@@ -34,6 +34,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_observability,
+    get_server_args,
 )
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.network import NetworkAddress
@@ -265,6 +266,22 @@ def load_model_with_memory_saver(
     # Remove monkey_patch when linear.py quant remove dependencies with vllm
     monkey_patch_vllm_parallel_state()
 
+    # LOCAL MODIFICATION (gaema): PLE embedding offload is Qwen4-Exp only.
+    # Ported across the upstream removal of this function's `server_args`
+    # parameter -- the arg is now reached via get_server_args().
+    if not is_draft_worker:
+        architectures = model_config.hf_config.architectures or []
+        is_qwen4_exp = "Qwen4ExpForConditionalGeneration" in architectures
+        if get_server_args().ple_offload_embedding and not is_qwen4_exp:
+            raise ValueError(
+                "--ple-offload-embedding only supports "
+                "Qwen4ExpForConditionalGeneration"
+            )
+        if is_qwen4_exp:
+            model_config.hf_text_config.ple_offload_embedding = (
+                get_server_args().ple_offload_embedding
+            )
+
     enable_cpu_backup = get_exec().features.enable_weights_cpu_backup or (
         is_draft_worker and get_exec().features.enable_draft_weights_cpu_backup
     )
@@ -312,6 +329,12 @@ def load_model_with_memory_saver(
             remote_instance_weight_info = (
                 loader.remote_instance_transfer_engine_weight_info
             )
+    if (
+        not is_draft_worker
+        and get_server_args().ple_offload_embedding
+        and device == "cuda"
+    ):
+        current_platform.empty_cache()
     # Cache needs to be cleared after loading model weights (in the loader.load_model function).
     # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
     if _is_npu:

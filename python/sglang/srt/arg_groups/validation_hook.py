@@ -71,6 +71,18 @@ def check_server_args(server_args: Any):
         cfg.tp_size,
     ), "moe_dense_tp_size only supports None, 1, or tp_size currently"
 
+    # LOCAL MODIFICATION (gaema): PLE embedding offload is incompatible with
+    # generic layer offload. Was ServerArgs._handle_offload_compatibility before
+    # upstream moved cross-family validation into this hook.
+    if cfg.ple_offload_embedding and (
+        cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0
+    ):
+        raise ValueError(
+            "--ple-offload-embedding cannot be combined with "
+            "--cpu-offload-gb or --offload-group-size: generic layer offload "
+            "would stage the pinned PLE embedding back to the device."
+        )
+
     # Check served model name to not have colon as it is reserved for LoRA adapter syntax
     if not is_runai_obj_uri(cfg.served_model_name):
         assert ":" not in cfg.served_model_name, (

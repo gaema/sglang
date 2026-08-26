@@ -23,6 +23,9 @@ from sglang.srt.runtime_context import get_platform
     "InternS2PreviewForConditionalGeneration",
     "InternS2MobiusForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
+    # LOCAL MODIFICATION (gaema): Qwen4-Exp rides the same hybrid attention
+    # shape as the Qwen3.5 family.
+    "Qwen4ExpForConditionalGeneration",
 )
 def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)

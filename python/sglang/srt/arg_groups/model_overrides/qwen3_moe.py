@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
     "Qwen3_5MoeForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
+    # LOCAL MODIFICATION (gaema): Qwen4-Exp shares the Qwen3 MoE runner
+    # selection.
+    "Qwen4ExpForConditionalGeneration",
 )
 def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
