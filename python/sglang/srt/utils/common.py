@@ -326,6 +326,14 @@ def is_sm121() -> bool:
     return is_cuda() and torch.cuda.get_device_capability() == (12, 1)
 
 
+# Consumer/workstation Blackwell (RTX 50-series, RTX PRO 6000). Shares the
+# major with SM121, so it needs the same exact-capability match rather than
+# _check_cuda_device_version's major-only test.
+@lru_cache(maxsize=1)
+def is_sm120_supported() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (12, 0)
+
+
 @lru_cache(maxsize=1)
 def _is_intel_amx_backend_available():
     try:
