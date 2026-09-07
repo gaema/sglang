@@ -77,6 +77,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
+    ensure_attn_graph_state,
     freeze_gc,
     get_batch_sizes_to_capture,
 )
@@ -364,7 +365,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.capture_num_tokens is not None
             else self.max_bs * self.captured_req_width
         )
-        self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        # fn:N106 LOCAL MODIFICATION (gaema) — the prefill runner may already
+        # own these buffers (it allocates the prefill+decode union before
+        # prefill capture).  A second init here would rebind them under the
+        # captured prefill graphs; ensure_attn_graph_state makes the fitting
+        # case a no-op. Replaces the direct init_cuda_graph_state call.
+        ensure_attn_graph_state(
+            self.attn_backend, self.max_bs, self.max_num_token, phase="decode"
+        )
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
@@ -564,7 +572,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.enable_pdmux:
             self.stream_groups = get_stream_groups()
             for attn_backend in self.model_runner.decode_attn_backend_group:
-                attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+                ensure_attn_graph_state(
+                    attn_backend,
+                    self.max_bs,
+                    self.max_num_token,
+                    phase="decode/pdmux",
+                )
 
     def _cache_loc_dtype(self):
         return torch.int64
@@ -1539,6 +1552,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     else None
                 )
 
+            # fn:N94 LOCAL MODIFICATION (gaema): carry the exported rank-local
+            # lm_head shard out of the replay, sliced exactly as
+            # next_token_logits is.  None on every path but the shard-export
+            # decode fast path.
+            local_vocab_shard = (
+                output.local_vocab_shard[: self.raw_num_token]
+                if getattr(output, "local_vocab_shard", None) is not None
+                else None
+            )
+
             # Preserve extension fields produced by the eager output processor.
             return dataclasses.replace(
                 output,
@@ -1549,6 +1572,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if output.hidden_states is not None
                     else None
                 ),
+                local_vocab_shard=local_vocab_shard,
             )
         else:
             assert isinstance(output, PPProxyTensors)
