@@ -1201,6 +1201,13 @@ class Scheduler(
         set_random_seed(self.random_seed)
 
         # Print debug info
+        from sglang.srt.model_executor.runner.flashinfer_autotune import (
+            _n129_deep_release,
+            _n129_mem_probe,
+        )
+
+        _n129_mem_probe("P7-scheduler-final-as-logged")
+        _n129_deep_release("P8-scheduler-final-post-gc-empty-cache")
         self.startup_available_gpu_memory_gb = get_available_gpu_memory(
             self.device, self.ps.gpu_id, empty_cache=False
         )

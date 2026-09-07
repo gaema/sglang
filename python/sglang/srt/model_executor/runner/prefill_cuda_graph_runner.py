@@ -92,7 +92,10 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
+    ensure_attn_graph_state,
     freeze_gc,
+    n106_single_owner_enabled,
+    n106_union_graph_state_bounds,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
@@ -455,6 +458,26 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     lora_max_bs,
                 )
                 self._capture_req_slots = lora_max_bs
+
+        # fn:N106 (LOCAL FORK) — attention CUDA-graph state for the FULL prefill
+        # backend.  Upstream initializes it only from the decode runner, and
+        # capture order is prefill-then-decode, so a FULL prefill capture reaches
+        # QsaAttnBackend._capture_cuda_graph_metadata with every graph buffer
+        # still None ("QSA CUDA graph state is not initialized").  Initializing
+        # it here alone would not be sound: the decode runner's later call
+        # REBINDS the same buffers under the graphs captured below.  So allocate
+        # ONCE, sized for the union of both phases, and let the decode call
+        # reuse it (ensure_attn_graph_state turns the fitting case into a no-op).
+        if self._is_full_backend and n106_single_owner_enabled():
+            union_bs, union_num_tokens = n106_union_graph_state_bounds(
+                model_runner, self._capture_req_slots
+            )
+            ensure_attn_graph_state(
+                model_runner.attn_backend,
+                union_bs,
+                union_num_tokens,
+                phase="prefill(full)",
+            )
 
         self._full_cg_seq_lens_cpu = (
             torch.zeros((self._capture_req_slots,), dtype=torch.int64, device="cpu")

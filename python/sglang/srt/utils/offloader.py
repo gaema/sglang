@@ -114,24 +114,41 @@ class OffloaderV1(BaseOffloader):
         # offload parameters to CPU
         # use pin_memory if possible, which helps cudagraph capture speed
         offloaded_parameters = False
+        # Maps device storage data_ptr -> host storage, for THIS module only.
+        host_storages = {}
         for p in module.parameters():
             if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
                 # we use per-parameter offloading
                 # one module might have some parameters offloaded and some not
                 break
 
-            # `torch.empty_like` does not support `pin_memory` argument
-            cpu_data = torch.empty_strided(
-                size=p.data.size(),
-                stride=p.data.stride(),
-                dtype=p.data.dtype,
-                layout=p.data.layout,
-                device="cpu",
-                pin_memory=pin_memory,
+            # Storage-aware offload: copy each distinct storage once and
+            # rebuild the parameter as a view onto it. A per-parameter
+            # empty_strided breaks aliasing (modelopt aliases
+            # w13_blockscale_swizzled onto w13_weight_scale) and drops any
+            # bytes outside a strided view's logical extent.
+            dev_storage = p.data.untyped_storage()
+            skey = dev_storage.data_ptr()
+            host_storage = host_storages.get(skey)
+            if host_storage is None:
+                nbytes = dev_storage.nbytes()
+                host_buf = torch.empty(
+                    nbytes, dtype=torch.uint8, device="cpu", pin_memory=pin_memory
+                )
+                dev_view = torch.empty(0, dtype=torch.uint8, device=p.data.device)
+                dev_view.set_(dev_storage, 0, (nbytes,), (1,))
+                host_buf.copy_(dev_view)
+                host_storage = host_buf.untyped_storage()
+                host_storages[skey] = host_storage
+                self._cpu_offload_bytes += nbytes
+            cpu_data = torch.empty(0, dtype=p.data.dtype, device="cpu")
+            cpu_data.set_(
+                host_storage,
+                p.data.storage_offset(),
+                p.data.size(),
+                p.data.stride(),
             )
-            cpu_data.copy_(p.data)
             p.data = cpu_data
-            self._cpu_offload_bytes += p.data.numel() * p.data.element_size()
             offloaded_parameters = True
 
         if offloaded_parameters:
@@ -139,13 +156,50 @@ class OffloaderV1(BaseOffloader):
 
             def forward(*args, **kwargs):
                 module.forward = original_forward
-                device_state = {
-                    # here we blindly call `to(device)`
-                    # if the parameter is already on the device, it will be a no-op
-                    k: v.to(device, non_blocking=True)
-                    for k, v in module.state_dict().items()
-                }
-                output = functional_call(module, device_state, args=args, kwargs=kwargs)
+                # Storage-aware upload mirroring the offload above: one
+                # transfer per distinct host storage, then rebuild each entry
+                # as a view onto the uploaded storage.
+                uploaded = {}
+                device_state = {}
+                for k, v in module.state_dict().items():
+                    if v.device.type != "cpu":
+                        device_state[k] = v
+                        continue
+                    vst = v.untyped_storage()
+                    vkey = vst.data_ptr()
+                    dev_storage = uploaded.get(vkey)
+                    if dev_storage is None:
+                        nb = vst.nbytes()
+                        hview = torch.empty(0, dtype=torch.uint8, device="cpu")
+                        hview.set_(vst, 0, (nb,), (1,))
+                        dev_storage = hview.to(
+                            device, non_blocking=False
+                        ).untyped_storage()
+                        uploaded[vkey] = dev_storage
+                    dv = torch.empty(0, dtype=v.dtype, device=device)
+                    dv.set_(dev_storage, v.storage_offset(), v.size(), v.stride())
+                    device_state[k] = dv
+                relocated = []
+                for sub in module.modules():
+                    for attr_name, attr_val in list(vars(sub).items()):
+                        if (
+                            isinstance(attr_val, torch.Tensor)
+                            and attr_val.device.type == "cpu"
+                        ):
+                            relocated.append((sub, attr_name, attr_val))
+                            # non_blocking=False: these are plain attributes,
+                            # not registered params, so nothing else in the
+                            # offload path synchronises them.
+                            setattr(
+                                sub, attr_name, attr_val.to(device, non_blocking=False)
+                            )
+                try:
+                    output = functional_call(
+                        module, device_state, args=args, kwargs=kwargs, tie_weights=False
+                    )
+                finally:
+                    for sub, attr_name, attr_val in relocated:
+                        setattr(sub, attr_name, attr_val)
                 module.forward = forward
                 return output
 

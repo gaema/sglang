@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -233,6 +234,20 @@ class LogitsProcessorOutput:
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
 
+    ## Part 7: fn:N94 LOCAL MODIFICATION (gaema).  GRAPH-OUTPUT SHARD EXPORT.
+    # The rank-local, PRE-all-gather lm_head shard, shape [#seq, vocab/tp].
+    # It is the output of the lm_head GEMM that the captured decode graph
+    # already computes and today discards after the collective; exporting it
+    # as a graph output lets a POST-graph all_gather rebuild the exact dense
+    # [#seq, vocab] rows for requests the shard-top-k -1e30 floor is not exact
+    # for (sampling, logprobs, penalties, logit_bias, grammar).
+    #
+    # Populated ONLY when SGLANG_LOGITS_SHARD_TOPK=<k> AND
+    # SGLANG_LOGITS_SHARD_EXPORT=1 and the batch is a decode batch whose rows
+    # map 1:1 onto next_token_logits.  None on every other path, and never
+    # read unless the export mode is on.
+    local_vocab_shard: Optional[torch.Tensor] = None
+
 
 @dataclasses.dataclass
 class LogitsMetadata:
@@ -423,6 +438,159 @@ class LogitsProcessor(nn.Module):
             skip_entry_sync=True,
         )
 
+        # --- fn:N89 LOCAL MODIFICATION (gaema) ------------------------------
+        # Opt-in shard-top-k logits gather, replacing the vocab-parallel
+        # lm_head logits AllGather ([B, V/tp] -> [B, V], 52.4 MB/rank/step at
+        # the c210 cell) with a per-shard top-k plus a [B, 2k] gather that is
+        # scattered back into a -1e30-filled [B, V].  The [B, V] shape
+        # contract is preserved, so nothing downstream of this module changes.
+        #
+        # EXACT for greedy/argmax: the global argmax is the argmax of some
+        # rank's shard, hence a member of that rank's top-k for every k >= 1,
+        # and it is carried back with its exact value (bf16 -> fp32 -> bf16).
+        # NOT EXACT for temperature / top-p / top-k / min-p sampling, for
+        # logprobs, for repetition penalties or for grammar masks: those need
+        # mass or ordering from the whole vocabulary, which the -1e30 floor
+        # destroys.  Hence: env-gated, default OFF, greedy-only.
+        #
+        #   SGLANG_LOGITS_SHARD_TOPK=<k>   0 or unset = upstream path
+        self.shard_topk_k = int(os.environ.get("SGLANG_LOGITS_SHARD_TOPK", "0") or 0)
+        self.use_shard_topk_gather = (
+            self.shard_topk_k > 0
+            and self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not self.do_tensor_parallel_all_gather_dp_attn
+        )
+        if self.shard_topk_k > 0:
+            logger.warning(
+                "fn:N89 shard-top-k logits gather: k=%d enabled=%s "
+                "(greedy/argmax exact; sampling, logprobs, penalties and "
+                "grammar masks are NOT exact)",
+                self.shard_topk_k,
+                self.use_shard_topk_gather,
+            )
+        # fn:N90 DIAGNOSTIC, default OFF.  With SGLANG_LOGITS_SHARD_TOPK_DEBUG=1
+        # the shard-top-k path ALSO computes the upstream dense all-gather and
+        # reports every row where the two disagree on argmax, or where the dense
+        # top-2 logits are tied or near-tied.  Costs a second all-gather per
+        # step: a correctness instrument, never a rate configuration.
+        self.shard_topk_debug = os.environ.get(
+            "SGLANG_LOGITS_SHARD_TOPK_DEBUG", "0"
+        ) not in ("", "0")
+        self._n90_step = 0
+        if self.shard_topk_debug and self.use_shard_topk_gather:
+            logger.warning("fn:N90 shard-top-k DEBUG compare: enabled=True")
+        # fn:N92 NULL PERTURBATION, default OFF.  Issues the fn:N89 arm's
+        # extra top-k + [B, 2k] all-gather + [B, V] fill + scatter and
+        # DISCARDS the result, returning the UPSTREAM DENSE all-gather.  The
+        # returned tensor is bit-identical to the control's BY CONSTRUCTION
+        # (it is the same call on the same input), so this arm perturbs the
+        # process without perturbing the arithmetic.  Used to bisect the
+        # per-PROCESS latch fn:N90 located upstream of the logits gather.
+        self.shard_topk_null_k = int(
+            os.environ.get("SGLANG_LOGITS_SHARD_TOPK_NULL", "0") or 0
+        )
+        self.use_shard_topk_null = (
+            self.shard_topk_null_k > 0
+            and not self.use_shard_topk_gather
+            and self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not self.do_tensor_parallel_all_gather_dp_attn
+        )
+        if self.shard_topk_null_k > 0:
+            logger.warning(
+                "fn:N92 NULL perturbation: k=%d enabled=%s "
+                "(extra collective issued and DISCARDED; the dense gather "
+                "is what is returned, so the output is unchanged)",
+                self.shard_topk_null_k,
+                self.use_shard_topk_null,
+            )
+            if self.use_shard_topk_null:
+                # _gather_shard_topk_logits reads self.shard_topk_k; give it
+                # the null arm's k without enabling the real arm.
+                self.shard_topk_k = self.shard_topk_null_k
+        # --- end fn:N89 -----------------------------------------------------
+
+        # --- fn:N93 ROUTE PROBE (gaema), default OFF ------------------------
+        # Answers ONE question, and it is the question that decides whether the
+        # fn:N89 shard-top-k gather can be ROUTED (fast path only for request
+        # shapes where it is semantically exact) instead of applied
+        # universally: is the Python-level gather branch in _get_logits
+        # evaluated once per DECODE STEP, or once per CAPTURED CUDA-graph
+        # shape?  A route that reads per-batch state (is_all_greedy,
+        # return_logprob, grammar, logit_bias) exists only if that branch runs
+        # per step; if it is baked at capture, no per-batch route is reachable
+        # from inside this module at all.
+        #
+        #   SGLANG_LOGITS_ROUTE_PROBE=1
+        #
+        # The channel is two-sided by construction: capturing=True must appear
+        # (graph capture happens at startup) and capturing=False must appear
+        # (prefill runs eager), so a probe stuck at either value is visible.
+        self.route_probe = os.environ.get("SGLANG_LOGITS_ROUTE_PROBE", "0") not in (
+            "",
+            "0",
+        )
+        self._n93_cap = 0
+        self._n93_eager = 0
+        self._n93_cap_decode = 0
+        self._n93_eager_decode = 0
+        if self.route_probe:
+            logger.warning("fn:N93 route-probe: enabled=True")
+        # --- end fn:N93 -----------------------------------------------------
+
+        # --- fn:N94 GRAPH-OUTPUT SHARD EXPORT (gaema), default OFF ----------
+        # fn:N93 MEASURED that the gather branch below is a CUDA-graph
+        # CAPTURE-TIME constant (<=99 Python executions against >=975 decode
+        # steps; 31 captured shapes; LogitsMetadata carries no sampling_info),
+        # so no per-batch route is reachable from inside this module.  The
+        # route it CAN take is post-graph, and the material it needs is the
+        # rank-local [B, vocab/tp] shard the graph already computes.  This mode
+        # exports that shard as a graph output; ModelRunner.sample() then
+        # all_gathers the rows that need full-vocab exactness and writes them
+        # into the floored [B, vocab] the fast path produced.
+        #
+        #   SGLANG_LOGITS_SHARD_EXPORT=1   (requires SGLANG_LOGITS_SHARD_TOPK)
+        #
+        # Two invariants make it shippable where the bare fn:N89 arm was not:
+        #   1. Sampler.forward and ModelRunner._preprocess_logits are UNTOUCHED
+        #      -- they still receive one [B, vocab] fp32 tensor.
+        #   2. The reconstructed rows are bitwise the dense path's own values
+        #      BY CONSTRUCTION: the same all_gather over the same bf16 shard,
+        #      then the same bf16->fp32 widening _copy_logits_to_buffer does.
+        #
+        # With the export on, the fast path is restricted to DECODE batches:
+        # extend/prefill rows feed input-logprob work that reads the whole
+        # vocabulary inside this module, upstream of any post-graph repair.
+        self.shard_export = os.environ.get("SGLANG_LOGITS_SHARD_EXPORT", "0") not in (
+            "",
+            "0",
+        )
+        self.use_shard_export = (
+            self.shard_export
+            and self.use_shard_topk_gather
+            # Softcapping is applied to the [B, vocab] tensor AFTER the gather
+            # (see _get_logits), so a post-graph write would bypass it.
+            and self.final_logit_softcapping is None
+        )
+        self._n94_pending_shard: Optional[torch.Tensor] = None
+        if self.shard_export and not self.use_shard_export:
+            # Asked for the routed build and it cannot be delivered here.  Fail
+            # SAFE: turn the fast path off rather than run it unrepaired, which
+            # is the one configuration that would be silently wrong.
+            self.use_shard_topk_gather = False
+        if self.shard_export:
+            logger.warning(
+                "fn:N94 graph-output shard export: enabled=%s "
+                "(shard_topk=%d softcap=%s fastpath=%s) -- decode-only fast "
+                "path, post-graph exact reconstruction in ModelRunner.sample()",
+                self.use_shard_export,
+                self.shard_topk_k,
+                self.final_logit_softcapping,
+                self.use_shard_topk_gather,
+            )
+        # --- end fn:N94 -----------------------------------------------------
+
         self.input_logprob_processor = InputLogprobProcessor()
 
     def forward(
@@ -503,11 +671,22 @@ class LogitsProcessor(nn.Module):
                 logits[sample_indices] if sample_indices is not None else logits
             )
 
+            # fn:N94 (gaema): attach the exported pre-gather shard.  Only when
+            # sample_indices is None, i.e. the rows of next_token_logits map
+            # 1:1 onto the shard's rows -- true for decode, which is the only
+            # mode the export's fast path runs in.
+            local_vocab_shard = None
+            if self._n94_pending_shard is not None:
+                if sample_indices is None:
+                    local_vocab_shard = self._n94_pending_shard
+                self._n94_pending_shard = None
+
             # Decode mode or extend mode without return_logprob.
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
+                local_vocab_shard=local_vocab_shard,
             )
 
         logprobs_result, sampled_logits = self.input_logprob_processor.forward(
@@ -520,6 +699,11 @@ class LogitsProcessor(nn.Module):
             logits_metadata=logits_metadata,
             skip_chunking_for_dp_attn=self.do_tensor_parallel_all_gather_dp_attn,
         )
+
+        # fn:N94 (gaema): this branch is extend-with-logprobs, where the fast
+        # path is disabled outright, so there is nothing to export.  Drop any
+        # reference defensively so a stale shard can never reach a later step.
+        self._n94_pending_shard = None
 
         logits_output = LogitsProcessorOutput(
             next_token_logits=sampled_logits,
@@ -812,12 +996,31 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         used_tp_lm_head_all_to_all = False
+
+        if self.route_probe:
+            self._n93_route_probe(logits_metadata)
+
         if self.do_tensor_parallel_all_gather:
             _trace_e2e_logits(
                 "tp_logits_gather_enter", logits_shape=tuple(logits.shape)
             )
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
+            elif self.use_shard_topk_gather and self._n94_fast_path_allowed(
+                logits_metadata
+            ):
+                # fn:N94: hand the PRE-gather local shard to forward(), which
+                # attaches it to the LogitsProcessorOutput.  Inside a capture
+                # this reference is what makes the shard a graph OUTPUT: the
+                # backend stores the output object per shape, so the tensor
+                # stays alive and every replay refreshes it in place.
+                if self.use_shard_export:
+                    self._n94_pending_shard = logits
+                logits = self._gather_shard_topk_logits(logits)
+            elif self.use_shard_topk_null:
+                # fn:N92: pay the arm's cost, keep the control's answer.
+                _ = self._gather_shard_topk_logits(logits)
+                logits = self._logits_gatherer(logits)
             elif self._can_use_tp_lm_head_all_to_all(
                 logits, local_hidden_states, lm_head, logits_metadata
             ):
@@ -1022,6 +1225,140 @@ class LogitsProcessor(nn.Module):
             all_to_all_output, get_parallel().tp_size
         )
 
+    def _n93_route_probe(self, logits_metadata: LogitsMetadata):
+        """fn:N93 ROUTE PROBE (gaema).  Inert unless SGLANG_LOGITS_ROUTE_PROBE=1.
+
+        Records, for every Python-level execution of the gather branch,
+        whether the current stream is capturing a CUDA graph and whether the
+        batch is a decode batch, and reports the running totals.  See __init__
+        for what the reading decides.
+        """
+        try:
+            capturing = bool(torch.cuda.is_current_stream_capturing())
+        except Exception:  # pragma: no cover - non-CUDA devices
+            capturing = False
+        is_decode = bool(logits_metadata.forward_mode.is_decode_or_idle())
+        if capturing:
+            self._n93_cap += 1
+            self._n93_cap_decode += int(is_decode)
+        else:
+            self._n93_eager += 1
+            self._n93_eager_decode += int(is_decode)
+        n = self._n93_cap + self._n93_eager
+        if n <= 6 or n % 100 == 0:
+            logger.warning(
+                "fn:N93 route-probe n=%d capturing=%s decode=%s rows=%s | "
+                "cap=%d eager=%d cap_decode=%d eager_decode=%d | "
+                "metadata_has_sampling_info=%s",
+                n,
+                capturing,
+                is_decode,
+                getattr(logits_metadata, "extend_seq_lens_cpu", None) is None,
+                self._n93_cap,
+                self._n93_eager,
+                self._n93_cap_decode,
+                self._n93_eager_decode,
+                hasattr(logits_metadata, "sampling_info"),
+            )
+
+    def _n94_fast_path_allowed(self, logits_metadata: LogitsMetadata) -> bool:
+        """fn:N94 LOCAL MODIFICATION (gaema).
+
+        Without the export mode this is a constant True, so fn:N89's arm is
+        bit-for-bit the behaviour it had before this round.  WITH the export
+        mode it restricts the -1e30 fast path to DECODE batches: an extend
+        batch's input-logprob work reads the whole vocabulary inside this
+        module (InputLogprobProcessor), upstream of any post-graph repair, so
+        the floor would be read before it could be undone.
+
+        For a captured decode graph this predicate is evaluated at CAPTURE
+        (fn:N93 D1) and is True there; for eager prefill it is evaluated per
+        batch and is False.  Both are the correct answers, which is why the
+        capture-baking that refuted fn:N93's route is harmless here.
+        """
+        if not self.use_shard_export:
+            return True
+        return bool(logits_metadata.forward_mode.is_decode_or_idle())
+
+    def _gather_shard_topk_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """fn:N89 LOCAL MODIFICATION (gaema).  See __init__ for the semantics
+        and for why this is greedy-only.
+
+        Every op has a static shape, so this is CUDA-graph capturable in the
+        same position the full all-gather occupies today.
+        """
+        # Lazy import, mirroring MultimemAllGatherer.__call__'s own fallback.
+        from sglang.srt.distributed import tensor_model_parallel_all_gather
+
+        tp_size = get_parallel().tp_size
+        tp_rank = get_parallel().tp_rank
+        rows, shard_width = logits.shape
+        k = min(self.shard_topk_k, shard_width)
+
+        vals, idx = torch.topk(logits, k, dim=-1)
+        idx = idx + tp_rank * shard_width
+        # fp32 carries a bf16 value losslessly, and every vocab id here is
+        # < 2**24, so the id survives the float round-trip exactly.
+        packed = torch.cat([vals.to(torch.float32), idx.to(torch.float32)], dim=-1)
+
+        # all_gather(dim=-1) is concat-style in rank order, so each row is
+        # [r0_vals(k), r0_idx(k), r1_vals(k), r1_idx(k), ...].
+        gathered = tensor_model_parallel_all_gather(packed, dim=-1)
+        gathered = gathered.reshape(rows, tp_size, 2, k)
+        all_vals = gathered[:, :, 0, :].reshape(rows, tp_size * k)
+        all_idx = gathered[:, :, 1, :].reshape(rows, tp_size * k)
+
+        # -1e30 is the same floor sanitize_nan_logits already writes for -inf,
+        # and it is below every real logit, so argmax is unaffected.
+        out = logits.new_full((rows, tp_size * shard_width), -1e30)
+        out.scatter_(1, all_idx.to(torch.int64), all_vals.to(logits.dtype))
+        if self.shard_topk_debug:
+            self._n90_debug_compare(logits, out)
+        return out
+
+    def _n90_debug_compare(self, local_logits: torch.Tensor, out: torch.Tensor):
+        """fn:N90 DIAGNOSTIC (gaema).  Inert unless
+        SGLANG_LOGITS_SHARD_TOPK_DEBUG=1.
+
+        Recomputes the UPSTREAM dense all-gather beside the shard-top-k output
+        and reports, per row, (a) whether the two disagree on argmax and
+        (b) whether the dense top-2 logits are exactly tied or near-tied.
+        This is the direct test of the fn:N89 tie-break hypothesis: if the
+        prompt-0 divergence is a tie, TIED=True must appear at that step.
+        """
+        from sglang.srt.distributed import tensor_model_parallel_all_gather
+
+        with torch.no_grad():
+            dense = tensor_model_parallel_all_gather(local_logits, dim=-1)
+            df = dense.float()
+            # The greedy sampler dispatches is_all_greedy -> torch.argmax
+            # (layers/sampler.py:126), so argmax is the reduction under test on
+            # BOTH sides.  v1 used topk on the dense side and was comparing two
+            # different tie-breaks.
+            d_arg = df.argmax(dim=-1)
+            s_arg = out.float().argmax(dim=-1)
+            d_max = df.amax(dim=-1, keepdim=True)
+            # Tie MULTIPLICITY: how many vocab entries attain the dense maximum.
+            mult = (df == d_max).sum(dim=-1)
+            differ = d_arg != s_arg
+            tied = mult > 1
+            self._n90_step += 1
+            hit = torch.nonzero(differ | tied).flatten()
+            if hit.numel() == 0:
+                return
+            # One host transfer for the whole step, not one per row.
+            rows = hit.tolist()
+            d_a = d_arg[hit].tolist()
+            s_a = s_arg[hit].tolist()
+            m_c = mult[hit].tolist()
+            v_m = d_max.squeeze(-1)[hit].tolist()
+            for r, da, sa, mc, vm in zip(rows, d_a, s_a, m_c, v_m):
+                logger.warning(
+                    "fn:N90 step=%d row=%d DIFFER=%s TIEMULT=%d "
+                    "dense_argmax=%d sparse_argmax=%d max=%.9g",
+                    self._n90_step, r, da != sa, mc, da, sa, vm,
+                )
+
     def _scatter_dp_attn_logits(
         self,
         logits: torch.Tensor,
@@ -1198,6 +1535,203 @@ def _reassemble_tp_lm_head_all_to_all_output(
         .permute(1, 0, 2)
         .reshape(local_rows, tp_size * vocab_shard)
     )
+
+
+# --- fn:N94 GRAPH-OUTPUT SHARD EXPORT (gaema) ---------------------------------
+# The post-graph half of the export.  Called from ModelRunner.sample() (and
+# compute_logprobs_only) BEFORE _preprocess_logits, so both that function and
+# Sampler.forward are untouched: they still receive exactly one [B, vocab]
+# fp32 tensor with the same contract it has always had.
+#
+# ROUTE (host-side, batch-level, NO device synchronization):
+#   fast  -- every request in this batch is argmax-safe against the -1e30
+#            floor, so the fast path's tensor is used as-is and the dense
+#            collective is never issued.
+#   exact -- at least one request needs full-vocab mass or ordering, so the
+#            exported shard is all_gathered and written over the floored
+#            tensor.  The result is bitwise the dense path's own values.
+#
+# The route is deliberately batch-level rather than per-row: `is_all_greedy`
+# and every logprob/penalty/bias/grammar flag are already HOST values, while a
+# per-row predicate lives in `sampling_info.top_ks` on the DEVICE and would
+# need a D2H `.item()` per decode step to shape the collective -- a CPU/GPU
+# pipeline stall that costs more than the 2.599 ms/step it is trying to save.
+_N94_ROUTE_COUNTS = {"fast": 0, "exact": 0, "skip": 0}
+
+# fn:N94 VERIFY, default OFF.  The IN-PROCESS, BITWISE, TWO-SIDED control on the
+# reconstruction.  A cross-process comparison cannot settle this question at
+# this configuration: fn:N92 measured the stock stack's own per-process
+# nondeterminism (2/23 lever-OFF, on the pristine upstream file), and this round
+# reproduced it on logprobs -- control C1 and export A1 disagree on the FIRST
+# generated token's logprobs by 0.026 nats, and that token comes from PREFILL,
+# where the export's fast path is disabled outright and both arms run byte-
+# identical code.  So the divergence is upstream of anything this lever touches
+# and a control-vs-arm comparison is measuring the latch, not the lever.
+#
+# What CAN be settled, in one process with no collective of its own, is the
+# relationship between the two tensors the exact route holds at that instant:
+#
+#   must-accept  at the <=2k positions the fast path's scatter FILLED, the
+#                reconstruction must agree BITWISE -- those are the same values
+#                carried by two different routes, so any mismatch is a real bug;
+#   must-reject  at the -1e30 FLOORED positions the reconstruction must CHANGE
+#                the value -- a repair that changes nothing is a dead lever, and
+#                would read as a pass to every downstream check.
+#
+# SGLANG_LOGITS_EXPORT_VERIFY=1
+_N94_VERIFY = os.environ.get("SGLANG_LOGITS_EXPORT_VERIFY", "0") not in ("", "0")
+_N94_VERIFY_CALLS = 0
+_N94_VERIFY_ROWS = 4      # bound the cost: compare the first few rows only
+_N94_VERIFY_MAX = 8       # ...on the first few exact-route steps only
+
+
+def _n94_verify(dst, dense) -> None:
+    """fn:N94 (gaema).  Inert unless SGLANG_LOGITS_EXPORT_VERIFY=1."""
+    global _N94_VERIFY_CALLS
+    if _N94_VERIFY_CALLS >= _N94_VERIFY_MAX:
+        return
+    _N94_VERIFY_CALLS += 1
+    try:
+        with torch.no_grad():
+            r = min(_N94_VERIFY_ROWS, dst.shape[0])
+            floored = dst[:r]
+            rebuilt = dense[:r].to(dst.dtype)
+            filled = floored > -1e29
+            n_fill = int(filled.sum().item())
+            n_floor = int(filled.numel() - n_fill)
+            if n_fill:
+                mism = int((floored[filled] != rebuilt[filled]).sum().item())
+                mx = float((floored[filled] - rebuilt[filled]).abs().max().item())
+            else:
+                mism, mx = -1, float("nan")
+            changed = (
+                int((rebuilt[~filled] != floored[~filled]).sum().item())
+                if n_floor
+                else -1
+            )
+            logger.warning(
+                "fn:N94 VERIFY call=%d rows=%d | MUST-ACCEPT filled=%d "
+                "mismatch=%d max_abs_diff=%.9g | MUST-REJECT floored=%d "
+                "changed=%d (%.4f%%)",
+                _N94_VERIFY_CALLS, r, n_fill, mism, mx, n_floor, changed,
+                100.0 * changed / n_floor if n_floor else float("nan"),
+            )
+    except Exception as e:  # pragma: no cover - an instrument must not kill a run
+        logger.warning("fn:N94 VERIFY raised %r -- reading is UNEVALUABLE", e)
+
+
+def n94_batch_needs_exact_logits(forward_batch) -> bool:
+    """fn:N94 (gaema).  True when ANY request in this batch reads mass or
+    ordering the -1e30 floor destroys.  Conservative by construction: every
+    unknown resolves to True, so an unrecognized consumer gets the dense
+    reconstruction rather than the floored tensor."""
+    si = getattr(forward_batch, "sampling_info", None)
+    if si is None:
+        return True
+    # Non-greedy: temperature / top-p / top-k / min-p all renormalize over the
+    # surviving mass, which the floor has changed.
+    if not getattr(si, "is_all_greedy", False):
+        return True
+    # log_softmax over a floored row is wrong even when the argmax is right.
+    if getattr(forward_batch, "return_logprob", False):
+        return True
+    if getattr(forward_batch, "token_ids_logprobs", None):
+        return True
+    if any(getattr(forward_batch, "top_logprobs_nums", None) or []):
+        return True
+    # Additive/multiplicative modifications of a floored entry are meaningless.
+    if getattr(si, "logit_bias", None) is not None:
+        return True
+    if getattr(si, "grammar_mask", None) is not None:
+        return True
+    if getattr(si, "grammars", None):
+        return True
+    if getattr(si, "has_custom_logit_processor", False):
+        return True
+    if getattr(si, "acc_additive_penalties", None) is not None:
+        return True
+    if getattr(si, "acc_scaling_penalties", None) is not None:
+        return True
+    po = getattr(si, "penalizer_orchestrator", None)
+    if po is not None and getattr(po, "is_required", False):
+        return True
+    if any(getattr(si, "return_sampling_masks", None) or []):
+        return True
+    return False
+
+
+def n94_restore_exact_logits(logits_output, forward_batch) -> Optional[str]:
+    """fn:N94 (gaema).  Reconstruct the exact dense logits for a batch that
+    needs them, from the shard the captured graph exported.
+
+    Returns the route taken ("fast" / "exact" / "skip"), or None when this
+    output carries no exported shard (every path but the export mode's decode
+    fast path), in which case it is a no-op.
+    """
+    shard = getattr(logits_output, "local_vocab_shard", None)
+    if shard is None:
+        return None
+    # One step, one use.  Never let a reference outlive the step that made it.
+    logits_output.local_vocab_shard = None
+
+    if not n94_batch_needs_exact_logits(forward_batch):
+        _N94_ROUTE_COUNTS["fast"] += 1
+        _n94_maybe_log()
+        return "fast"
+
+    dst = logits_output.next_token_logits
+    if dst is None or dst.shape[0] != shard.shape[0]:
+        # Rows do not correspond; refuse rather than write the wrong rows.
+        # Unreachable for decode, where forward() only attaches the shard when
+        # sample_indices is None.
+        _N94_ROUTE_COUNTS["skip"] += 1
+        logger.warning(
+            "fn:N94 export: row mismatch dst=%s shard=%s -- NOT reconstructing",
+            None if dst is None else tuple(dst.shape),
+            tuple(shard.shape),
+        )
+        return "skip"
+
+    from sglang.srt.distributed import tensor_model_parallel_all_gather
+
+    dense = tensor_model_parallel_all_gather(shard, dim=-1)
+    if dense.shape[-1] > dst.shape[-1]:
+        # Same truncation _copy_logits_to_buffer applies to a padded vocab.
+        dense = dense[:, : dst.shape[-1]]
+    if _N94_VERIFY:
+        _n94_verify(dst, dense)
+    # Same bf16 -> fp32 widening _copy_logits_to_buffer performs, so these rows
+    # are bit-for-bit what the dense path would have left here.
+    dst.copy_(dense)
+    _N94_ROUTE_COUNTS["exact"] += 1
+    _n94_maybe_log()
+    return "exact"
+
+
+def _n94_maybe_log() -> None:
+    """fn:N94 (gaema) LIVENESS.  The route counters ARE the instrument: a run
+    that never prints an `exact` is claiming every batch was argmax-safe, and a
+    run that never prints a `fast` is claiming the lever bought nothing.  Both
+    are falsifiable readings, and a run with neither has a dead instrument.
+    First six calls, then every 200th."""
+    n = _N94_ROUTE_COUNTS["fast"] + _N94_ROUTE_COUNTS["exact"] + _N94_ROUTE_COUNTS["skip"]
+    if n <= 6 or n % 200 == 0:
+        logger.warning(
+            "fn:N94 export route n=%d fast=%d exact=%d skip=%d",
+            n,
+            _N94_ROUTE_COUNTS["fast"],
+            _N94_ROUTE_COUNTS["exact"],
+            _N94_ROUTE_COUNTS["skip"],
+        )
+
+
+def n94_route_counts() -> dict:
+    """fn:N94 (gaema) liveness readback.  A run whose counters are all zero has
+    a DEAD instrument, not a fast batch mix."""
+    return dict(_N94_ROUTE_COUNTS)
+
+
+# --- end fn:N94 ---------------------------------------------------------------
 
 
 def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:

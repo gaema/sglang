@@ -43,6 +43,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_extend,
+    _n129_mem_probe,
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
 )
@@ -258,7 +259,9 @@ class BaseRunner(ABC):
                 "_autotune_buffers() must return a reusable buffer set for autotune"
             )
             self._flashinfer_autotune(buffers=buffers, batch_size=batch_size)
+            _n129_mem_probe("P0-warmup-pre-extend")
             maybe_flashinfer_autotune_extend(self, decode_num_tokens=batch_size)
+            _n129_mem_probe("P6-warmup-post-extend")
 
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()

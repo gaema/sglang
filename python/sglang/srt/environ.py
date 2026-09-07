@@ -304,6 +304,16 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Unwind Qwen4-Exp's PLE prefetch state when a forward aborts part-way.
+    # `Qwen4ExpPLELayer._prefetch_state` is armed one layer ahead and consumed
+    # inside the SAME forward, so it is forward-scoped by construction -- but
+    # nothing unwound it when the forward died between the two, and the next
+    # forward then raised "PLE prefetch state was not consumed before reuse".
+    # ON restores the scope's own invariant; the guarded region is entered only
+    # on a path that is already failing, so a healthy forward is unaffected
+    # either way. OFF reproduces the historical behaviour (a kill switch, and
+    # the must-reject arm of this fix's liveness test).
+    SGLANG_QWEN4_PLE_ABORT_PREFETCH_ON_ERROR = EnvBool(True)
     # Stream Qwen4's PLE n-gram table from a local safetensors snapshot instead
     # of allocating it in host or device memory. An empty path disables it.
     SGLANG_QWEN4_PLE_NVME_PATH = EnvStr("")
@@ -1025,6 +1035,13 @@ class Envs:
     # warmup. Opt-in: the extra forward needs transient activation headroom
     # that small-VRAM or tightly-packed configs may not have.
     SGLANG_FLASHINFER_AUTOTUNE_EXTEND = EnvBool(False)
+    # Let the EXTEND-shaped autotune dummy above also run for a MULTIMODAL
+    # model, when that model's class declares `mm_dummy_extend_safe = True`.
+    # `is_multimodal` is a CONFIG property; the hazard it stands in for (a
+    # prefill path that iterates the dummy's `mm_inputs=None`) is a CODE
+    # property of the model class. Opt-in, and a model that does not declare
+    # the attribute keeps the historical skip regardless of this flag.
+    SGLANG_FLASHINFER_AUTOTUNE_EXTEND_MULTIMODAL = EnvBool(False)
 
     # ===================================================================
     # Triton and Torch compilation

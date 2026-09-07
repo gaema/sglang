@@ -79,7 +79,10 @@ from sglang.srt.layers.cp.utils import (
     is_cp_v2_active,
     is_mla_prefill_cp_enabled,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    n94_restore_exact_logits,  # fn:N94 LOCAL MODIFICATION (gaema)
+)
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
@@ -1896,6 +1899,17 @@ class ModelRunner:
         # runners may reuse backing objects. Never leak an auxiliary result from
         # a previous replay into a request with no observer state.
         logits_output.auxiliary_device_output = None
+
+        # fn:N94 LOCAL MODIFICATION (gaema): post-graph reconstruction of the
+        # exact dense logits from the shard the captured decode graph exported.
+        # A no-op unless SGLANG_LOGITS_SHARD_TOPK + SGLANG_LOGITS_SHARD_EXPORT
+        # are both set (logits_output.local_vocab_shard is None otherwise).
+        # It runs BEFORE _preprocess_logits precisely so that neither that
+        # function nor Sampler.forward changes: both still see one [B, vocab]
+        # fp32 tensor, and for a batch that needs exactness its contents are
+        # bitwise what the in-graph dense all-gather would have written.
+        n94_restore_exact_logits(logits_output, forward_batch)
+
         observer = self.sampling_observer
         # Preserve two-argument overrides when observation is inactive.
         if observer is not None and observer.is_active(forward_batch.sampling_info):
@@ -1951,6 +1965,13 @@ class ModelRunner:
             forward_batch: The forward batch that generates logits_output
         """
         logits_output.auxiliary_device_output = None
+
+        # fn:N94 (gaema): same reconstruction as in sample(). This path is
+        # prefill-only today (where the fast path never runs), so it is a
+        # no-op; it is here so a future decode caller cannot reach
+        # _preprocess_logits with a floored tensor.
+        n94_restore_exact_logits(logits_output, forward_batch)
+
         if not forward_batch.token_ids_logprobs:
             return
 

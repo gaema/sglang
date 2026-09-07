@@ -18,6 +18,7 @@ from __future__ import annotations
 import bisect
 import gc
 import logging
+import os
 from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
@@ -59,6 +60,96 @@ def freeze_gc(enable_cudagraph_gc: bool):
         if should_freeze:
             gc.unfreeze()
             gc.collect()
+
+
+# --- LOCAL FORK (gaema fn:N106): single-owner attention CUDA-graph buffers ---
+N106_ENV = "SGLANG_N106_QSA_PREFILL_GRAPH"
+
+
+def n106_single_owner_enabled() -> bool:
+    """Local-fork gate for the single-owner graph-state allocation below.
+
+    Default OFF: with the variable unset every call site behaves exactly as
+    upstream (a direct, rebinding init_cuda_graph_state call).
+    """
+    return os.environ.get(N106_ENV, "0").strip().lower() not in ("", "0", "false", "no")
+
+
+def ensure_attn_graph_state(
+    attn_backend: Any, max_bs: int, max_num_tokens: int, *, phase: str
+) -> None:
+    """Allocate the attention backends' CUDA-graph buffers ONCE, for both phases.
+
+    ``AttentionBackend.init_cuda_graph_state`` REBINDS every graph buffer with
+    fresh ``torch.zeros``.  Capture order is prefill-then-decode, and both
+    phases share one ``model_runner.attn_backend`` object, so a second call
+    made after the prefill graphs were captured frees the tensors those graphs
+    still hold device pointers into — a use-after-free on replay (wrong
+    answers, not a slow path).  That is why simply calling
+    ``init_cuda_graph_state`` before prefill capture is NOT a valid fix.
+
+    Here the first caller allocates, sized for both phases, and records the
+    allocation ON THE BACKEND THAT OWNS IT.  Any later request that fits
+    inside the existing allocation is a no-op, so every already-captured
+    graph keeps valid pointers.  A later request that does NOT fit is a
+    startup-time error rather than a silent reallocation: it can only mean the
+    union was mis-computed, and a loud failure is the safe outcome.
+    """
+    if not n106_single_owner_enabled():
+        attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+        return
+
+    owned = getattr(attn_backend, "_n106_graph_state_alloc", None)
+    if owned is not None:
+        owned_bs, owned_tokens = owned
+        if max_bs <= owned_bs and max_num_tokens <= owned_tokens:
+            logger.info(
+                "fn:N106 graph state already owned (bs=%d, num_tokens=%d); "
+                "%s request (bs=%d, num_tokens=%d) reuses it, no rebind.",
+                owned_bs,
+                owned_tokens,
+                phase,
+                max_bs,
+                max_num_tokens,
+            )
+            return
+        raise RuntimeError(
+            f"fn:N106: {phase} requests attention graph state "
+            f"(bs={max_bs}, num_tokens={max_num_tokens}) larger than the "
+            f"single owner already allocated (bs={owned_bs}, "
+            f"num_tokens={owned_tokens}). Reallocating would invalidate the "
+            f"graphs already captured against those buffers; widen the union "
+            f"computed before prefill capture instead."
+        )
+
+    attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+    attn_backend._n106_graph_state_alloc = (max_bs, max_num_tokens)
+    logger.info(
+        "fn:N106 attention graph state allocated once by %s: bs=%d, num_tokens=%d.",
+        phase,
+        max_bs,
+        max_num_tokens,
+    )
+
+
+def n106_union_graph_state_bounds(
+    model_runner: ModelRunner, prefill_req_slots: int
+) -> Tuple[int, int]:
+    """(max_bs, max_num_tokens) covering BOTH the prefill and decode phases.
+
+    The decode half is computed with the same two calls the decode runner
+    makes, so the two cannot drift.  ``max_num_tokens`` is kept at
+    ``bs * width`` because ``HybridLinearAttnBackend`` asserts that
+    ``max_num_tokens % max_bs == 0``.
+    """
+    from sglang.srt.runtime_context import get_spec
+
+    width = model_runner.decode_num_tokens_per_req(
+        num_draft_tokens=get_spec().speculative_num_draft_tokens
+    )
+    decode_capture_bs, _ = get_batch_sizes_to_capture(model_runner, width)
+    union_bs = max(max(decode_capture_bs), int(prefill_req_slots))
+    return union_bs, union_bs * width
 
 
 def get_batch_sizes_to_capture(

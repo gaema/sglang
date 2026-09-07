@@ -4,6 +4,8 @@
 
 import ctypes
 import logging
+import os
+import sys as _sys
 from contextlib import contextmanager
 from functools import partial
 from typing import Any, List, Optional, Union
@@ -142,6 +144,33 @@ class CustomAllreduce:
         self.disabled = False
         self.original_disabled = False  # Ensure original_disabled == disabled
         self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+
+        # ---- fn:N95 -- FP8-E4M3 ONE-SHOT all-reduce.  ENV-GATED, DEFAULT OFF.
+        # The ws==2 path below is an UNCONDITIONAL bf16 cross_device_reduce_1stage
+        # (custom_all_reduce.cuh:637-639).  fn:N87 measured that halving the
+        # payload costs 54.6% of the call on this PCIe pair, so an FP8 wire is
+        # worth ~24.3 us/call -- and no stack ships a one-shot FP8 collective on
+        # CUDA (flashinfer's is TWO-shot and costs 196% of this kernel's time at
+        # this message size).  fn:N95 builds the missing one.  Kernel + gate:
+        # /home/dxue/local/build/fn-n95/, audit ai/gaema/engine/audit/
+        # 2026-09-01-fn-n95-fp8-oneshot-allreduce.md.
+        #
+        # This RAISES rather than falling back: an unreachable lever that
+        # silently runs the control would be scored as the treatment (F13).
+        self._n95_fp8 = None
+        if os.environ.get("SGLANG_N95_FP8_ALLREDUCE", "0") == "1":
+            _d = os.environ.get("SGLANG_N95_FP8_DIR", "/home/dxue/local/build/fn-n95")
+            if _d not in _sys.path:
+                _sys.path.insert(0, _d)
+            import n95_fp8_hook as _n95
+
+            self._n95_fp8 = _n95.attach(self)
+            logger.warning(
+                "fn:N95 FP8 one-shot all-reduce ENABLED (scale_group=%d, ws=%d) "
+                "-- the bf16 cross_device_reduce_1stage is REPLACED",
+                self._n95_fp8.scale_group,
+                self.world_size,
+            )
 
     @staticmethod
     def create_shared_buffer(
@@ -283,6 +312,14 @@ class CustomAllreduce:
         return False
 
     def _all_reduce_impl(self, inp: torch.Tensor, registered: bool):
+        # fn:N95 -- FP8 one-shot.  Reads the input only LOCALLY (it quantizes
+        # into its own IPC staging), so it is indifferent to `registered` and
+        # behaves identically in the graph-captured and eager paths.
+        _n95 = getattr(self, "_n95_fp8", None)
+        if _n95 is not None and _n95.supports(inp):
+            _n95.n_calls += 1
+            return _n95.all_reduce(inp)
+
         out = torch.empty_like(inp)
         if not _is_hip:  # CUDA-like
             if registered:
@@ -329,6 +366,19 @@ class CustomAllreduce:
             return self._all_reduce_impl(input, registered=False)
 
     def close(self):
+        # fn:N96 -- the FP8 one-shot owns three cudaMalloc slabs and 3*(ws-1)
+        # IPC imports per rank.  Release them HERE so its lifetime is exactly
+        # this object's, alongside meta_ptrs/buffer_ptrs.  Outside the
+        # `not self.disabled and self._ptr` guard on purpose: that guard is
+        # false on a second close(), and this one is idempotent on its own.
+        _n95 = getattr(self, "_n95_fp8", None)
+        if _n95 is not None:
+            self._n95_fp8 = None
+            try:
+                _n95.close()
+            except BaseException as _e:  # teardown must not raise
+                logger.warning("fn:N95 teardown failed: %r", _e)
+
         if not self.disabled and self._ptr:
             if ops is not None:
                 ops.dispose(self._ptr)

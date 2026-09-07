@@ -392,6 +392,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     needs_cpu_seq_lens: bool = False
 
+    # The chunked GDN forward launches with grid = (cdiv(V, BV), N * H), where
+    # N is the number of SEQUENCES in the batch (chunk_delta_h.py: `def grid`).
+    # An UNPACKED autotune extend dummy is one sequence per token, so at
+    # max_prefill_tokens it asks for N * H = 16384 * <v-heads-per-rank> blocks
+    # in grid.y and CUDA refuses the launch: measured on ai100 (sm_120a, TP2,
+    # Qwen3.8-Flash-Next-NVFP4), `extra EXTEND pass at 16384 tokens
+    # (16384 seqs x 1 tokens)` -> `RuntimeError: Triton Error [CUDA]: invalid
+    # argument` in chunk_gated_delta_rule_fwd_kernel_h_blockdim64, killing the
+    # scheduler during warmup.  This is exactly the case the flag is for --
+    # flashinfer_autotune's own comment says "pack only where the backend would
+    # otherwise crash" -- so cap the dummy's batch at the req pool size.
+    extend_dummy_seqs_capped_by_req_pool: bool = True
+
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
         super().__init__(model_runner)
