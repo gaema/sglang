@@ -1279,6 +1279,32 @@ class Qwen4ExpPLELayer(nn.Module):
             self._eager_prefetch_buffer = buffer
         return buffer[:lookup_tokens]
 
+    def abort_prefetch(self) -> None:
+        """Disarm an armed-but-unconsumed prefetch after its forward aborted.
+
+        This is the SYNCHRONISATION half of `_consume_prefetched_embeddings`
+        without the use, and the synchronisation is the whole point: dropping
+        the tuple alone would NOT be correct, because `start_prefetch` launched
+        an async gather into a REUSED buffer (`_graph_prefetch_buffers` /
+        `_eager_prefetch_buffer`). A later forward is handed that same buffer,
+        so abandoning the gather without joining it races the next reader.
+
+        Join first, clear last: if the join itself raises, the state stays
+        armed and the next `start_prefetch` still refuses -- an honest failure
+        rather than a silently reused buffer.
+        """
+        state = self._prefetch_state
+        if state is None:
+            return
+        if self._prefetch_stream is not None:
+            if torch.cuda.is_current_stream_capturing():
+                # A host-side sync is illegal mid-capture. The ordering edge is
+                # exactly the one consume() takes, and it is capture-legal.
+                torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+            else:
+                self._prefetch_stream.synchronize()
+        self._prefetch_state = None
+
     def start_prefetch(
         self,
         batch: Optional[_PLEBatch],
@@ -2026,6 +2052,28 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             else PPMissingLayer()
         )
 
+    def _abort_ple_prefetch(self) -> None:
+        """Unwind every PLE prefetch an aborted forward left armed.
+
+        `Qwen4ExpPLELayer._prefetch_state` is created and consumed inside one
+        `forward`, and `start_prefetch` asserts that invariant on entry. The
+        assert is correct and stays; what was missing is that the scope which
+        OWNS the state never unwound it, so a forward that died between arm and
+        consume (an allocator failure inside the MoE runner, say) poisoned the
+        model for every later forward with `RuntimeError: PLE prefetch state
+        was not consumed before reuse`.
+
+        The only other forward-scoped PLE residue, the request pool's
+        `ple_window_cache`, is already reset unconditionally at the top of
+        `_prepare_ple_batch`, so this is the whole of it.
+        """
+        if not envs.SGLANG_QWEN4_PLE_ABORT_PREFETCH_ON_ERROR.get():
+            return
+        for i in range(self.start_layer, self.end_layer):
+            ple = getattr(self.layers[i], "ple", None)
+            if ple is not None:
+                ple.abort_prefetch()
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -2078,41 +2126,48 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             )
         aux_hidden_states = AuxHiddenStateList()
         normalized_input = None
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            if i + 1 < self.end_layer:
-                next_ple = self.layers[i + 1].ple
-                if next_ple is not None:
-                    if breakable_ple:
-                        _breakable_ple_prefetch(ple=next_ple, batch=ple_batch)
-                    else:
-                        next_ple.start_prefetch(
-                            batch=ple_batch, forward_batch=forward_batch
-                        )
-            next_norm = None
-            if i + 1 < self.end_layer:
-                next_layer = self.layers[i + 1]
-                if next_layer.ple is None:
-                    next_norm = next_layer.attn_hyper_connection.hc_norm
-            elif self.pp_group.is_last_rank:
-                next_norm = self.hyper_connection_mixer.hc_norm
-            with (
-                get_global_expert_distribution_recorder().with_current_layer(i),
-                layer.hc_norms(normalized_input, next_norm) as norms,
-            ):
-                hidden_states = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    forward_batch=forward_batch,
-                    ple_batch=ple_batch,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
-                    ),
-                )
+        try:
+            for i in range(self.start_layer, self.end_layer):
+                layer = self.layers[i]
+                if i + 1 < self.end_layer:
+                    next_ple = self.layers[i + 1].ple
+                    if next_ple is not None:
+                        if breakable_ple:
+                            _breakable_ple_prefetch(ple=next_ple, batch=ple_batch)
+                        else:
+                            next_ple.start_prefetch(
+                                batch=ple_batch, forward_batch=forward_batch
+                            )
+                next_norm = None
+                if i + 1 < self.end_layer:
+                    next_layer = self.layers[i + 1]
+                    if next_layer.ple is None:
+                        next_norm = next_layer.attn_hyper_connection.hc_norm
+                elif self.pp_group.is_last_rank:
+                    next_norm = self.hyper_connection_mixer.hc_norm
+                with (
+                    get_global_expert_distribution_recorder().with_current_layer(i),
+                    layer.hc_norms(normalized_input, next_norm) as norms,
+                ):
+                    hidden_states = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        forward_batch=forward_batch,
+                        ple_batch=ple_batch,
+                        captured_last_layer_outputs=(
+                            aux_hidden_states
+                            if getattr(layer, "_is_layer_to_capture", False)
+                            else None
+                        ),
+                    )
 
-            normalized_input = norms.output
+                normalized_input = norms.output
+        except BaseException:
+            # The layer loop is the scope that owns _prefetch_state; unwind it
+            # here so the failure stays local to this forward instead of
+            # poisoning the next one. Re-raised unchanged.
+            self._abort_ple_prefetch()
+            raise
 
         if breakable_ple:
             _breakable_commit_ple_batch(batch=ple_batch)
@@ -2195,6 +2250,11 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
 class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
+    # Multimodal prefill enters through general_mm_embed_routine, whose mm
+    # branch is gated on ForwardBatch.contains_mm_inputs() -- False when
+    # mm_inputs is None -- so the flashinfer EXTEND autotune dummy takes the
+    # text-only path. See flashinfer_autotune.mm_dummy_extend_is_safe().
+    mm_dummy_extend_safe = True
 
     def should_apply_lora(self, module_name: str) -> bool:
         return module_name.startswith("model.layers.")
