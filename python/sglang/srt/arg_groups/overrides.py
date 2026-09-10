@@ -662,7 +662,9 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         )
         return declared
 
-    if is_glm_sm12_fp8:
+    if is_glm_sm12_fp8 and not (
+        view.dsa_prefill_backend == "tilelang" and view.dsa_decode_backend == "tilelang"
+    ):
         backend = "flashinfer_sparse_mla"
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = backend
