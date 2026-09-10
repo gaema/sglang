@@ -1,4 +1,5 @@
 import functools
+import logging
 from functools import lru_cache
 from typing import Any, Optional, Tuple
 
@@ -54,6 +55,135 @@ FP8_DTYPE = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
 FP32 = "float32"
 INT32 = "int32"
 UINT8 = "uint8"
+
+logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=8)
+def _max_dynamic_smem_bytes(device_index: int = -1) -> int:
+    """`cudaDevAttrMaxSharedMemoryPerBlockOptin` for the device, or 0 if unknown.
+
+    Every DSA kernel below sizes its shared buffers from (block_I, num_stages,
+    threads), so its dynamic-smem request is a compile-time constant of the
+    model shape and those tiles.  The ceiling it must fit under is a property of
+    the DEVICE, not of the caller -- 101376 B on sm_120, 232448 B on sm_90 --
+    so it is queried here rather than spelled as an `sm in (...)` allowlist at
+    one of the three tile-selecting call sites.  0 means "could not query";
+    callers then leave tiles alone and a too-large launch fails loudly exactly
+    as it did before.
+    """
+    if _is_hip:
+        return 0
+    try:
+        if not torch.cuda.is_available():
+            return 0
+        idx = torch.cuda.current_device() if device_index < 0 else device_index
+        props = torch.cuda.get_device_properties(idx)
+        return int(getattr(props, "shared_memory_per_block_optin", 0) or 0)
+    except Exception:  # pragma: no cover - never fail a compile on a query
+        return 0
+
+
+# One tilelang dynamic-smem alignment unit (the generated kernels declare
+# `extern __shared__ __align__(1024)`).  A candidate must clear the device cap
+# by at least this much: a shape landing EXACTLY on the ceiling has no room for
+# the alignment padding or any driver-side reserve, and is not worth choosing
+# when a smaller one is available.
+_SMEM_HEADROOM_BYTES = 1024
+
+# block_I=16 is rejected by the kernels themselves ("warp_row_tiles must be
+# greater than 16, got 8"), so 32 is the floor -- measured, not assumed.
+_MIN_BLOCK_I = 32
+
+
+def _fit_tiles_to_smem(
+    kernel_name,
+    smem_bytes,
+    block_I,
+    num_stages,
+    threads,
+    *,
+    topk=None,
+    min_block_I=_MIN_BLOCK_I,
+    min_stages=1,
+    min_threads=128,
+    scale_threads=True,
+):
+    """Pick the largest (block_I, num_stages, threads) whose smem fits the device.
+
+    `smem_bytes(block_I, num_stages, threads)` is the kernel's own closed-form
+    shared-memory request for a candidate tile.
+
+    `threads` is scaled with `block_I` rather than held fixed, because the two
+    are not independent: the per-row reduction fragments are laid out over
+    `threads` from an `[H_per_block, block_I]` accumulator, so halving block_I
+    at fixed threads halves the elements per thread and tilelang's
+    LayoutInference then rejects the kernel outright ("Layout infer conflict
+    between m_i and alpha in T.Parallel loop").  Measured on sm_120: 32/1/256
+    fails that pass, 32/1/128 passes it.  Keeping `H_per_block * block_I /
+    threads` invariant preserves the shape the stock tile was validated at.
+
+    This helper only ever SHRINKS, and a configuration that already fits is
+    returned unchanged -- which is what keeps a hand-picked caller shape (the
+    fp8 decode path) byte-for-byte intact.  When nothing fits, the original
+    triple is returned so the launch fails loudly rather than silently running
+    a shape nobody asked for.
+    """
+    cap = _max_dynamic_smem_bytes()
+    if cap <= 0:
+        return block_I, num_stages, threads
+    want = smem_bytes(block_I, num_stages, threads)
+    if want <= cap:
+        return block_I, num_stages, threads
+
+    stage_opts = sorted(range(min_stages, num_stages + 1), reverse=True) or [
+        num_stages
+    ]
+    cands = []
+    bi = block_I
+    while bi >= min_block_I:
+        th = max(min_threads, threads * bi // block_I) if scale_threads else threads
+        for ns in stage_opts:
+            cands.append((bi, ns, th))
+        bi //= 2
+    # Widest tile first, then deepest pipeline.
+    cands.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    for bi, ns, th in cands:
+        if topk is not None and topk % bi:
+            continue
+        got = smem_bytes(bi, ns, th)
+        if got + _SMEM_HEADROOM_BYTES <= cap:
+            logger.warning(
+                "%s: dynamic smem %d B at block_I=%d/num_stages=%d/threads=%d "
+                "exceeds the device optin cap %d B; selected "
+                "block_I=%d/num_stages=%d/threads=%d (%d B, %.1f%% of cap)",
+                kernel_name,
+                want,
+                block_I,
+                num_stages,
+                threads,
+                cap,
+                bi,
+                ns,
+                th,
+                got,
+                100.0 * got / cap,
+            )
+            return bi, ns, th
+    logger.error(
+        "%s: no tile at or below block_I=%d/num_stages=%d fits the %d B device "
+        "smem cap with %d B headroom; keeping %d/%d/%d and letting the launch "
+        "fail",
+        kernel_name,
+        min_block_I,
+        min_stages,
+        cap,
+        _SMEM_HEADROOM_BYTES,
+        block_I,
+        num_stages,
+        threads,
+    )
+    return block_I, num_stages, threads
 
 
 def fast_log2_ceil(x):
@@ -319,6 +449,35 @@ def sparse_attention_fwd_kernel_v1(
 
     H_per_block = padded_H if REPLICATE_H == 1 else 64
 
+    # Fit the tile to the DEVICE's dynamic-smem ceiling.  The prim_func below
+    # allocates, in bfloat16: Q_shared (which the lowering aliases with
+    # O_shared, so it is charged once), KV_shared buffered `num_stages` deep by
+    # the T.Pipelined loop, S_shared, and -- when there is a tail --
+    # Q_tail_shared plus a pipelined K_tail_shared; the reduce/scan workspace
+    # adds two float `threads`-wide scratch buffers.  Term for term this
+    # reproduces the 169984 B request the stock 64/2/256 shape makes at
+    # H=32/D=512, which sm_120 refuses against its 101376 B optin cap.
+    def _smem(bi, ns, th):
+        nbytes = 2 * H_per_block * D  # Q_shared / O_shared (aliased)
+        nbytes += 2 * ns * bi * D  # KV_shared, pipelined
+        nbytes += 2 * H_per_block * bi  # S_shared
+        if has_tail:
+            nbytes += 2 * H_per_block * D_tail  # Q_tail_shared
+            nbytes += 2 * ns * bi * D_tail  # K_tail_shared, pipelined
+        nbytes += 8 * th  # 2 x float reduce/scan workspace
+        return nbytes
+
+    block_I, num_stages, threads = _fit_tiles_to_smem(
+        "sparse_attention_fwd_kernel_v1",
+        _smem,
+        block_I,
+        num_stages,
+        threads,
+        topk=topk,
+    )
+    BI = block_I
+    NI = tilelang.cdiv(topk, block_I)
+
     @T.prim_func
     def main(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
@@ -499,6 +658,35 @@ def sparse_attention_fwd_kernel_v2(
         REPLICATE_H = 1
 
     H_per_block = padded_H if REPLICATE_H == 1 else 64
+
+    # Same device-driven fit as v1.  v2 hand-rolls its double buffering (the
+    # _0/_1 buffer pairs below) instead of using T.Pipelined, so the pipeline
+    # depth is structural and only block_I is tunable here.
+    def _smem(bi, _ns, th):
+        nbytes = 2 * H_per_block * D  # Q_shared_l + Q_shared_r
+        nbytes += 2 * H_per_block * D_tail  # Q_tail_shared
+        nbytes += 2 * 2 * bi * D  # KV_shared_{0,1}_{l,r}
+        nbytes += 2 * 2 * bi * D_tail  # K_tail_shared_{0,1}
+        nbytes += 2 * bi  # is_kv_valid_{0,1} (bool)
+        nbytes += 2 * H_per_block * bi  # S_shared
+        nbytes += 8 * H_per_block  # sum_exp_shared + alpha_shared (float)
+        nbytes += 8 * th  # 2 x float reduce/scan workspace
+        return nbytes
+
+    # v2's warp specialisation is written against threads=384, so only block_I
+    # is tunable here (scale_threads=False pins it).
+    block_I, _, _ = _fit_tiles_to_smem(
+        "sparse_attention_fwd_kernel_v2",
+        _smem,
+        block_I,
+        1,
+        threads,
+        topk=topk,
+        scale_threads=False,
+    )
+    BI = block_I
+    NI = tilelang.cdiv(topk, block_I)
+    assert NI % 2 == 0, "NI should be a multiple of 2"
 
     @T.prim_func
     def main(
@@ -858,10 +1046,45 @@ def sparse_mla_fwd_decode_partial(
     padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
     REPLICATE_H = (head_kv // 64) if head_kv > 64 else 1
     H_per_block = padded_H if REPLICATE_H == 1 else 64
-    N_GROUPS = topk // (block_I * inner_iter)
-    BI = block_I
     D = dim
     D_tail = tail_dim
+
+    _q_in_shared_pre = inner_iter == 1
+
+    # Same device-driven fit as the v1/v2 factories above.  Shrinking block_I
+    # here must not break the `topk % (block_I * inner_iter) == 0` invariant
+    # asserted at the top, so candidates are filtered on that product.
+    def _smem(bi, ns, th):
+        eff_ns = min(ns, inner_iter)
+        nbytes = 2 * eff_ns * bi * D  # KV_shared, pipelined
+        nbytes += 2 * H_per_block * bi  # S_shared
+        if _q_in_shared_pre:
+            nbytes += 2 * H_per_block * D  # Q_buf (shared only at inner_iter==1)
+        if D_tail > 0:
+            nbytes += 2 * eff_ns * bi * D_tail  # K_tail_shared, pipelined
+            if _q_in_shared_pre:
+                nbytes += 2 * H_per_block * D_tail  # Q_tail_buf
+        nbytes += 8 * th  # 2 x float reduce/scan workspace
+        return nbytes
+
+    block_I, num_stages, threads = _fit_tiles_to_smem(
+        "sparse_mla_fwd_decode_partial",
+        _smem,
+        block_I,
+        num_stages,
+        threads,
+        topk=topk,
+    )
+    # Halving block_I preserves `topk % (block_I * inner_iter) == 0` (the new
+    # product divides the old one), but assert rather than assume.
+    if topk % (block_I * inner_iter):
+        raise AssertionError(
+            f"tile fit produced block_I={block_I} which does not divide "
+            f"topk={topk} with inner_iter={inner_iter}"
+        )
+
+    N_GROUPS = topk // (block_I * inner_iter)
+    BI = block_I
 
     q_shape = [batch, seq_len, heads, dim + tail_dim]
     kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
@@ -1363,6 +1586,19 @@ def tilelang_sparse_fwd(
                 block_I, threads, block_per_cu, cu = 32, 128, 1, 304
             else:
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304
+            # NOTE: sparse_mla_fwd_decode_partial_fp8 deliberately does NOT
+            # carry the _fit_tiles_to_smem auto-fit the bf16 factories use --
+            # its fp8 buffer inventory is a different shape, and this is the
+            # only serving path that works today, so its hand-picked tiles are
+            # left byte-for-byte alone.  Logged so the selection is observable
+            # for both KV dtypes.
+            logger.warning(
+                "tilelang_sparse_fwd: fp8 KV -- block_I=%d threads=%d "
+                "(hand-picked at call site; device smem optin cap %d B)",
+                block_I,
+                threads,
+                _max_dynamic_smem_bytes(),
+            )
             ni = topk // block_I
             inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
             kernel_partial = sparse_mla_fwd_decode_partial_fp8(
