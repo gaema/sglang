@@ -82,7 +82,17 @@ def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
 def _get_processed_token_count(
     forward_batch: ForwardBatch, physical_tokens: int
 ) -> int:
-    processed_tokens = forward_batch.num_token_non_padded_cpu
+    # `num_token_non_padded_cpu` is NOT a field of ForwardBatch. Upstream's
+    # GLOBAL/LOCAL split renamed the declared host int to
+    # `global_num_token_non_padded_cpu` and left only a GPU scalar
+    # (`num_token_non_padded`) at LOCAL scope; the old name survives solely as a
+    # dynamic attribute the dspark draft path assigns, so reading it here raised
+    # AttributeError on every other batch. This reads the GLOBAL host int, which
+    # is what every other model-level consumer in this tree uses (deepseek_v4,
+    # inkling, nemotron_h_utils). A scope mismatch cannot pass silently: the
+    # invariant below rejects a count exceeding this forward's own physical rows
+    # and reports both numbers.
+    processed_tokens = forward_batch.global_num_token_non_padded_cpu
     if processed_tokens is None and forward_batch.extend_seq_lens_cpu is not None:
         processed_tokens = sum(forward_batch.extend_seq_lens_cpu)
     if processed_tokens is None:
