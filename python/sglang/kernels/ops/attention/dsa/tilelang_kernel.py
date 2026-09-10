@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils.common import get_device_sm
 
 tilelang.set_log_level("WARNING")
 
@@ -1336,13 +1337,30 @@ def tilelang_sparse_fwd(
     topk = indices.shape[-1]
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
-    if _is_hip:
-        is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+    if _is_hip or is_fp8_kv:
+        # The partial+combine tilelang kernels are generic TileLang with no HIP
+        # intrinsics, so the raw-fp8 decode kernel
+        # (sparse_mla_fwd_decode_partial_fp8) also runs on CUDA -- it was only
+        # reachable via _is_hip because CUDA was always handed the scaled
+        # 528 B/token pool layout it cannot parse. kv.dtype is fp8 here iff the
+        # raw fp8 KV pool is active (gated upstream by
+        # arg_groups/overrides.py._check_tilelang_dsa_fp8_kv and
+        # mem_cache/kv_cache_configurator.calculate_mla_kv_cache_dim), so branch
+        # on dtype, not platform.
         if is_fp8_kv:
             if q.dtype != kv.dtype:
                 q = q.to(kv.dtype)
             if _is_gfx95_supported:
                 block_I, threads, block_per_cu, cu = 64, 256, 2, 256
+            elif not _is_hip and get_device_sm() in (120, 121):
+                # sm_12x dynamic-smem ceiling: the stock block_I=64/threads=256
+                # shape needs >=103.4 KB, and on this RTX PRO 6000 (sm_120) it
+                # died with "Failed to set the allowed dynamic shared memory
+                # size to 169984" at exactly that shape. 32/128 fits with no
+                # measured perf cost.
+                block_I, threads, block_per_cu, cu = 32, 128, 1, 304
             else:
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304
             ni = topk // block_I

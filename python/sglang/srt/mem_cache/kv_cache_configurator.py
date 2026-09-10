@@ -2563,6 +2563,17 @@ def calculate_mla_kv_cache_dim(
     ):
         return kv_cache_dim
 
+    # On CUDA, the generic (no-HIP-intrinsics) raw-fp8 sparse decode kernel
+    # (sparse_mla_fwd_decode_partial_fp8) also consumes the raw MLA KV layout
+    # when BOTH prefill and decode backends are tilelang -- gated to sm_89+
+    # by arg_groups/overrides.py._check_tilelang_dsa_fp8_kv, which is the
+    # only combination this raw pool layout supports.
+    if not _is_hip and (
+        get_exec().kernel.dsa_prefill_backend == "tilelang"
+        and get_exec().kernel.dsa_decode_backend == "tilelang"
+    ):
+        return kv_cache_dim
+
     quant_block_size = DSATokenToKVPool.quant_block_size
     rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
     # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout

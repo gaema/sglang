@@ -4544,9 +4544,23 @@ class MLATokenToKVPool(KVCache):
             self.write_loc_is_dcp_resolved
             and (self.use_dsa or self.dsa_kv_cache_store_fp8)
         ), "the DSA write paths have no resolved-loc variant"
-        if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
-            # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
-            # Fuse BF16/FP16 -> FP8 cast with paged KV write.
+        if (
+            self.use_dsa
+            and self.dtype == fp8_dtype
+            and not self.dsa_kv_cache_store_fp8
+        ):
+            # Raw MLA KV layout (nope + rope) without per-block scales -- keyed
+            # on the POOL LAYOUT (dsa_kv_cache_store_fp8 == False), not on
+            # platform: HIP tilelang/aiter and the CUDA raw-fp8 tilelang decode
+            # kernel (sparse_mla_fwd_decode_partial_fp8) both consume this
+            # layout. Fuse BF16/FP16 -> FP8 cast with paged KV write.
+            # NoPE models (qk_rope_head_dim == 0, e.g. GLM-5.3-Flash) have no
+            # rope tensor; the fp8-quant kernel indexes cache_k_rope
+            # unconditionally, so substitute an empty one rather than None.
+            if cache_k_rope is None:
+                cache_k_rope = cache_k_nope.new_empty(
+                    *cache_k_nope.shape[:-1], 0
+                )
             set_mla_kv_buffer_triton_fp8_quant(
                 dst_buffer,
                 loc,

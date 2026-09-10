@@ -686,20 +686,47 @@ def _check_tilelang_dsa_fp8_kv(
     *,
     hip: bool,
 ) -> None:
-    """tilelang's fp8 KV path is ROCm-only; the CUDA kernel hardcodes bfloat16.
-    Reject here instead of crashing at decode CUDA-graph capture."""
-    if (
-        not hip
-        and kv_cache_dtype == "fp8_e4m3"
-        and "tilelang" in {prefill_backend, decode_backend}
-    ):
+    """tilelang's fp8 KV path historically ran on ROCm only. A generic
+    (no-HIP-intrinsics) raw-fp8 sparse decode kernel
+    (``sparse_mla_fwd_decode_partial_fp8``) also exists in-tree and runs on
+    CUDA sm_89+ when BOTH the prefill and decode DSA backends are tilelang --
+    that is the only shape the raw fp8 KV pool layout supports, so mixed
+    backends are rejected explicitly rather than silently building the wrong
+    pool. Reject here instead of crashing at decode CUDA-graph capture."""
+    if kv_cache_dtype != "fp8_e4m3" or hip:
+        return
+
+    is_prefill_tilelang = prefill_backend == "tilelang"
+    is_decode_tilelang = decode_backend == "tilelang"
+    if not is_prefill_tilelang and not is_decode_tilelang:
+        return
+
+    if is_prefill_tilelang != is_decode_tilelang:
         raise ValueError(
-            "The tilelang DSA prefill/decode kernels only support an fp8_e4m3 KV "
-            "cache on ROCm/HIP; on CUDA they require a bfloat16 KV cache. Use "
+            "The tilelang DSA raw fp8 KV cache path requires BOTH prefill and "
+            f"decode backends to be 'tilelang' (got prefill={prefill_backend!r}, "
+            f"decode={decode_backend!r}); the raw fp8 pool layout it builds "
+            "cannot be shared with any other backend's KV layout."
+        )
+
+    device_sm = get_device_sm()
+    if device_sm < 89:
+        raise ValueError(
+            "The tilelang DSA prefill/decode kernels only support an fp8_e4m3 "
+            "KV cache on ROCm/HIP, or on CUDA sm_89+ with both prefill and "
+            f"decode backends set to 'tilelang' (device is sm_{device_sm}). Use "
             "--kv-cache-dtype bfloat16 with the tilelang backend, or keep "
             "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
+
+    logger.warning(
+        "Enabling tilelang raw fp8_e4m3 KV cache on CUDA sm_%d "
+        "(prefill=%s, decode=%s).",
+        device_sm,
+        prefill_backend,
+        decode_backend,
+    )
 
 
 @register_post_process
@@ -771,7 +798,9 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         )
         return declared
 
-    if is_glm_sm12_fp8:
+    if is_glm_sm12_fp8 and not (
+        view.dsa_prefill_backend == "tilelang" and view.dsa_decode_backend == "tilelang"
+    ):
         backend = "flashinfer_sparse_mla"
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = backend

@@ -893,6 +893,49 @@ class Glm5NextModel(nn.Module):
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
+            offloader_kwargs=dict(
+                # Mirrors deepseek_v2.py. hasattr rather than
+                # isinstance(..., DeepseekV2MoE): GLM's MoE is Glm5NextMoE,
+                # but the shape of the thing we need -- an `experts`
+                # submodule holding the fused expert weights -- is the same.
+                submodule_accessor=lambda layer: (
+                    layer.mlp.experts if hasattr(layer.mlp, "experts") else layer.mlp
+                ),
+                whitelist_param_names_creator=lambda module: (
+                    [
+                        "w13_weight",
+                        "w2_weight",
+                        # only for nvfp4
+                        *(
+                            [
+                                "w13_blockscale_swizzled",
+                                "w2_blockscale_swizzled",
+                                # The swizzled scales are ALIASES of the
+                                # weight_scale tensors under modelopt's
+                                # NVFP4 path. Both names must be offloaded
+                                # together, or post_load.py computes two
+                                # different restore devices for one tensor
+                                # object and refuses with "Aliased post-load
+                                # tensor has conflicting restore devices".
+                                *(
+                                    ["w13_weight_scale"]
+                                    if hasattr(module, "w13_weight_scale")
+                                    else []
+                                ),
+                                *(
+                                    ["w2_weight_scale"]
+                                    if hasattr(module, "w2_weight_scale")
+                                    else []
+                                ),
+                            ]
+                            if hasattr(module, "w13_blockscale_swizzled")
+                            else []
+                        ),
+                    ]
+                    if isinstance(module, FusedMoE)
+                    else []
+                ),
+            ),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
