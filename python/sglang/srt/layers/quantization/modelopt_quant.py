@@ -2386,8 +2386,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if self.enable_flashinfer_trtllm_moe:
             layer.w13_blockscale_swizzled = None
         else:
+            # Zero-byte placeholder, not a full-size swizzle. On every other
+            # arm process_weights_after_loading recomputes the swizzle and
+            # alias_or_bind_derived_param writes it INTO w13_weight_scale's
+            # own storage, rebinding this name onto that Parameter -- so a
+            # full-size swizzle of uninitialised memory here was a
+            # byte-exact duplicate of every expert blockscale, resident from
+            # construction until the whole checkpoint had loaded (8.86
+            # GiB/card on GLM-5.3-Flash NVFP4 at TP=2). It stays a
+            # registered Parameter rather than None because the group
+            # offloader whitelists this name at wrap time (pre-load) and
+            # asserts it is in named_parameters().
             layer.w13_blockscale_swizzled = Parameter(
-                swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
+                layer.w13_weight_scale.new_empty(0), requires_grad=False
             )
 
         w2_weight_scale = ModelWeightParameter(
@@ -2406,8 +2417,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if self.enable_flashinfer_trtllm_moe:
             layer.w2_blockscale_swizzled = None
         else:
+            # Same zero-byte placeholder as w13 above; see that comment.
             layer.w2_blockscale_swizzled = Parameter(
-                swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
+                layer.w2_weight_scale.new_empty(0), requires_grad=False
             )
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
