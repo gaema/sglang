@@ -37,6 +37,10 @@ class GroupedGemmaRMSNorm(nn.Module):
         self._jit_group_size = (
             effective_group_size if effective_group_size % 512 == 0 else None
         )
+        # Opt-in (R2d, fn:N285): route the JIT kernel through its registered
+        # custom-op twin so a Dynamo trace (tc_piecewise prefill capture) can
+        # see it. Off by default; a model sets it on its own norms.
+        self.use_traceable_kernel = False
 
     def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
@@ -48,6 +52,14 @@ class GroupedGemmaRMSNorm(nn.Module):
             and x.is_cuda
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
+            if self.use_traceable_kernel:
+                from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm_op import (
+                    grouped_gemma_rmsnorm_op,
+                )
+
+                return grouped_gemma_rmsnorm_op(
+                    x, self.weight, self._jit_group_size, self.variance_epsilon
+                )
             from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
                 grouped_gemma_rmsnorm,
             )

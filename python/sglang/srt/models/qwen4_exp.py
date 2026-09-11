@@ -2,7 +2,7 @@
 
 import math
 from contextlib import nullcontext
-from typing import Any, Iterable, Optional, Set, Tuple, Union
+from typing import Any, Iterable, NamedTuple, Optional, Set, Tuple, Union
 
 import msgspec
 import sympy
@@ -138,6 +138,38 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     state_indices: torch.Tensor
     ngram_context: Optional[torch.Tensor]
     ngram_eos_token_id: Optional[int]
+
+
+class _PLEBatchTraceable(NamedTuple):
+    """R2d (SGLANG_QWEN4_QSA_SPLIT_OP): the same batch as a NamedTuple.
+
+    The PLE batch is built inside the forward, i.e. inside the region a
+    tc_piecewise prefill capture traces, and Dynamo refuses to construct a
+    msgspec.Struct there (`object.__new__(_PLEBatch) is not safe`, fn:N284).
+    A NamedTuple is constructed the same way (keyword fields), is read the
+    same way (attribute access), is as immutable, and is a container Dynamo
+    traces. Gate OFF never instantiates this class.
+    """
+
+    mode: ForwardMode
+    use_decode_fast_path: bool
+    physical_tokens: int
+    processed_tokens: int
+    lengths: torch.Tensor
+    row_width: int
+    req_indices: torch.Tensor
+    token_offsets: torch.Tensor
+    valid_tokens: torch.Tensor
+    state_indices: torch.Tensor
+    ngram_context: Optional[torch.Tensor]
+    ngram_eos_token_id: Optional[int]
+
+
+# Read once at import (the gate is a process-level env, as the layer
+# constructor's read further down is): OFF keeps the shipped msgspec struct
+# and the shipped pinned-table gather.
+_QSA_SPLIT_OP_GATE = bool(envs.SGLANG_QWEN4_QSA_SPLIT_OP.get())
+_PLE_BATCH_CLS = _PLEBatchTraceable if _QSA_SPLIT_OP_GATE else _PLEBatch
 
 
 def _prepare_ple_batch(
@@ -288,7 +320,7 @@ def _prepare_ple_batch(
             )
         ngram_context = torch.cat([history, padded], dim=1)
 
-    return _PLEBatch(
+    return _PLE_BATCH_CLS(
         mode=mode,
         use_decode_fast_path=use_decode_fast_path,
         physical_tokens=physical_tokens,
@@ -875,6 +907,16 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
         del embedding.weight
         self._block_d = triton.next_power_of_2(self.embedding_dim)
+        # R2d (fn:N285 obstacle 2): Dynamo refuses `weight.data_ptr()` as a
+        # Triton kernel argument inside the traced prefill graph
+        # (DataPtrVariable). The pinned table is allocated here and only ever
+        # copied INTO (weight_loader -> param.data.copy_), so its address is a
+        # process constant; record it as a plain int and refresh it after
+        # load_weights. Used only under the gate.
+        self._weight_ptr = int(self.weight.data_ptr())
+
+    def refresh_weight_ptr(self) -> None:
+        self._weight_ptr = int(self.weight.data_ptr())
 
     def allocate_output(
         self, shape: Tuple[int, ...], device: torch.device
@@ -915,7 +957,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                     vocab_end=self.shard_indices.org_vocab_end_index,
                 )
             _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                self.weight.data_ptr(),
+                self._weight_ptr if _QSA_SPLIT_OP_GATE else self.weight.data_ptr(),
                 flat_ids,
                 output,
                 embedding_dim=self.embedding_dim,
@@ -1811,6 +1853,16 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             if self.pp_group.is_last_rank
             else PPMissingLayer()
         )
+        if _QSA_SPLIT_OP_GATE:
+            # R2d (fn:N285 obstacle 3): every hyper-connection norm in this
+            # model runs its JIT kernel through the registered custom op so
+            # the tc_piecewise trace can see it. Gate OFF leaves the flag at
+            # its default (False) on every norm.
+            from sglang.srt.layers.hyperconnection import GroupedGemmaRMSNorm
+
+            for module in self.modules():
+                if isinstance(module, GroupedGemmaRMSNorm):
+                    module.use_traceable_kernel = True
 
     def _abort_ple_prefetch(self) -> None:
         """Unwind every PLE prefetch an aborted forward left armed.
@@ -2413,6 +2465,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         for module in self.modules():
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
+            elif _QSA_SPLIT_OP_GATE and isinstance(module, Qwen4ExpPinnedHostEmbedding):
+                module.refresh_weight_ptr()
 
         return loaded_params
 
