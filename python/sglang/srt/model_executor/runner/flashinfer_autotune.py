@@ -442,12 +442,69 @@ def _autotune_process_group(group: Optional[torch.distributed.ProcessGroup]):
         set_autotune_process_group(previous)
 
 
+# Positions inside a MoERunner key's config tuple that name the RANK writing
+# the cache rather than the problem being tuned: tp_rank, ep_rank,
+# cluster_rank (flashinfer/fused_moe/core.py MoERunner.get_tuning_config key
+# order: x_dtype, weight_dtype, output_dtype, top_k, tp_size, tp_rank, ep_size,
+# ep_rank, cluster_size, cluster_rank, ...). Two ranks' files can never be
+# byte-equal while these are inside the keys.
+_MOE_RANK_FIELD_POSITIONS = (5, 7, 9)
+_CACHE_GENERATION_KEY = "_generation"
+
+
+def _canonical_autotune_configs(configs: dict) -> dict:
+    """A rank-invariant view of a cache file, for cross-rank comparison only.
+
+    Drops flashinfer's per-write ``_generation`` stamp and masks the rank
+    fields inside MoERunner keys. Everything else -- the problem shapes, every
+    other config bit, the ``_metadata`` stamp and the chosen tactics -- stays,
+    so two ranks agree iff they would hit and miss the same profiles.
+    """
+    import ast
+    import re
+
+    out: dict = {}
+    for k, v in configs.items():
+        if k == _CACHE_GENERATION_KEY:
+            continue
+        if k.startswith("_"):
+            out[k] = v
+            continue
+        try:
+            parsed = ast.literal_eval(
+                re.sub(r"torch\.[A-Za-z0-9_]+", lambda m: f"'{m.group(0)}'", k)
+            )
+        except (ValueError, SyntaxError):
+            out[k] = v
+            continue
+        if (
+            isinstance(parsed, tuple)
+            and len(parsed) == 4
+            and parsed[1] == "MoERunner"
+            and isinstance(parsed[3], tuple)
+        ):
+            cfg = list(parsed[3])
+            for pos in _MOE_RANK_FIELD_POSITIONS:
+                if pos < len(cfg):
+                    cfg[pos] = None
+            parsed = (parsed[0], parsed[1], parsed[2], tuple(cfg))
+        out[repr(parsed)] = v
+    return out
+
+
 def _autotune_cache_digest(cache_path: Path, env: dict[str, str]) -> str:
     """Hash of what this rank would load from ``cache_path`` ("" for nothing).
 
     Includes the environment: ``load_configs`` ignores the whole file when its
     ``_metadata`` stamp disagrees with the environment reading it, so equal
     tactics alone do not mean two ranks load the same thing.
+
+    Compared on the rank-invariant view (``_canonical_autotune_configs``): the
+    raw file embeds the writing rank in every MoERunner key and a per-write
+    ``_generation`` stamp, so a whole-file digest disagreed on EVERY boot at
+    any TP > 1 and both ranks re-tuned from scratch each time (measured
+    fn:N269: 10 of 10 boots; the two files paired 44/44 keys with identical
+    tactics and differed only in tp_rank).
     """
     if not cache_path.is_file():
         return ""
@@ -457,7 +514,7 @@ def _autotune_cache_digest(cache_path: Path, env: dict[str, str]) -> str:
         return ""
     if not isinstance(configs, dict):
         return ""
-    payload = {"file": configs, "env": env}
+    payload = {"file": _canonical_autotune_configs(configs), "env": env}
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 

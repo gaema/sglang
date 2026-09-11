@@ -212,12 +212,32 @@ def is_deepseek_v4(config) -> bool:
     )
 
 
+def is_qwen4_exp(config) -> bool:
+    return _hf_arch(config) in (
+        "Qwen4ExpForConditionalGeneration",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForCausalLMMTP",
+    )
+
+
+def carries_hc_stream_to_draft(hf_config) -> bool:
+    """Archs whose target hands the hc-FLATTENED hidden stream to the draft.
+
+    DSV4 and Qwen4Exp both do: Qwen4Exp's target captures `hc_count * hidden`
+    (qwen4_exp.py, the hidden-capture assert) and its MTP draft normalises it
+    at that width (`pre_fc_norm_hidden` in qwen4_exp_mtp.py) before collapsing.
+    Other hc models (hy_v4) collapse to hidden_size first. Sizing the draft's
+    recurrent hidden_states buffer at hidden_size for Qwen4Exp hands a 2560-wide
+    dummy to a 10240-wide norm during the speculative-draft autotune and fails
+    graph capture (`Mismatched mW.shape[0] ... expected to be 2560`).
+    """
+    return is_deepseek_v4(hf_config) or is_qwen4_exp(hf_config)
+
+
 def resolve_spec_hidden_size(
     hf_config, hidden_size: int, hc_mult: int
 ) -> tuple[int, Optional[int]]:
-    # Only DSV4 carries the hc-flattened stream across the target→draft
-    # boundary; other hc models (hy_v4) collapse to hidden_size first.
-    if hc_mult <= 1 or not is_deepseek_v4(hf_config):
+    if hc_mult <= 1 or not carries_hc_stream_to_draft(hf_config):
         return hidden_size, None
     hc_hidden_size = hidden_size * hc_mult
     return hc_hidden_size, hc_hidden_size
@@ -1218,7 +1238,10 @@ class ModelConfig:
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
-        hc_mult = getattr(self.hf_text_config, "hc_mult", 1)
+        hc_mult = getattr(self.hf_text_config, "hc_mult", None)
+        if hc_mult is None:
+            # Qwen4Exp spells the hyper-connection count `hc_count`.
+            hc_mult = getattr(self.hf_text_config, "hc_count", 1)
         is_glm5_next = getattr(self.hf_config, "model_type", None) == "glm5_next" or (
             getattr(self.hf_text_config, "model_type", None) == "glm5_next_text"
         )
