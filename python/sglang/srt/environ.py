@@ -326,6 +326,18 @@ class Envs:
     # either way. OFF reproduces the historical behaviour (a kill switch, and
     # the must-reject arm of this fix's liveness test).
     SGLANG_QWEN4_PLE_ABORT_PREFETCH_ON_ERROR = EnvBool(True)
+    # R2d (local, UNMEASURED): run the Qwen4-Exp QSA indexer as a registered
+    # tc_piecewise split op so the extend pass can be captured. ON does four
+    # gated things: (1) under a piecewise/breakable prefill graph the compressed
+    # QSA indexer runs as `pcg_qsa_indexer_prefill_split` (an eager custom op
+    # with a fake impl) writing a static, padded, -1-filled top-k buffer instead
+    # of a data-shaped tensor in the traced body; (2) `layer_setup` collects the
+    # hybrid layer's `indexer` into the forward context the op reads it from;
+    # (3) the sparse backend records the host-known max position in the indexer
+    # metadata so the two `positions.max().item()` syncs are skipped; (4)
+    # `Qwen4ExpForConditionalGeneration` joins the multimodal tc_piecewise
+    # allowlist. OFF (default) leaves every one of those code paths untouched.
+    SGLANG_QWEN4_QSA_SPLIT_OP = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)

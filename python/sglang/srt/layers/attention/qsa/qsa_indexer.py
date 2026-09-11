@@ -164,6 +164,7 @@ class QSAIndexer(MultiPlatformOp):
         pool=None,
         cache_loc: torch.Tensor | None = None,
         q_heads_padded: int | None = None,
+        max_position: int | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
         qk, _ = self.index_qk_proj(hidden_states)
         token_k = qk[:, self.index_n_heads * self.index_head_dim :].reshape(
@@ -182,9 +183,7 @@ class QSAIndexer(MultiPlatformOp):
             if not get_is_capture_mode() and hasattr(
                 self.rotary_emb, "_ensure_cos_sin_cache_length"
             ):
-                self.rotary_emb._ensure_cos_sin_cache_length(
-                    int(positions.max().item())
-                )
+                self._ensure_rope_cache(positions, max_position)
             key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
             q = qsa_index_q_norm_rope_store(
                 qk,
@@ -207,18 +206,34 @@ class QSAIndexer(MultiPlatformOp):
         q = self.q_layernorm(q_raw.reshape(-1, self.index_head_dim)).reshape(
             -1, self.index_n_heads, self.index_head_dim
         )
-        q = self.apply_rope(positions, q)
+        q = self.apply_rope(positions, q, max_position=max_position)
         if pool is not None:
             q = q.to(pool.qsa_compressed_dtype)
         return q, token_k, False
 
+    def _ensure_rope_cache(
+        self, positions: torch.Tensor, max_position: int | None
+    ) -> None:
+        """Grow the shared cos/sin cache to cover ``positions``.
+
+        R2d: with ``max_position`` supplied (the backend's host-side bound,
+        SGLANG_QWEN4_QSA_SPLIT_OP on) this is host arithmetic; without it
+        (the default) it is the shipped ``positions.max().item()`` sync.
+        """
+        if max_position is None:
+            max_position = int(positions.max().item())
+        self.rotary_emb._ensure_cos_sin_cache_length(int(max_position))
+
     def normalize_compressed_keys(
-        self, compressed_keys: torch.Tensor, block_positions: torch.Tensor
+        self,
+        compressed_keys: torch.Tensor,
+        block_positions: torch.Tensor,
+        max_position: int | None = None,
     ) -> torch.Tensor:
         normalized = self.k_layernorm(
             compressed_keys.reshape(-1, self.index_head_dim)
         ).reshape(-1, self.index_kv_heads, self.index_head_dim)
-        return self.apply_rope(block_positions, normalized)
+        return self.apply_rope(block_positions, normalized, max_position=max_position)
 
     def _use_fused_compress(self, pool) -> bool:
         return getattr(
@@ -363,7 +378,11 @@ class QSAIndexer(MultiPlatformOp):
         compressed_rope_positions = self._rope_from_matrix(
             source_rope[group_locs[:, 0]]
         )
-        normalized = self.normalize_compressed_keys(pooled, compressed_rope_positions)
+        normalized = self.normalize_compressed_keys(
+            pooled,
+            compressed_rope_positions,
+            max_position=getattr(metadata, "max_position", None),
+        )
         pool.set_qsa_compressed_k_buffer(self.layer_id, compressed_locs, normalized)
 
     def _compress_decode_cuda_graph(self, metadata) -> None:
@@ -399,7 +418,12 @@ class QSAIndexer(MultiPlatformOp):
             return positions[0]
         return positions
 
-    def apply_rope(self, positions: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
+    def apply_rope(
+        self,
+        positions: torch.Tensor,
+        tensor: torch.Tensor,
+        max_position: int | None = None,
+    ) -> torch.Tensor:
         if tensor.numel() == 0:
             return tensor
         positions = positions.long()
@@ -411,7 +435,7 @@ class QSAIndexer(MultiPlatformOp):
         if not get_is_capture_mode() and hasattr(
             self.rotary_emb, "_ensure_cos_sin_cache_length"
         ):
-            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
+            self._ensure_rope_cache(positions, max_position)
 
         # position_cos/position_sin repeat cos/sin to the full rotary width;
         # apply_rotary_emb consumes one half.
@@ -699,6 +723,8 @@ class QSAIndexer(MultiPlatformOp):
                 if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
                 else None
             ),
+            # R2d: None unless SGLANG_QWEN4_QSA_SPLIT_OP set it in the backend.
+            max_position=getattr(indexer_metadata, "max_position", None),
         )
         self.update_key_state_and_compress(
             token_k,

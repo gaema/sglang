@@ -2321,6 +2321,15 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
     multimodal_model_archs.append(external_mm_model_arch)
 
+# R2d (local, UNMEASURED): Qwen4-Exp's LM prefill can only be captured once its
+# QSA indexer is a split op, which SGLANG_QWEN4_QSA_SPLIT_OP provides; the same
+# gate admits the arch to the tc_piecewise allowlist. OFF (default) leaves the
+# list as shipped and the generic multimodal rule keeps prefill CG disabled.
+if envs.SGLANG_QWEN4_QSA_SPLIT_OP.get():
+    multimodal_piecewise_cuda_graph_supported_model_archs.append(
+        "Qwen4ExpForConditionalGeneration"
+    )
+
 
 def is_multimodal_model(model_architectures: List[str]):
     if any(

@@ -91,6 +91,12 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     extend_rope_matrix: Optional[torch.Tensor] = None
     graph_ring_group_locs: Optional[torch.Tensor] = None
     defer_block_expansion: bool = False
+    # R2d (SGLANG_QWEN4_QSA_SPLIT_OP): an upper bound on every RoPE position
+    # this forward will index, known on the host when the metadata is built
+    # (the backend's ``max_length - 1``, read from ``seq_lens_cpu``). When set,
+    # ``QSAIndexer`` grows the cos/sin cache from it instead of syncing on
+    # ``positions.max().item()``; None (the default) keeps the sync.
+    max_position: Optional[int] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)

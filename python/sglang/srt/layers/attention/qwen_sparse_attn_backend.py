@@ -16,6 +16,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
@@ -227,6 +228,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         req_pool = getattr(runner, "req_to_token_pool", None)
         self.req_to_token = getattr(req_pool, "req_to_token", None)
         self.req_to_token_pool = req_pool
+        # R2d (SGLANG_QWEN4_QSA_SPLIT_OP): when ON, extend/decode metadata
+        # carries the host-known max position so the indexer skips its two
+        # `positions.max().item()` syncs. OFF leaves `max_position=None`.
+        self._qsa_hoist_max_position = bool(envs.SGLANG_QWEN4_QSA_SPLIT_OP.get())
         self.forward_metadata: Optional[QwenSparseAttnMetadata] = None
         self._cuda_graph_metadata: Dict[
             Tuple[ForwardMode, int], QwenSparseAttnMetadata
@@ -597,6 +602,13 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "mis-mapped to requests"
             )
         speculative_paged = self._is_speculative_paged_mode(forward_batch.forward_mode)
+        # R2d: host-side bound on the RoPE positions of this forward. Extend
+        # rows index prefix_len..seq_len-1 and decode rows seq_len-1, so
+        # max(seq_lens) - 1 bounds every axis (MRoPE axes never exceed the
+        # text position). Speculative paged modes may advance the RoPE
+        # coordinate independently of the paged position, so they keep the
+        # indexer's own sync (None).
+        max_position: Optional[int] = None
         if speculative_paged:
             logical_positions = forward_batch.positions
             if logical_positions.ndim == 2:
@@ -627,6 +639,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                 max_length = int(forward_batch.seq_lens_cpu[:batch_size].max())
             else:
                 max_length = int(sequence_lengths.max())
+            if self._qsa_hoist_max_position:
+                max_position = max(int(max_length) - 1, 0)
             row_req_pool_indices = forward_batch.req_pool_indices[:batch_size]
             token_slot_table = self.req_to_token[
                 row_req_pool_indices.long(), :max_length
@@ -752,6 +766,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 self._can_defer_block_expansion(forward_batch.forward_mode)
                 and decode_logical_positions is not None
             ),
+            max_position=max_position,
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,

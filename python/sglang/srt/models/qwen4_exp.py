@@ -1592,6 +1592,24 @@ class Qwen4ExpAttentionDecoderLayer(
                 rotary_emb=self.rotary_emb,
             )
         self._init_qwen4_exp_layer_extensions(config, layer_id, quant_config, prefix)
+        # R2d gate, read once at construction: with it OFF (the default) the
+        # split-op branch below is never entered and the QSA path is the
+        # shipped one.
+        self._qsa_split_op_gate = bool(envs.SGLANG_QWEN4_QSA_SPLIT_OP.get())
+        if self._qsa_split_op_gate and self.is_qsa:
+            # Registers the custom op + split op at model construction, i.e.
+            # before the tc_piecewise backend snapshots SPLIT_OPS into its
+            # CompilationConfig (DSA does the same via a module-level import).
+            import sglang.srt.layers.attention.qsa.prefill_cuda_graph  # noqa: F401
+
+    def _qsa_split_op_surface(self, forward_batch: ForwardBatch) -> bool:
+        if not self._qsa_split_op_gate:
+            return False
+        from sglang.srt.layers.attention.qsa.prefill_cuda_graph import (
+            is_graph_qsa_split_op_surface,
+        )
+
+        return is_graph_qsa_split_op_surface(forward_batch)
 
     def _compute_qsa_topk_indices(
         self,
@@ -1603,6 +1621,31 @@ class Qwen4ExpAttentionDecoderLayer(
             get_qsa_indexer_metadata,
             resolve_qsa_sparse_backend,
         )
+
+        if self._qsa_split_op_surface(forward_batch):
+            # R2d (SGLANG_QWEN4_QSA_SPLIT_OP): under a piecewise/breakable
+            # prefill graph the indexer is a registered split op. It writes a
+            # static, padded, -1-filled buffer allocated here in the traced
+            # body (the DSA contract); the attention split op narrows it to
+            # the real query rows. The MTP seed capture runs inside the op.
+            from sglang.srt.layers.attention.qsa.prefill_cuda_graph import (
+                pcg_qsa_indexer_prefill_split,
+                qsa_topk_result_width,
+            )
+
+            topk_result = torch.full(
+                (hidden_states.shape[0], qsa_topk_result_width(self.indexer)),
+                -1,
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+            pcg_qsa_indexer_prefill_split(
+                layer_id=self.layer_id,
+                hidden_states=hidden_states,
+                positions=positions,
+                topk_result=topk_result,
+            )
+            return topk_result
 
         backend = get_attn_backend()
         sparse_backend = resolve_qsa_sparse_backend(backend)
@@ -1642,6 +1685,9 @@ class Qwen4ExpAttentionDecoderLayer(
             and self.alt_stream is not None
             and get_is_capture_mode()
             and hidden_states.shape[0] < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
+            # R2d: a split op is a single-stream seam of the prefill graph;
+            # never fork it onto alt_stream (gate OFF -> always False here).
+            and not self._qsa_split_op_surface(forward_batch)
         )
         attention_kwargs = {}
         if overlap_indexer:
