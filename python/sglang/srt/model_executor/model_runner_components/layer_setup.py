@@ -17,6 +17,12 @@ class AttentionAndMoeLayers(NamedTuple):
     mha_companion_layers: list[Any]
 
 
+def _qsa_split_op_enabled() -> bool:
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_QWEN4_QSA_SPLIT_OP.get())
+
+
 def _get_loop_num(hf_config: Any) -> int:
     # Nanbeige uses num_loops; IQuestLoopCoder uses loop_num.
     return int(getattr(hf_config, "loop_num", getattr(hf_config, "num_loops", 1)) or 1)
@@ -106,6 +112,11 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
         dsa_indexer = None
         if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "indexer"):
             dsa_indexer = layer.self_attn.indexer
+        elif _qsa_split_op_enabled() and hasattr(layer, "indexer"):
+            # R2d (SGLANG_QWEN4_QSA_SPLIT_OP): hybrid Qwen4-Exp attention
+            # layers keep their QSA indexer at `layer.indexer`; the prefill
+            # split op reads it back from this slot by layer_id.
+            dsa_indexer = layer.indexer
         dsa_indexers.append(dsa_indexer)
 
     # Reorder so attention_layers[i] matches RadixAttention.layer_id.
