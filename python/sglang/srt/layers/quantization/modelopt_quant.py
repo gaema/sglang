@@ -1465,6 +1465,23 @@ _SHARED_DENSE_NVFP4_LEAVES = frozenset({"gate_up_proj", "down_proj"})
 SHARED_DENSE_NVFP4_A16_ENV = "SGLANG_GLM53_SHARED_DENSE_NVFP4_A16"
 _SHARED_DENSE_NVFP4_A16 = os.environ.get(SHARED_DENSE_NVFP4_A16_ENV, "").strip() == "1"
 
+# --- G41 (default ON): reconcile gate/up weight_scale_2 for single-alpha MoE backends
+# Gate: SGLANG_GLM53_W13_SCALE2_RECONCILE, read ONCE at import. Default ON. The
+# FlashInfer CUTLASS runner takes ONE fc1 dequant scale per expert (quant_scales[2],
+# 1-D [num_experts]; csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
+# `fc1_global` CHECK_DIM(1)), and both CuteDSL paths derive w1_alpha from g1_alphas --
+# yet a ModelOpt checkpoint may store DIFFERENT per-tensor weight_scale_2 for gate_proj
+# and up_proj (LibertAIDAI/GLM-5.3-Flash-NVFP4: 8,563 of 12,384 experts, ratio up to
+# 10x). Applying the gate scalar to the up half is a math error, not a convention, so
+# the fix is ON by default; =0 restores the old behaviour for an A/B.
+W13_SCALE2_RECONCILE_ENV = "SGLANG_GLM53_W13_SCALE2_RECONCILE"
+_W13_SCALE2_RECONCILE = os.environ.get(W13_SCALE2_RECONCILE_ENV, "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "off",
+)
+
 # --- L4a (opt-in): online fp8 for ParallelLMHead ---
 # Gate: SGLANG_GLM53_LMHEAD_FP8=1, read ONCE at import. Default OFF -> no dispatch
 # change. When ON, an excluded ParallelLMHead is served by LmHeadOnlineFp8Method (the
@@ -2753,6 +2770,64 @@ def _compute_gemm1_alphas(
     return g1_alphas, g1_alphas_up
 
 
+def reconcile_w13_weight_scale_2(
+    w13_weight_scale_2: torch.Tensor,
+    w13_weight_scale: torch.Tensor,
+    *,
+    gate_first: bool,
+    chunk: int = 16,
+) -> tuple[int, float]:
+    """[G41] Fold a per-expert gate/up ``weight_scale_2`` mismatch into the e4m3
+    block scales so ONE GEMM1 alpha is exact for both halves.
+
+    ``w13_weight_scale_2`` is ``[E, 2]`` (col 0 = gate/w1, col 1 = up/w3, per
+    FusedMoE._load_per_tensor_weight_scale). ``w13_weight_scale`` is
+    ``[E, 2*I, K/16]`` e4m3 with the two halves STACKED on dim 1 by
+    FusedMoE._load_w13; ``gate_first`` says whether gate occupies rows ``[0:I)``
+    (True) or ``[I:2I)`` (False -- the load_up_proj_weight_first layout the
+    CUTLASS / CuteDSL-v2 kernels take).
+
+    For each expert whose columns differ: ``shared = max(gate, up)``; each
+    half's block scales are multiplied by ``s_half / shared`` (<= 1, so no e4m3
+    overflow) and re-quantised to e4m3 (3 mantissa bits -- a bounded precision
+    loss on the smaller-scale half); both columns are then set to ``shared`` so
+    ``g1_alphas == g1_alphas_up``. Experts whose columns already agree are not
+    touched. Both tensors are modified IN PLACE.
+
+    Returns ``(num_experts_reconciled, max_ratio)``.
+    """
+    if w13_weight_scale_2.dim() != 2 or w13_weight_scale_2.shape[1] < 2:
+        return 0, 1.0
+    gate_s2 = w13_weight_scale_2[:, 0]
+    up_s2 = w13_weight_scale_2[:, 1]
+    differ = gate_s2 != up_s2
+    n = int(differ.sum().item())
+    if n == 0:
+        return 0, 1.0
+    assert w13_weight_scale.dim() == 3 and w13_weight_scale.shape[1] % 2 == 0, (
+        f"[G41] expected w13_weight_scale [E, 2*I, K/16], got {tuple(w13_weight_scale.shape)}"
+    )
+    idx = differ.nonzero(as_tuple=False).flatten()
+    shared = torch.maximum(gate_s2, up_s2)
+    ratio = torch.maximum(gate_s2 / up_s2, up_s2 / gate_s2)[idx]
+    max_ratio = float(ratio.max().item())
+    half_rows = w13_weight_scale.shape[1] // 2
+    lo, hi = slice(0, half_rows), slice(half_rows, 2 * half_rows)
+    gate_rows, up_rows = (lo, hi) if gate_first else (hi, lo)
+    bs_dtype = w13_weight_scale.dtype
+    for rows, s_half in ((gate_rows, gate_s2), (up_rows, up_s2)):
+        # Chunk the differing experts so the fp32 temporary stays small
+        # (one expert half of GLM-5.3-Flash is [2048, 256] -> 2 MiB fp32).
+        for start in range(0, idx.numel(), chunk):
+            e = idx[start : start + chunk]
+            factor = (s_half[e] / shared[e]).to(torch.float32).view(-1, 1, 1)
+            blk = w13_weight_scale[e, rows, :].to(torch.float32)
+            w13_weight_scale[e, rows, :] = (blk * factor).to(bs_dtype)
+    w13_weight_scale_2[:, 0] = shared
+    w13_weight_scale_2[:, 1] = shared
+    return n, max_ratio
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -3050,6 +3125,44 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
             prepare_moe_nvfp4_layer_for_marlin(layer)
             return
+
+        # [G41] Single-alpha backends (FlashInfer CUTLASS `fc1_global`, CuteDSL
+        # v1/v2 via g1_alphas) cannot express a per-expert gate/up
+        # weight_scale_2 difference, so fold it into the e4m3 block scales
+        # BEFORE the alphas are derived and the scales swizzled. The TRT-LLM
+        # runner consumes g1_alphas_up itself and is left alone.
+        if (
+            _W13_SCALE2_RECONCILE
+            and layer.moe_runner_config.is_gated
+            and not self.enable_flashinfer_trtllm_moe
+        ):
+            # Row layout of w13_weight_scale on this branch: a checkpoint-
+            # interleaved w13 was de-interleaved gate-first above (up_first is
+            # the TRT-LLM flag, False here); otherwise FusedMoE._load_w13 put
+            # gate at rows [I:2I) iff load_up_proj_weight_first (CUTLASS /
+            # CuteDSL v2) and at [0:I) otherwise (CuteDSL v1).
+            gate_first = bool(getattr(layer, "_w13_deinterleaved", False)) or (
+                not self.load_up_proj_weight_first
+            )
+            n_rec, max_ratio = reconcile_w13_weight_scale_2(
+                layer.w13_weight_scale_2.data,
+                layer.w13_weight_scale.data,
+                gate_first=gate_first,
+            )
+            num_e = layer.w13_weight_scale_2.shape[0]
+            if n_rec:
+                logger.info(
+                    "[G41] w13 gate/up weight_scale_2 reconciled for %d of %d experts "
+                    "(max ratio %.4f); blockscales rescaled to the shared max",
+                    n_rec,
+                    num_e,
+                    max_ratio,
+                )
+            else:
+                logger.info(
+                    "[G41] w13 gate/up weight_scale_2: 0 experts differ (%d experts)",
+                    num_e,
+                )
 
         # Calculate input scales based on strategy
         if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
