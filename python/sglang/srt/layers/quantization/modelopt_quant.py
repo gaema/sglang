@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
 from __future__ import annotations
 
+import os
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
