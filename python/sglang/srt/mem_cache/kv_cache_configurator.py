@@ -85,6 +85,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
+    mamba_decode_holds_one_enabled,
     max_speculative_num_draft_tokens,
     pre_capture_activation_reserve_mb,
 )
@@ -2185,8 +2186,41 @@ class KVCacheConfigurator:
 
         return int(rest_memory * (1 << 30))  # return in bytes
 
+    def _mamba_decode_holds_one_reserve(self) -> tuple[int, str]:
+        """G47 admission: pool slots = M x 1 + reserve. Returns (reserve, formula).
+
+        A running request holds its active slot. Beyond that the pool must
+        cover, all at once: the ping-pong keep slot of every request in the
+        one prefill batch in flight (a batch admits at most
+        chunked_prefill_size new tokens and a donated checkpoint lands on the
+        mamba_track_interval grid, so at most ceil(chunked / interval)
+        checkpoint-bearing requests; each keep slot is released to the tree
+        at its prefill->decode donation), the one chunked request in flight
+        (its chunk-boundary replacement slot + its re-locked donated node),
+        and one decode-boundary transient so a finish-time checkpoint stays
+        allocatable. Tree nodes beyond that are evictable, not reserved."""
+        schedule = get_schedule()
+        chunked = schedule.chunked_prefill_size or 0
+        if chunked <= 0:
+            chunked = schedule.max_prefill_tokens or 0
+        interval = get_exec().mamba.mamba_track_interval
+        prefill_batch_reqs = max(1, math.ceil(chunked / interval))
+        chunked_req = 2
+        boundary = 1
+        reserve = prefill_batch_reqs + chunked_req + boundary
+        formula = (
+            f"M x 1 + {reserve} [= ceil(chunked_prefill_size {chunked} / "
+            f"mamba_track_interval {interval}) = {prefill_batch_reqs} prefill-batch "
+            f"ping-pong + {chunked_req} chunked-request + {boundary} decode-boundary]"
+        )
+        return reserve, formula
+
     def _calculate_mamba_ratio(self) -> int:
         if get_memory().disable_radix_cache:
+            return 1
+        if mamba_decode_holds_one_enabled():
+            # G47: one slot per running request; the prefill reserve is
+            # additive (see _mamba_decode_holds_one_reserve), not a ratio.
             return 1
 
         skip_decode_lock = envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
@@ -2263,8 +2297,30 @@ class KVCacheConfigurator:
         capped_by_mamba = False
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
-            mamba_cap = get_schedule().max_mamba_cache_size // ratio
-            if mamba_cap < max_num_reqs:
+            holds_one = mamba_decode_holds_one_enabled()
+            if holds_one:
+                reserve, formula = self._mamba_decode_holds_one_reserve()
+                mamba_cap = get_schedule().max_mamba_cache_size - reserve
+                logger.info(
+                    "mamba admission (SGLANG_GLM53_MAMBA_DECODE_HOLDS_ONE): pool of "
+                    "%d slots = %s -> at most %d running requests",
+                    get_schedule().max_mamba_cache_size,
+                    formula,
+                    mamba_cap,
+                )
+            else:
+                mamba_cap = get_schedule().max_mamba_cache_size // ratio
+            if holds_one and mamba_cap < max_num_reqs:
+                capped_by_mamba = True
+                logger.warning(
+                    "max_running_requests is capped to %d by the mamba state cache "
+                    "(SGLANG_GLM53_MAMBA_DECODE_HOLDS_ONE: max_mamba_cache_size=%d = "
+                    "%s). To raise it: increase --max-mamba-cache-size.",
+                    mamba_cap,
+                    get_schedule().max_mamba_cache_size,
+                    formula,
+                )
+            elif mamba_cap < max_num_reqs:
                 capped_by_mamba = True
                 logger.warning(
                     "max_running_requests is capped to %d by the mamba state "

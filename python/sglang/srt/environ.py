@@ -1358,6 +1358,15 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    # G47 (opt-in; MambaRadixCache, extra_buffer_lazy, no spec decode): a
+    # request that has left prefill holds ONE mamba slot -- its active state.
+    # At the prefill->decode donation the ping-pong keep slot goes to the tree
+    # with NO replacement (the lazy boundary path allocates a checkpoint slot
+    # on demand; if that alloc fails the boundary is simply not tracked), and
+    # the request's own donated node keeps only its KV (full) lock -- its mamba
+    # state is an ordinary evictable tree node. Admission is sized as
+    # M x 1 + a bounded prefill reserve instead of ratio x M. Off = unchanged.
+    SGLANG_GLM53_MAMBA_DECODE_HOLDS_ONE = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers

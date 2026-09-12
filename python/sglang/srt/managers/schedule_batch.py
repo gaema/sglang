@@ -3259,6 +3259,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_lazy_post_decode_at_boundary.
         """
         pool = self.req_to_token_pool
+        # Rows whose boundary cannot be tracked this step (G47: the keep slot
+        # was donated with no replacement and no transient could be allocated).
+        untrackable: List[int] = []
         for i, req in enumerate(self.reqs):
             buf = req.kv.mamba_ping_pong_track_buffer
             assert buf is not None
@@ -3279,6 +3282,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if new_slot is not None:
                 pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                 req.kv.mamba_next_track_idx = other_idx
+            elif buf[req.kv.mamba_next_track_idx].item() == -1:
+                # G47: nowhere to degrade into (the keep slot is empty), so
+                # this boundary is not tracked; the mask row is cleared.
+                untrackable.append(i)
+        return untrackable
 
     def mamba_lazy_spec_prepare(self, mamba_track_interval: int, max_draft_tokens: int):
         """Lazy-mode spec counterpart of mamba_lazy_prealloc_at_boundary.
@@ -3407,6 +3415,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if get_exec().mamba.enable_mamba_extra_buffer:
             mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
 
+            untrackable = []
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
                     (0,), dtype=torch.int64, device=self.device
@@ -3414,11 +3423,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.mamba_track_buffer_indices = []
             else:
                 if get_exec().mamba.enable_mamba_extra_buffer_lazy:
-                    self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
+                    untrackable = self.mamba_lazy_prealloc_at_boundary(
+                        mamba_track_interval
+                    )
                 set_mamba_track_indices_from_reqs(self)
 
             track_remainders_cpu = self.seq_lens_cpu % mamba_track_interval
             track_mask_cpu = track_remainders_cpu == 0
+            if untrackable:
+                # G47: a -1 track index must never meet a True mask (the static
+                # pool's track-save kernel has no -1 guard).
+                track_mask_cpu[untrackable] = False
             self.mamba_track_mask_cpu = track_mask_cpu.tolist()
             self.mamba_track_mask_next_cpu = (
                 (track_remainders_cpu == mamba_track_interval - 1).tolist()

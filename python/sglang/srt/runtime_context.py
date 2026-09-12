@@ -1767,6 +1767,20 @@ def reset_context() -> None:
     set_global_dwdp_manager(None)
 
 
+def mamba_decode_holds_one_enabled() -> bool:
+    """G47: ``SGLANG_GLM53_MAMBA_DECODE_HOLDS_ONE`` on the lazy extra-buffer
+    strategy without speculative decoding (the spec scatter path carries no
+    -1 guard for an empty keep slot). See the env leaf for what it changes.
+    """
+    from sglang.srt.environ import envs
+
+    return (
+        envs.SGLANG_GLM53_MAMBA_DECODE_HOLDS_ONE.get()
+        and get_exec().mamba.enable_mamba_extra_buffer_lazy
+        and get_spec().speculative_algorithm is None
+    )
+
+
 def remote_instance_transfer_engine_enabled(load_format: str | None = None) -> bool:
     """Whether remote-instance weight loading runs over the transfer engine.
 

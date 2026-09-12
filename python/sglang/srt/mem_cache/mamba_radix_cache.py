@@ -53,6 +53,7 @@ from sglang.srt.mem_cache.utils import split_node_hash_value
 from sglang.srt.runtime_context import (
     get_parallel,
     mamba_cache_chunk_size,
+    mamba_decode_holds_one_enabled,
 )
 
 if TYPE_CHECKING:
@@ -462,6 +463,8 @@ class MambaRadixCache(BasePrefixCache):
         self.disable = params.disable
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
+        # G47: see SGLANG_GLM53_MAMBA_DECODE_HOLDS_ONE.
+        self.decode_holds_one = mamba_decode_holds_one_enabled()
         self.kv_events = KVCacheEventRecorder(
             enabled=params.enable_kv_cache_events, page_size=self.page_size
         )
@@ -621,7 +624,10 @@ class MambaRadixCache(BasePrefixCache):
                 src_active = req.kv.mamba_ping_pong_track_buffer[
                     mamba_ping_pong_track_buffer_to_keep
                 ].unsqueeze(-1)
-                if _MAMBA_DEBUG_ASSERTS:
+                # G47: with nothing to cache (no tracked decode boundary) the
+                # keep slot is legitimately -1; the empty-key insert below is a
+                # no-op and free_mamba_cache skips -1 entries.
+                if _MAMBA_DEBUG_ASSERTS and page_aligned_len > 0:
                     # .item() forces a cudaStreamSynchronize; only pay it when debugging.
                     assert src_active.item() != -1, (
                         f"Cached mamba slot is -1: keep_idx={mamba_ping_pong_track_buffer_to_keep}, "
@@ -685,7 +691,7 @@ class MambaRadixCache(BasePrefixCache):
                 mamba_ping_pong_track_buffer_to_keep=mamba_ping_pong_track_buffer_to_keep,
             )
 
-        self.dec_lock_ref(req.last_node)
+        self._dec_req_last_node_lock(req)
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
@@ -750,7 +756,17 @@ class MambaRadixCache(BasePrefixCache):
                     req.kv.mamba_pool_idx.view(-1)
                 )
         elif self.enable_mamba_extra_buffer:
-            new_slot = self._alloc_mamba_slot()
+            if self.decode_holds_one and not chunked:
+                # G47: the request is leaving prefill. Its keep slot goes to
+                # the tree with NO replacement: decode reads the active slot
+                # only, and mamba_lazy_prealloc_at_boundary allocates a
+                # checkpoint slot on demand at the next track boundary
+                # (skipping the boundary when it cannot). A chunked request
+                # still checkpoints its next chunk, so it is unchanged.
+                buf = req.kv.mamba_ping_pong_track_buffer
+                new_slot = torch.full((1,), -1, dtype=buf.dtype, device=buf.device)
+            else:
+                new_slot = self._alloc_mamba_slot()
             mamba_value_donated = self.req_to_token_pool.donate_mamba_ping_pong_slot(
                 req, new_slot
             )
@@ -810,8 +826,15 @@ class MambaRadixCache(BasePrefixCache):
             new_indices[req.kv.cache_protected_len :],
         )
 
-        self.dec_lock_ref(req.last_node)
+        self._dec_req_last_node_lock(req)
         self.inc_lock_ref(new_last_node)
+        if self.decode_holds_one and not chunked:
+            # G47: keep the KV (full) lock -- the request's prefix indices live
+            # in the tree -- but release the mamba lock on its own donated
+            # node: decode reads the active slot, so this state serves future
+            # prefix hits only and may be evicted like any other node.
+            self._dec_mamba_lock_only(new_last_node)
+            req.mamba_own_node_unlocked = True
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         # NOTE: this is needed for both page_size == 1 and page_size > 1
@@ -836,6 +859,19 @@ class MambaRadixCache(BasePrefixCache):
         assert x.full_lock_ref == 0 and x.mamba_lock_ref == 0, (
             f"evict leaf node invalid with {x.id=} {x.full_lock_ref=} {x.mamba_lock_ref=}"
         )
+
+        if x.mamba_value is None and self.decode_holds_one and not is_evict_mamba:
+            # G47 tombstone leaf: its mamba state was evicted while a live
+            # request still held its KV, and that lock has since dropped.
+            # Free the KV only (it is in the full LRU, not the mamba LRU).
+            self.kv_events.record_remove(x)
+            self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
+            full_num_evicted = len(x.value)
+            x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
+            self.full_lru_list.remove_node(x)
+            self._delete_tombstone_leaf(x)
+            x, leaf_full_num_evicted = self._iteratively_delete_tombstone_leaf(x)
+            return full_num_evicted + leaf_full_num_evicted, 0, x, x_next
 
         assert x.mamba_value is not None, f"leaf node mamba value is not None, {x.id=}"
         # 1. a leaf node, free full tokens and mamba
@@ -894,8 +930,10 @@ class MambaRadixCache(BasePrefixCache):
             assert x != self.root_node, f"root node is not evictable, {x.id=}"
             assert x.mamba_lock_ref == 0, f"node is in use by mamba kv indices, {x.id=}"
 
-            if len(x.children) > 0:
-                # 1. an internal node, free mamba tokens.
+            if len(x.children) > 0 or (self.decode_holds_one and x.full_lock_ref > 0):
+                # 1. an internal node -- or (G47) a leaf whose KV a live request
+                # still holds: free the mamba state only and tombstone the node;
+                # its KV goes through evict_full once the full lock drops.
                 self._free_mamba_value(x.mamba_value)
                 mamba_num_evicted += len(x.mamba_value)
 
@@ -997,6 +1035,42 @@ class MambaRadixCache(BasePrefixCache):
             node = node.parent
 
         return DecLockRefResult()
+
+    def _dec_mamba_lock_only(self, node: TreeNode) -> None:
+        """Release only the mamba half of a lock taken by inc_lock_ref (G47)."""
+        if self.disable or node.mamba_value is None:
+            return
+        assert (
+            node.mamba_lock_ref > 0
+        ), f"_dec_mamba_lock_only on node with {node.mamba_lock_ref=}, {node.id=}"
+        if node.mamba_lock_ref == 1:
+            self.mamba_evictable_size_ += len(node.mamba_value)
+            self.mamba_protected_size_ -= len(node.mamba_value)
+        node.mamba_lock_ref -= 1
+
+    def _dec_full_lock_only(self, node: TreeNode) -> None:
+        """Release only the KV (full) half of a lock taken by inc_lock_ref."""
+        if self.disable:
+            return
+        while node != self.root_node:
+            assert (
+                node.full_lock_ref > 0
+            ), f"_dec_full_lock_only on node with {node.full_lock_ref=}, {node.id=}"
+            if node.full_lock_ref == 1:
+                self.full_evictable_size_ += len(node.value)
+                self.full_protected_size_ -= len(node.value)
+            node.full_lock_ref -= 1
+            node = node.parent
+
+    def _dec_req_last_node_lock(self, req: Req) -> None:
+        """Release the lock this cache holds on ``req.last_node`` for ``req``.
+        Under G47 the mamba half was already released at the prefill->decode
+        donation (``req.mamba_own_node_unlocked``), so only the KV half remains."""
+        if getattr(req, "mamba_own_node_unlocked", False):
+            req.mamba_own_node_unlocked = False
+            self._dec_full_lock_only(req.last_node)
+        else:
+            self.dec_lock_ref(req.last_node)
 
     def sanity_check(self):
         if self.disable:
@@ -1372,7 +1446,10 @@ class MambaRadixCache(BasePrefixCache):
         self.mamba_evictable_size_ -= len(node.mamba_value)
 
     def _tombstone_internal_node(self, node: TreeNode) -> None:
-        assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
+        # A leaf may be tombstoned only while a live request holds its KV (G47).
+        assert len(node.children) != 0 or node.full_lock_ref > 0, (
+            f"Cannot tombstone a leaf node, {node.id=}"
+        )
         self.mamba_evictable_size_ -= len(node.mamba_value)
         node.mamba_value = None
 
