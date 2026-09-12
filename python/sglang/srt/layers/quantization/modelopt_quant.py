@@ -1406,10 +1406,37 @@ _IGNORED_LINEAR_FP8 = os.environ.get(IGNORED_LINEAR_FP8_ENV, "").strip() == "1"
 _IGNORED_LINEAR_FP8_DENY_PARTS = frozenset(
     {"gate", "indexer", "visual", "vision_model", "eh_proj", "mtp", "mtp_layers"}
 )
+# Tiny-N KDA projections that L1 leaves in bf16 by default: f_a_proj / g_a_proj
+# (N=128, replicated) and b_proj (N=32/rank). At decode M <= 32 the sm_120 fp8
+# CUTLASS GEMM (one 128x128x128 instantiation, no small-M shape) runs each as ONE
+# CTA behind its own per-token quant kernel, for 0.037 GiB of the ~3.54 GiB L1
+# saves (2.25 MiB/layer bf16 = 76.5 MiB/rank kept). SGLANG_GLM53_FP8_DENYLIST=
+# <comma-separated leaf names> overrides the set; an EMPTY value converts
+# everything (the behaviour before this deny-list existed). Matched on the
+# module's LEAF name, so `kv_b_proj` is not `b_proj`.
+IGNORED_LINEAR_FP8_DENYLIST_ENV = "SGLANG_GLM53_FP8_DENYLIST"
+_IGNORED_LINEAR_FP8_DENYLIST_DEFAULT = "f_a_proj,g_a_proj,b_proj"
+
+
+def _parse_fp8_denylist(raw: Optional[str]) -> frozenset:
+    if raw is None:
+        raw = _IGNORED_LINEAR_FP8_DENYLIST_DEFAULT
+    return frozenset(p.strip() for p in raw.split(",") if p.strip())
+
+
+_IGNORED_LINEAR_FP8_DENYLIST = _parse_fp8_denylist(
+    os.environ.get(IGNORED_LINEAR_FP8_DENYLIST_ENV)
+)
 
 
 def ignored_linear_fp8_enabled() -> bool:
     return _IGNORED_LINEAR_FP8
+
+
+def ignored_linear_fp8_denylisted(prefix: str) -> bool:
+    """True when the module's leaf name is on the SGLANG_GLM53_FP8_DENYLIST set."""
+    parts = prefix.split(".")
+    return bool(parts) and parts[-1] in _IGNORED_LINEAR_FP8_DENYLIST
 
 
 def ignored_linear_fp8_in_scope(prefix: str) -> bool:
@@ -1462,6 +1489,8 @@ class _IgnoredLinearFp8Ledger:
     processed = 0
     bytes_before = 0
     bytes_after = 0
+    denied = 0
+    denied_prefixes: List[str] = []
     prefixes: List[str] = []
 
 
@@ -1496,9 +1525,13 @@ class IgnoredLinearOnlineFp8Method(Fp8LinearMethod):
             gib = 1024.0**3
             logger.info(
                 "[%s] online fp8 for ignore-listed linears: %d layers converted, "
-                "%.4f GiB -> %.4f GiB per rank (saved %.4f GiB); weight dtype now %s",
+                "%d denied (%s=%s), %.4f GiB -> %.4f GiB per rank (saved %.4f GiB); "
+                "weight dtype now %s",
                 IGNORED_LINEAR_FP8_ENV,
                 L.processed,
+                L.denied,
+                IGNORED_LINEAR_FP8_DENYLIST_ENV,
+                ",".join(sorted(_IGNORED_LINEAR_FP8_DENYLIST)) or "<empty>",
                 L.bytes_before / gib,
                 L.bytes_after / gib,
                 (L.bytes_before - L.bytes_after) / gib,
@@ -1788,6 +1821,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             prefix, self.exclude_modules, self.packed_modules_mapping
         ) or self.is_layer_excluded(prefix)
         if not excluded or not ignored_linear_fp8_in_scope(prefix):
+            return None
+        if ignored_linear_fp8_denylisted(prefix):
+            _IgnoredLinearFp8Ledger.denied += 1
+            _IgnoredLinearFp8Ledger.denied_prefixes.append(prefix)
             return None
         return IgnoredLinearOnlineFp8Method(self._ignored_linear_fp8_config(), prefix)
 
