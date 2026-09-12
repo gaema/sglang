@@ -422,6 +422,44 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
+def _glm53_mem_census(tag: str, device: str, gpu_id: int, tp_rank: int) -> None:
+    """GLM53_MEM_CENSUS: attribute device memory that is not the torch pool.
+
+    non_torch = total - free - reserved is the CUDA context + cubins + NCCL +
+    anything allocated outside the caching allocator. See the GLM-5.3-Flash
+    resident-vram plan, lever L12.
+    """
+    if not envs.SGLANG_GLM53_MEM_CENSUS.get():
+        return
+    if device != "cuda" or not torch.cuda.is_available():
+        return
+    try:
+        free_b, total_b = torch.cuda.mem_get_info(gpu_id)
+        stats = torch.cuda.memory_stats(gpu_id)
+        reserved_b = stats.get("reserved_bytes.all.current", 0)
+        allocated_b = stats.get("allocated_bytes.all.current", 0)
+        peak_reserved_b = stats.get("reserved_bytes.all.peak", 0)
+        peak_allocated_b = stats.get("allocated_bytes.all.peak", 0)
+        g = float(1 << 30)
+        logger.info(
+            "[GLM53_MEM_CENSUS %s TP%d] total=%.4f free=%.4f used=%.4f | "
+            "torch reserved=%.4f allocated=%.4f (peak reserved=%.4f allocated=%.4f) | "
+            "NON-TORCH=%.4f GiB",
+            tag,
+            tp_rank,
+            total_b / g,
+            free_b / g,
+            (total_b - free_b) / g,
+            reserved_b / g,
+            allocated_b / g,
+            peak_reserved_b / g,
+            peak_allocated_b / g,
+            (total_b - free_b - reserved_b) / g,
+        )
+    except Exception:  # diagnostics must never take the server down
+        logger.warning("[GLM53_MEM_CENSUS %s] census failed", tag, exc_info=True)
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -1222,6 +1260,10 @@ class Scheduler(
                 f"{self.startup_available_gpu_memory_gb:.2f} GB"
             )
 
+        _glm53_mem_census(
+            "post-sizing", self.device, self.ps.gpu_id, self.ps.tp_rank
+        )
+
     def emit_metrics_constants(self) -> None:
         if not get_observability().enable_metrics:
             return
@@ -1849,6 +1891,9 @@ class Scheduler(
         """
         # Engine init (graph capture, warmups) is done; from here on any
         # Triton kernel device-load is a lazy first-use at serving time.
+        _glm53_mem_census(
+            "pre-serving", self.device, self.ps.gpu_id, self.ps.tp_rank
+        )
         triton_load_watch.install()
         triton_load_watch.mark_serving_started()
 

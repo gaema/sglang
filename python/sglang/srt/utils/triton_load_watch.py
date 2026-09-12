@@ -95,6 +95,26 @@ def _on_kernel_load(module, function, name, metadata_group, hash) -> None:
     if not _serving_started:
         return
 
+    if envs.SGLANG_GLM53_MEM_CENSUS.get() and torch.cuda.is_available():
+        # GLM53_MEM_CENSUS: price the cubins L15 names. NON-TORCH walks up by
+        # exactly the bytes each late device-load takes outside the allocator.
+        try:
+            dev = torch.cuda.current_device()
+            free_b, total_b = torch.cuda.mem_get_info(dev)
+            stats = torch.cuda.memory_stats(dev)
+            reserved_b = stats.get("reserved_bytes.all.current", 0)
+            g = float(1 << 30)
+            logger.info(
+                "[GLM53_MEM_CENSUS triton-load] kernel='%s' free=%.4f "
+                "reserved=%.4f NON-TORCH=%.4f GiB",
+                name,
+                free_b / g,
+                reserved_b / g,
+                (total_b - free_b - reserved_b) / g,
+            )
+        except Exception:
+            logger.debug("census failed in triton load hook", exc_info=True)
+
     free_gb = None
     if torch.cuda.is_available():
         try:

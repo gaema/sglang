@@ -1069,6 +1069,7 @@ class Envs:
     # verifies that startup warmup covers every kernel specialization used at
     # serving time.
     SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY = EnvBool(False)
+    SGLANG_GLM53_MEM_CENSUS = EnvBool(False)
     SGLANG_TRITON_SLOW_COMPILE_THRESHOLD_SECS = EnvFloat(1.0)
     SGLANG_TRITON_LOAD_WARNING_THRESHOLD_GB = EnvFloat(1.0)
     # gfx950 MLA decode stage-1: pick the launch geometry and split count per batch.
