@@ -8,6 +8,7 @@ small quant_info payload and route through ``MoeRunner``.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -27,6 +28,9 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import next_power_of_2
+
+logger = logging.getLogger(__name__)
+_g42_fallback_warned = False
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
@@ -59,6 +63,13 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     moe_ep_size: int = 1
     moe_ep_rank: int = 0
     apply_routed_scaling_factor: bool = True
+    # [G42] Caller-owned scratch buffer for ``cutlass_fused_moe(workspace_buffer=)``,
+    # reserved once at weight-processing time (modelopt_quant.reserve_cutlass_moe_workspace)
+    # so the first prefill never allocates ~0.5 GiB under memory pressure. Valid for
+    # any batch of <= ``workspace_max_tokens`` rows; larger batches fall back to the
+    # kernel's own per-call allocation.
+    workspace_buffer: Optional[torch.Tensor] = None
+    workspace_max_tokens: int = 0
 
 
 @dataclass
@@ -231,6 +242,21 @@ def _run_flashinfer_cutlass(
             quant_scales[5],
         ]
 
+    # [G42] Use the reserved workspace when the batch fits it; otherwise let the
+    # kernel allocate (its original behaviour) and say so once.
+    workspace_buffer = quant_info.workspace_buffer
+    if workspace_buffer is not None and x.shape[0] > quant_info.workspace_max_tokens:
+        global _g42_fallback_warned
+        if not _g42_fallback_warned:
+            _g42_fallback_warned = True
+            logger.warning(
+                "[G42] cutlass MoE batch of %d tokens exceeds the reserved workspace "
+                "(%d tokens); this call allocates its own workspace",
+                x.shape[0],
+                quant_info.workspace_max_tokens,
+            )
+        workspace_buffer = None
+
     output = flashinfer_cutlass_fused_moe(
         output=output,
         input=x,
@@ -249,6 +275,7 @@ def _run_flashinfer_cutlass(
         activation_type=_activation_type(runner_config),
         enable_alltoall=enable_alltoall,
         use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+        workspace_buffer=workspace_buffer,
     )[0]
 
     if quant_info.quant_type in ("bf16", "fp8"):

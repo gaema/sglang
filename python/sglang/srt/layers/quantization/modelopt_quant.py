@@ -1482,6 +1482,145 @@ _W13_SCALE2_RECONCILE = os.environ.get(W13_SCALE2_RECONCILE_ENV, "1").strip() no
     "off",
 )
 
+# --- G42 (default ON): reserve the FlashInfer CUTLASS MoE workspace at load time
+# Gate: SGLANG_GLM53_MOE_WORKSPACE_RESERVE, read ONCE at import. Default ON; =0
+# restores the kernel's per-call allocation. Without it the first MoE prefill
+# chunk allocates a ~0.5 GiB GEMM workspace AFTER the KV/mamba pools have taken
+# every byte --mem-fraction-static left, so the allocation fails on the first try
+# and the CUDACachingAllocator retry path (or a hard OOM) decides the boot's
+# numerics: same-tree boots split into two NLL clusters (G38). Reserving the
+# buffer inside process_weights_after_loading -- i.e. BEFORE
+# get_available_gpu_memory sizes the pools -- puts it in the accounting, exactly
+# as L14 did for the DSA workspace. The size comes from FlashInfer's own
+# cutlass_fused_moe_workspace_size (the binding's getWorkspaceSize formula) for
+# SGLANG_GLM53_MOE_WORKSPACE_TOKENS rows (default: max(chunked_prefill_size,
+# max_running_requests, cuda_graph_max_bs)); the ONE buffer is shared by every
+# MoE layer on the rank, since they run sequentially on one stream.
+MOE_WORKSPACE_RESERVE_ENV = "SGLANG_GLM53_MOE_WORKSPACE_RESERVE"
+_MOE_WORKSPACE_RESERVE = os.environ.get(MOE_WORKSPACE_RESERVE_ENV, "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "off",
+)
+MOE_WORKSPACE_TOKENS_ENV = "SGLANG_GLM53_MOE_WORKSPACE_TOKENS"
+# {torch.device: (buffer, max_tokens)} -- one shared buffer per device/process.
+_G42_MOE_WORKSPACE: dict = {}
+_G42_DISABLED_LOGGED = False
+
+
+def _g42_workspace_max_tokens() -> int:
+    """Rows the reserved cutlass MoE workspace must cover: the largest forward batch."""
+    override = os.environ.get(MOE_WORKSPACE_TOKENS_ENV, "").strip()
+    if override:
+        return max(int(override), 1)
+    candidates = []
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        sa = get_global_server_args()
+        for name in (
+            "chunked_prefill_size",
+            "max_running_requests",
+            "cuda_graph_max_bs",
+            "cuda_graph_max_bs_decode",
+            "cuda_graph_max_bs_prefill",
+        ):
+            v = getattr(sa, name, None)
+            if isinstance(v, int) and v > 0:
+                candidates.append(v)
+    except Exception:  # server args not installed (unit tests, offline tools)
+        pass
+    return max(candidates) if candidates else 4096
+
+
+def reserve_cutlass_moe_workspace(layer: torch.nn.Module) -> None:
+    """[G42] Size + allocate the FlashInfer CUTLASS fused-MoE workspace for ``layer``.
+
+    Called from ModelOptNvFp4FusedMoEMethod.process_weights_after_loading on the
+    CUTLASS branch, i.e. during model load and before the memory pools are sized.
+    The buffer is process-wide (shared across layers and grown to the largest
+    requirement); the layer keeps a reference + the token bound it was sized for.
+    """
+    global _G42_DISABLED_LOGGED
+    if not _MOE_WORKSPACE_RESERVE:
+        if not _G42_DISABLED_LOGGED:
+            _G42_DISABLED_LOGGED = True
+            logger.info(
+                "[G42] cutlass MoE workspace reserve disabled (%s=0): the kernel "
+                "allocates per call",
+                MOE_WORKSPACE_RESERVE_ENV,
+            )
+        return
+    try:
+        from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
+
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+            _activation_type,
+        )
+    except ImportError as e:
+        logger.warning("[G42] cutlass MoE workspace not reserved: %s", e)
+        return
+
+    w2 = layer.w2_weight
+    device = w2.device
+    hidden_size = int(w2.shape[1])
+    # fp4 packs two values per byte: the binding's inter_size = fc2.size(2) * 2
+    intermediate_size = int(w2.shape[2]) * 2
+    num_experts_total = int(w2.shape[0]) * int(layer.moe_ep_size)
+    top_k = int(layer.moe_runner_config.top_k)
+    max_tokens = _g42_workspace_max_tokens()
+    use_fused_finalize = envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
+    activation_type = _activation_type(layer.moe_runner_config)
+
+    # The runtime call presents x either as bf16 (in-kernel NVFP4 quant) or as
+    # pre-quantized uint8 (fp4 all-gather dispatch); size for the larger of the two.
+    with torch.cuda.device(device):
+        ws_bytes = 0
+        for x_dtype in (torch.bfloat16, torch.uint8):
+            ws_bytes = max(
+                ws_bytes,
+                int(
+                    cutlass_fused_moe_workspace_size(
+                        max_tokens,
+                        hidden_size,
+                        intermediate_size,
+                        num_experts_total,
+                        top_k,
+                        x_dtype=x_dtype,
+                        weight_dtype=torch.long,
+                        output_dtype=torch.bfloat16,
+                        activation_type=activation_type,
+                        tp_size=int(layer.moe_tp_size),
+                        tp_rank=int(layer.moe_tp_rank),
+                        ep_size=int(layer.moe_ep_size),
+                        ep_rank=int(layer.moe_ep_rank),
+                        use_fused_finalize=use_fused_finalize,
+                        device=device,
+                    )
+                ),
+            )
+
+    buf, _ = _G42_MOE_WORKSPACE.get(device, (None, 0))
+    if buf is None or buf.numel() < ws_bytes:
+        buf = torch.empty(ws_bytes, dtype=torch.uint8, device=device)
+        _G42_MOE_WORKSPACE[device] = (buf, max_tokens)
+        logger.info(
+            "[G42] cutlass MoE workspace reserved: %d MiB (method: api; %d tokens, "
+            "hidden %d, inter %d, %d experts, top_k %d, tp %d) on %s",
+            ws_bytes >> 20,
+            max_tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts_total,
+            top_k,
+            int(layer.moe_tp_size),
+            device,
+        )
+    layer.g42_moe_workspace = buf
+    layer.g42_moe_workspace_max_tokens = _G42_MOE_WORKSPACE[device][1]
+
+
 # --- L4a (opt-in): online fp8 for ParallelLMHead ---
 # Gate: SGLANG_GLM53_LMHEAD_FP8=1, read ONCE at import. Default OFF -> no dispatch
 # change. When ON, an excluded ParallelLMHead is served by LmHeadOnlineFp8Method (the
@@ -3454,6 +3593,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 if layer._cutedsl_wrapper is not None:
                     refresh_cutedsl_standard_scales_for_weight_update(layer)
 
+            # [G42] FlashInfer CUTLASS only: reserve the fused-MoE GEMM workspace
+            # now, while the pools have not been sized, so the first prefill
+            # never allocates it under pressure.
+            if self.enable_flashinfer_cutlass_moe:
+                reserve_cutlass_moe_workspace(layer)
+
     @property
     def load_up_proj_weight_first(self) -> bool:
         # Load W13 as [Up, Gate] for FlashInfer CUTLASS and CuteDSL v2 kernels.
@@ -3665,6 +3810,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 moe_tp_size=layer.moe_tp_size,
                 moe_tp_rank=layer.moe_tp_rank,
                 apply_routed_scaling_factor=False,
+                # [G42]
+                workspace_buffer=getattr(layer, "g42_moe_workspace", None),
+                workspace_max_tokens=getattr(layer, "g42_moe_workspace_max_tokens", 0),
             )
             return self.runner.run(dispatch_output, quant_info)
 
