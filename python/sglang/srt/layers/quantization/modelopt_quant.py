@@ -1413,7 +1413,48 @@ def ignored_linear_fp8_enabled() -> bool:
 
 
 def ignored_linear_fp8_in_scope(prefix: str) -> bool:
-    return not any(p in _IGNORED_LINEAR_FP8_DENY_PARTS for p in prefix.split("."))
+    parts = prefix.split(".")
+    return not any(p in _IGNORED_LINEAR_FP8_DENY_PARTS for p in parts)
+
+
+# --- L3 (opt-in): online NVFP4 for the dense-MLP + shared-expert linears ---
+# Gate: SGLANG_GLM53_SHARED_DENSE_NVFP4=1, read ONCE at import. Default OFF -> no
+# dispatch change. When ON, an excluded LinearBase named `<...>.mlp.gate_up_proj` /
+# `<...>.mlp.down_proj` (dense layers) or `<...>.mlp.shared_experts.{gate_up,down}_proj`
+# is served by SharedDenseOnlineNvFp4Method: bf16 from the checkpoint, quantized to
+# NVFP4 after load, then ModelOptFp4LinearMethod.apply (flashinfer mm_fp4). Takes
+# precedence over the L1 fp8 gate for these classes; the L1 deny list still applies.
+SHARED_DENSE_NVFP4_ENV = "SGLANG_GLM53_SHARED_DENSE_NVFP4"
+_SHARED_DENSE_NVFP4 = os.environ.get(SHARED_DENSE_NVFP4_ENV, "").strip() == "1"
+_SHARED_DENSE_NVFP4_LEAVES = frozenset({"gate_up_proj", "down_proj"})
+
+# --- L4a (opt-in): online fp8 for ParallelLMHead ---
+# Gate: SGLANG_GLM53_LMHEAD_FP8=1, read ONCE at import. Default OFF -> no dispatch
+# change. When ON, an excluded ParallelLMHead is served by LmHeadOnlineFp8Method (the
+# L1 Fp8LinearMethod construction); LogitsProcessor._compute_lm_head routes any
+# quant_method outside _UNQUANTIZED_LM_HEAD_METHODS through quant_method.apply, so the
+# fp8 weight is never read raw. embed_tokens (VocabParallelEmbedding) is untouched:
+# no fp8 embedding method exists in this tree.
+LMHEAD_FP8_ENV = "SGLANG_GLM53_LMHEAD_FP8"
+_LMHEAD_FP8 = os.environ.get(LMHEAD_FP8_ENV, "").strip() == "1"
+
+
+def shared_dense_nvfp4_enabled() -> bool:
+    return _SHARED_DENSE_NVFP4
+
+
+def lmhead_fp8_enabled() -> bool:
+    return _LMHEAD_FP8
+
+
+def shared_dense_nvfp4_in_scope(prefix: str) -> bool:
+    parts = prefix.split(".")
+    if not parts or parts[-1] not in _SHARED_DENSE_NVFP4_LEAVES:
+        return False
+    if "mlp" not in parts or not ignored_linear_fp8_in_scope(prefix):
+        return False
+    # routed experts are FusedMoE (never a LinearBase); keep the predicate explicit.
+    return "shared_experts" in parts or "experts" not in parts
 
 
 class _IgnoredLinearFp8Ledger:
@@ -1465,9 +1506,49 @@ class IgnoredLinearOnlineFp8Method(Fp8LinearMethod):
             )
 
 
+class _LmHeadFp8Ledger:
+    created = 0
+    processed = 0
+    bytes_before = 0
+    bytes_after = 0
+
+
+class LmHeadOnlineFp8Method(Fp8LinearMethod):
+    """Fp8LinearMethod for the `ignore`-listed ParallelLMHead: bf16 from the
+    checkpoint, per-channel fp8 after load (same construction as L1). One summary
+    line when the last converted head has been processed."""
+
+    def __init__(self, quant_config: Fp8Config, prefix: str):
+        super().__init__(quant_config)
+        self.l4_prefix = prefix
+        _LmHeadFp8Ledger.created += 1
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        before = IgnoredLinearOnlineFp8Method._layer_bytes(layer)
+        super().process_weights_after_loading(layer)
+        after = IgnoredLinearOnlineFp8Method._layer_bytes(layer)
+        L = _LmHeadFp8Ledger
+        L.processed += 1
+        L.bytes_before += before
+        L.bytes_after += after
+        if L.processed == L.created:
+            gib = 1024.0**3
+            logger.info(
+                "[%s] online fp8 for lm_head: %d layers converted, "
+                "%.4f GiB -> %.4f GiB per rank (saved %.4f GiB); weight dtype now %s",
+                LMHEAD_FP8_ENV,
+                L.processed,
+                L.bytes_before / gib,
+                L.bytes_after / gib,
+                (L.bytes_before - L.bytes_after) / gib,
+                layer.weight.dtype,
+            )
+
+
 class ModelOptFp4Config(ModelOptQuantConfig):
-    """Supported ModelOpt FP4 paths (plus the opt-in SGLANG_GLM53_IGNORED_LINEAR_FP8
-    online-fp8 branch for excluded linears, see get_quant_method):
+    """Supported ModelOpt FP4 paths (plus the opt-in SGLANG_GLM53_IGNORED_LINEAR_FP8 /
+    SGLANG_GLM53_SHARED_DENSE_NVFP4 / SGLANG_GLM53_LMHEAD_FP8 online branches for
+    excluded linears and the lm_head, see get_quant_method):
 
     - Serialized + per-tensor FP32 activation scales: load packed NVFP4 weights
       and checkpoint-provided scales.
@@ -1710,15 +1791,54 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             return None
         return IgnoredLinearOnlineFp8Method(self._ignored_linear_fp8_config(), prefix)
 
+    def _is_excluded_prefix(self, prefix: str) -> bool:
+        return is_layer_skipped(
+            prefix, self.exclude_modules, self.packed_modules_mapping
+        ) or self.is_layer_excluded(prefix)
+
+    def shared_dense_nvfp4_method(self, layer: torch.nn.Module, prefix: str):
+        """Return the opt-in online-NVFP4 method for an excluded dense-MLP /
+        shared-expert LinearBase, else None."""
+        from sglang.srt.layers.linear import LinearBase
+
+        if not shared_dense_nvfp4_enabled():
+            return None
+        if not isinstance(layer, LinearBase):
+            return None
+        if not self._is_excluded_prefix(prefix) or not shared_dense_nvfp4_in_scope(
+            prefix
+        ):
+            return None
+        return SharedDenseOnlineNvFp4Method(self, prefix)
+
+    def lmhead_fp8_method(self, layer: torch.nn.Module, prefix: str):
+        """Return the opt-in online-fp8 method for an excluded ParallelLMHead, else None."""
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+        if not lmhead_fp8_enabled():
+            return None
+        if not isinstance(layer, ParallelLMHead):
+            return None
+        if not self._is_excluded_prefix(prefix):
+            return None
+        return LmHeadOnlineFp8Method(self._ignored_linear_fp8_config(), prefix)
+
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         if self.is_checkpoint_nvfp4_serialized:
-            l1_method = self.ignored_linear_fp8_method(layer, prefix)
-            if l1_method is not None:
-                return l1_method
+            # Precedence: L3 (nvfp4) over L1 (fp8) for the classes it covers; L4a
+            # only ever matches ParallelLMHead, which neither of the others accepts.
+            for opt_in in (
+                self.shared_dense_nvfp4_method,
+                self.ignored_linear_fp8_method,
+                self.lmhead_fp8_method,
+            ):
+                method = opt_in(layer, prefix)
+                if method is not None:
+                    return method
         if not self.is_checkpoint_nvfp4_serialized:
             if isinstance(layer, (LinearBase, ParallelLMHead)):
                 # Load-time quantization applies only to MoE weights.
@@ -2176,7 +2296,146 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             raise ValueError(f"Unsupported FP4 GEMM quant mode: {self.quant_mode}")
 
 
-def deinterleave_w13(weight: torch.Tensor, *, up_first: bool = False) -> torch.Tensor:
+class _SharedDenseNvFp4Ledger:
+    created = 0
+    processed = 0
+    bytes_before = 0
+    bytes_after = 0
+
+
+class SharedDenseOnlineNvFp4Method(ModelOptFp4LinearMethod):
+    """ModelOptFp4LinearMethod for one bf16 dense-MLP / shared-expert linear.
+
+    create_weights registers the bf16 [N, K] weight the checkpoint carries (no
+    input_scale / weight_scale / weight_scale_2 to load). process_weights_after_loading
+    quantizes it online: one per-tensor fp32 decode scale `weight_scale_2 = amax /
+    (448 * 6)` (the formula ModelOptNvFp4OnlineFusedMoEMethod._quantize_weight_nvfp4
+    uses for online expert weights), per-16-block e4m3 scales + packed fp4 from the
+    same flashinfer `fp4_quantize` entry point apply() quantizes activations with on
+    this arm (fp4_utils: backend "cuda" off sm_100), linear scale layout; input_scale is
+    1.0, the online per-tensor convention (ModelOptNvFp4FusedMoEMethod.create_weights
+    `input_scale_fill = 1.0`). The parent then computes alpha / input_scale_inv, pads
+    and swizzles the block scales into `weight_scale_interleaved`, and apply() runs the
+    configured fp4 GEMM (flashinfer mm_fp4, cutlass on cap 12.0)."""
+
+    def __init__(self, quant_config: ModelOptFp4Config, prefix: str):
+        super().__init__(quant_config)
+        self.l3_prefix = prefix
+        _SharedDenseNvFp4Ledger.created += 1
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        del input_size, output_size
+        if input_size_per_partition % 16 != 0:
+            raise ValueError(
+                "Online NVFP4 requires in_features to be a multiple of 16, got "
+                f"{input_size_per_partition} for {self.l3_prefix}"
+            )
+        output_size_per_partition = sum(output_partition_sizes)
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.params_dtype = params_dtype
+        layer.quant_config = self.quant_config
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                output_size_per_partition, input_size_per_partition, dtype=params_dtype
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=extra_weight_attrs.get("weight_loader"),
+        )
+        layer.register_parameter("weight", weight)
+
+    @staticmethod
+    def _quantize_weight_online(
+        weight: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if fp4_quantize is None:
+            raise RuntimeError(
+                "flashinfer fp4_quantize is unavailable; online NVFP4 needs it"
+            )
+        if not weight.is_floating_point() or weight.ndim != 2:
+            raise ValueError(
+                "Online NVFP4 expects a 2D floating-point weight, got "
+                f"{weight.dtype} {tuple(weight.shape)} (already quantized?)"
+            )
+        weight = weight.contiguous()
+        rows, cols = weight.shape
+        weight_amax = weight.abs().nan_to_num().amax().to(torch.float32)
+        fp8_fp4_max = float(torch.finfo(torch.float8_e4m3fn).max) * 6.0
+        weight_scale_2 = torch.where(
+            weight_amax > 0,
+            weight_amax / fp8_fp4_max,
+            torch.ones_like(weight_amax),
+        )
+        fp4_weight, weight_sf = fp4_quantize(
+            weight,
+            (1.0 / weight_scale_2).reshape(1),
+            sf_vec_size=16,
+            sf_use_ue8m0=False,
+            is_sf_swizzled_layout=False,
+        )
+        fp4_weight = fp4_weight.reshape(rows, cols // 2)
+        weight_sf = weight_sf.view(torch.float8_e4m3fn).reshape(rows, cols // 16)
+        return fp4_weight, weight_sf.contiguous(), weight_scale_2.reshape(1)
+
+    @staticmethod
+    def _layer_bytes(layer: torch.nn.Module) -> int:
+        n = layer.weight.numel() * layer.weight.element_size()
+        seen = {layer.weight.data_ptr()}
+        for name in ("weight_scale_interleaved", "weight_scale", "weight_scale_2",
+                     "input_scale", "alpha", "input_scale_inv"):
+            t = getattr(layer, name, None)
+            if isinstance(t, torch.Tensor) and t.data_ptr() not in seen:
+                seen.add(t.data_ptr())
+                n += t.numel() * t.element_size()
+        return n
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        before = self._layer_bytes(layer)
+        fp4_weight, weight_sf, weight_scale_2 = self._quantize_weight_online(
+            layer.weight.data
+        )
+        layer.weight = Parameter(fp4_weight, requires_grad=False)
+        layer.weight_scale = Parameter(weight_sf, requires_grad=False)
+        layer.weight_scale_2 = Parameter(weight_scale_2, requires_grad=False)
+        layer.input_scale = Parameter(
+            torch.ones(1, dtype=torch.float32, device=fp4_weight.device),
+            requires_grad=False,
+        )
+        super().process_weights_after_loading(layer)
+        after = self._layer_bytes(layer)
+        L = _SharedDenseNvFp4Ledger
+        L.processed += 1
+        L.bytes_before += before
+        L.bytes_after += after
+        if L.processed == L.created:
+            gib = 1024.0**3
+            logger.info(
+                "[%s] online nvfp4 for dense-MLP + shared-expert linears: %d layers "
+                "converted, %.4f GiB -> %.4f GiB per rank (saved %.4f GiB); "
+                "weight dtype now %s",
+                SHARED_DENSE_NVFP4_ENV,
+                L.processed,
+                L.bytes_before / gib,
+                L.bytes_after / gib,
+                (L.bytes_before - L.bytes_after) / gib,
+                layer.weight.dtype,
+            )
+
+
+def deinterleave_w13(
+    weight: torch.Tensor, *, up_first: bool = False
+) -> torch.Tensor:
     """De-interleave a checkpoint ``[g0,u0,g1,u1,...]`` fused gate/up tensor.
 
     Default returns the block layout ``[gate...; up...]`` (gate half first), which
