@@ -1454,6 +1454,16 @@ def ignored_linear_fp8_in_scope(prefix: str) -> bool:
 SHARED_DENSE_NVFP4_ENV = "SGLANG_GLM53_SHARED_DENSE_NVFP4"
 _SHARED_DENSE_NVFP4 = os.environ.get(SHARED_DENSE_NVFP4_ENV, "").strip() == "1"
 _SHARED_DENSE_NVFP4_LEAVES = frozenset({"gate_up_proj", "down_proj"})
+# L3 W4A16 arm (opt-in; consulted only when the L3 gate above is ON):
+# SGLANG_GLM53_SHARED_DENSE_NVFP4_A16=1 serves the same linears with
+# SharedDenseOnlineNvFp4A16Method -- weights online-quantized to NVFP4 exactly as
+# the W4A4 arm does (same weight_scale_2 / per-16-block e4m3 scales / packed fp4,
+# linear scale layout), activations left in bf16, GEMM =
+# ModelOptNvFp4A16LinearMethod.apply (apply_fp4_marlin_linear, JIT). Removes the
+# A4 term a unit global activation scale (input_scale = 1.0) charges on the
+# always-on dense-MLP / shared-expert layers. Default OFF -> W4A4 as before.
+SHARED_DENSE_NVFP4_A16_ENV = "SGLANG_GLM53_SHARED_DENSE_NVFP4_A16"
+_SHARED_DENSE_NVFP4_A16 = os.environ.get(SHARED_DENSE_NVFP4_A16_ENV, "").strip() == "1"
 
 # --- L4a (opt-in): online fp8 for ParallelLMHead ---
 # Gate: SGLANG_GLM53_LMHEAD_FP8=1, read ONCE at import. Default OFF -> no dispatch
@@ -1468,6 +1478,10 @@ _LMHEAD_FP8 = os.environ.get(LMHEAD_FP8_ENV, "").strip() == "1"
 
 def shared_dense_nvfp4_enabled() -> bool:
     return _SHARED_DENSE_NVFP4
+
+
+def shared_dense_nvfp4_a16_enabled() -> bool:
+    return _SHARED_DENSE_NVFP4 and _SHARED_DENSE_NVFP4_A16
 
 
 def lmhead_fp8_enabled() -> bool:
@@ -1846,6 +1860,8 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             prefix
         ):
             return None
+        if shared_dense_nvfp4_a16_enabled():
+            return SharedDenseOnlineNvFp4A16Method(self, prefix)
         return SharedDenseOnlineNvFp4Method(self, prefix)
 
     def lmhead_fp8_method(self, layer: torch.nn.Module, prefix: str):
@@ -2615,6 +2631,100 @@ class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
             size_k=layer.input_size_per_partition,
             bias=bias,
         )
+
+
+class _SharedDenseNvFp4A16Ledger:
+    created = 0
+    processed = 0
+    bytes_before = 0
+    bytes_after = 0
+
+
+class SharedDenseOnlineNvFp4A16Method(ModelOptNvFp4A16LinearMethod):
+    """W4A16 arm of SharedDenseOnlineNvFp4Method: the same bf16 dense-MLP /
+    shared-expert linear, the same online NVFP4 weight quantization
+    (SharedDenseOnlineNvFp4Method._quantize_weight_online: weight_scale_2 =
+    amax / (448 * 6), per-16-block e4m3 scales, packed fp4, LINEAR scale
+    layout), but activations stay bf16 and the GEMM is the inherited
+    ModelOptNvFp4A16LinearMethod.apply (apply_fp4_marlin_linear).
+
+    prepare_nvfp4_layer_for_marlin consumes exactly that linear layout: a uint8
+    [N, K/2] packed weight, an e4m3 [N, K/16] `weight_scale` (transposed,
+    marlin-permuted and nvfp4-processed in place) and the scalar
+    `weight_global_scale` the A16 parent derives from `weight_scale_2`. No
+    swizzle is built here -- the W4A4 parent's `weight_scale_interleaved` is a
+    layout for mm_fp4, which this arm never calls. Marlin pads N/K to N%64,K%128
+    or N%128,K%64 itself (the dense / shared N and K here are multiples of both).
+    """
+
+    def __init__(self, quant_config: ModelOptFp4Config, prefix: str):
+        super().__init__(quant_config)
+        self.l3_prefix = prefix
+        _SharedDenseNvFp4A16Ledger.created += 1
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        # bf16 [N, K] straight from the checkpoint, no scale params to load; the A16
+        # parent's create_weights would demand a serialized packed-fp4 checkpoint.
+        SharedDenseOnlineNvFp4Method.create_weights(
+            self,
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+    @staticmethod
+    def _layer_bytes(layer: torch.nn.Module) -> int:
+        n = layer.weight.numel() * layer.weight.element_size()
+        seen = {layer.weight.data_ptr()}
+        for name in ("weight_scale", "weight_scale_2", "weight_global_scale"):
+            t = getattr(layer, name, None)
+            if isinstance(t, torch.Tensor) and t.data_ptr() not in seen:
+                seen.add(t.data_ptr())
+                n += t.numel() * t.element_size()
+        return n
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        before = self._layer_bytes(layer)
+        fp4_weight, weight_sf, weight_scale_2 = (
+            SharedDenseOnlineNvFp4Method._quantize_weight_online(layer.weight.data)
+        )
+        layer.weight = Parameter(fp4_weight, requires_grad=False)
+        layer.weight_scale = Parameter(weight_sf, requires_grad=False)
+        layer.weight_scale_2 = Parameter(weight_scale_2, requires_grad=False)
+        # A16 parent: weight_global_scale <- weight_scale_2.max(), group_size == 16
+        # check, prepare_nvfp4_layer_for_marlin (repack + permute the linear scales).
+        super().process_weights_after_loading(layer)
+        after = self._layer_bytes(layer)
+        L = _SharedDenseNvFp4A16Ledger
+        L.processed += 1
+        L.bytes_before += before
+        L.bytes_after += after
+        if L.processed == L.created:
+            gib = 1024.0**3
+            logger.info(
+                "[%s] online nvfp4 W4A16 (marlin, bf16 activations) for dense-MLP + "
+                "shared-expert linears: %d layers converted, %.4f GiB -> %.4f GiB per "
+                "rank (saved %.4f GiB); weight dtype now %s",
+                SHARED_DENSE_NVFP4_A16_ENV,
+                L.processed,
+                L.bytes_before / gib,
+                L.bytes_after / gib,
+                (L.bytes_before - L.bytes_after) / gib,
+                layer.weight.dtype,
+            )
 
 
 def _compute_gemm1_alphas(
