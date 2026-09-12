@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
@@ -16,6 +17,33 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 logger = logging.getLogger(__name__)
+
+# [G42] Gate: SGLANG_GLM53_LOGPROB_GATHER_VIEW, read ONCE at import. Default ON.
+# ``chunk_logits[chunk_indices]`` copies fp32 [rows, vocab] logits (GLM-5.3-Flash:
+# 835 x 154880 x 4 B = 494 MiB) for an input-logprob request; at
+# --mem-fraction-static 0.975 that copy is the allocation that fails on the
+# first try at the first request (CUDACachingAllocator retry warning, or a hard
+# OOM). When the requested rows form one contiguous run -- every single-request
+# return_logprob call -- a narrow() view carries the same values with no
+# allocation. =0 keeps the gather copy.
+_LOGPROB_GATHER_VIEW = os.environ.get(
+    "SGLANG_GLM53_LOGPROB_GATHER_VIEW", "1"
+).strip() not in ("0", "false", "False", "off")
+_g42_view_logged = False
+
+
+def _contiguous_run(indices: torch.Tensor):
+    """Return (start, n) when ``indices`` is start, start+1, ..., start+n-1; else None."""
+    n = indices.numel()
+    if n == 0:
+        return None
+    first = int(indices[0])
+    last = int(indices[-1])
+    if last - first + 1 != n:
+        return None
+    if n > 1 and not bool((indices[1:] - indices[:-1] == 1).all()):
+        return None
+    return first, n
 
 
 class LogprobStage(Enum):
@@ -582,7 +610,26 @@ class InputLogprobProcessor:
                 sampled_logits[chunk_sample_mask] = chunk_logits[chunk_sample_indices]
 
             # Zero-logprob-row chunks still need the per-sequence bookkeeping below.
-            chunk_logprobs = chunk_logits[chunk_indices]
+            # [G42] Contiguous rows -> zero-copy view; every consumer below reads
+            # chunk_logprobs or produces a new tensor (fused logsumexp / top-k,
+            # out-of-place log_softmax, advanced-index gathers), so the view is
+            # never written through.
+            run = _contiguous_run(chunk_indices) if _LOGPROB_GATHER_VIEW else None
+            if run is not None:
+                chunk_logprobs = chunk_logits.narrow(0, run[0], run[1])
+                global _g42_view_logged
+                if not _g42_view_logged:
+                    _g42_view_logged = True
+                    logger.info(
+                        "[G42] input-logprob logits served as a view: %d contiguous "
+                        "rows x %d vocab (%d MiB copy avoided)",
+                        run[1],
+                        chunk_logits.shape[1],
+                        (run[1] * chunk_logits.shape[1] * chunk_logits.element_size())
+                        >> 20,
+                    )
+            else:
+                chunk_logprobs = chunk_logits[chunk_indices]
             del chunk_logits
 
             # End at the last row inside the chunk; token_to_seq_idx[end_idx]
