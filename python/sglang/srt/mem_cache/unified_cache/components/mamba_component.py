@@ -40,6 +40,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     mamba_cache_chunk_size,
     mamba_checkpoint_grid,
+    mamba_decode_holds_one_enabled,
 )
 
 if TYPE_CHECKING:
@@ -587,7 +588,18 @@ class MambaComponent(TreeComponent):
                         req.kv.mamba_pool_idx.view(-1)
                     )
             elif self.cache.enable_mamba_extra_buffer:
-                new_slot = self._alloc_mamba_slot()
+                if mamba_decode_holds_one_enabled() and not insert_params.chunked:
+                    # G47: leaving prefill -- donate the keep slot with NO
+                    # replacement (decode reads the active slot only; the lazy
+                    # boundary path allocates a checkpoint slot on demand and
+                    # schedule_batch clears the track mask when it cannot). A
+                    # chunked request still checkpoints its next chunk: unchanged.
+                    buf = req.kv.mamba_ping_pong_track_buffer
+                    new_slot = torch.full(
+                        (1,), -1, dtype=buf.dtype, device=buf.device
+                    )
+                else:
+                    new_slot = self._alloc_mamba_slot()
                 mamba_value_donated = (
                     self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
                         req, new_slot
