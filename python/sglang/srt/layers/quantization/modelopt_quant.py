@@ -1387,8 +1387,87 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         return self.runner.run(dispatch_output, quant_info)
 
 
+# --- L1 (opt-in): online fp8 for the checkpoint's `ignore`-listed bf16 linears ---
+# Gate: SGLANG_GLM53_IGNORED_LINEAR_FP8=1, read ONCE at import. Default OFF -> the dispatch below is
+# byte-identical to the ungated code (every excluded LinearBase still gets
+# UnquantizedLinearMethod). When ON, a LinearBase that the ModelOpt exclude list
+# matches is served by Fp8LinearMethod in the exact construction `--quantization fp8`
+# uses on an unquantized checkpoint (Fp8Config() defaults: is_checkpoint_fp8_serialized
+# =False, activation_scheme='dynamic', no weight_block_size): the weight is created in
+# params_dtype (bf16), loaded from the checkpoint as-is, and quantized per-channel in
+# process_weights_after_loading (fp8.py, the `not is_checkpoint_fp8_serialized` arm).
+# Out of scope, by construction: FusedMoE, ParallelLMHead / embeddings (not LinearBase),
+# norms / conv1d (no quant_config), and the deny-listed parts below.
+IGNORED_LINEAR_FP8_ENV = "SGLANG_GLM53_IGNORED_LINEAR_FP8"
+_IGNORED_LINEAR_FP8 = os.environ.get(IGNORED_LINEAR_FP8_ENV, "").strip() == "1"
+# Excluded linears that stay in source precision even when the gate is ON:
+# the MoE router gate (scores in fp32), the DSA indexer (fp32 params), the vision
+# tower, and the MTP head / layers.
+_IGNORED_LINEAR_FP8_DENY_PARTS = frozenset(
+    {"gate", "indexer", "visual", "vision_model", "eh_proj", "mtp", "mtp_layers"}
+)
+
+
+def ignored_linear_fp8_enabled() -> bool:
+    return _IGNORED_LINEAR_FP8
+
+
+def ignored_linear_fp8_in_scope(prefix: str) -> bool:
+    return not any(p in _IGNORED_LINEAR_FP8_DENY_PARTS for p in prefix.split("."))
+
+
+class _IgnoredLinearFp8Ledger:
+    created = 0
+    processed = 0
+    bytes_before = 0
+    bytes_after = 0
+    prefixes: List[str] = []
+
+
+class IgnoredLinearOnlineFp8Method(Fp8LinearMethod):
+    """Fp8LinearMethod for one `ignore`-listed linear: bf16 from the checkpoint,
+    per-channel fp8 after load. Emits ONE summary line (count + bytes) when the last
+    converted layer has been processed."""
+
+    def __init__(self, quant_config: Fp8Config, prefix: str):
+        super().__init__(quant_config)
+        self.l1_prefix = prefix
+        _IgnoredLinearFp8Ledger.created += 1
+        _IgnoredLinearFp8Ledger.prefixes.append(prefix)
+
+    @staticmethod
+    def _layer_bytes(layer: torch.nn.Module) -> int:
+        n = layer.weight.numel() * layer.weight.element_size()
+        ws = getattr(layer, "weight_scale", None)
+        if isinstance(ws, torch.Tensor):
+            n += ws.numel() * ws.element_size()
+        return n
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        before = self._layer_bytes(layer)
+        super().process_weights_after_loading(layer)
+        after = self._layer_bytes(layer)
+        L = _IgnoredLinearFp8Ledger
+        L.processed += 1
+        L.bytes_before += before
+        L.bytes_after += after
+        if L.processed == L.created:
+            gib = 1024.0**3
+            logger.info(
+                "[%s] online fp8 for ignore-listed linears: %d layers converted, "
+                "%.4f GiB -> %.4f GiB per rank (saved %.4f GiB); weight dtype now %s",
+                IGNORED_LINEAR_FP8_ENV,
+                L.processed,
+                L.bytes_before / gib,
+                L.bytes_after / gib,
+                (L.bytes_before - L.bytes_after) / gib,
+                layer.weight.dtype,
+            )
+
+
 class ModelOptFp4Config(ModelOptQuantConfig):
-    """Supported ModelOpt FP4 paths:
+    """Supported ModelOpt FP4 paths (plus the opt-in SGLANG_GLM53_IGNORED_LINEAR_FP8
+    online-fp8 branch for excluded linears, see get_quant_method):
 
     - Serialized + per-tensor FP32 activation scales: load packed NVFP4 weights
       and checkpoint-provided scales.
@@ -1603,11 +1682,43 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         quant_config.is_w4a16 = quant_method == "W4A16_NVFP4"
         return quant_config
 
+    def _ignored_linear_fp8_config(self) -> Fp8Config:
+        # Same construction `--quantization fp8` yields for an unquantized checkpoint
+        # (weight_utils.get_quant_config -> Fp8Config()), built once per config.
+        cfg = getattr(self, "_l1_fp8_config", None)
+        if cfg is None:
+            cfg = Fp8Config(
+                is_checkpoint_fp8_serialized=False,
+                activation_scheme="dynamic",
+                packed_modules_mapping=self.packed_modules_mapping,
+            )
+            self._l1_fp8_config = cfg
+        return cfg
+
+    def ignored_linear_fp8_method(self, layer: torch.nn.Module, prefix: str):
+        """Return the opt-in online-fp8 method for an excluded LinearBase, else None."""
+        from sglang.srt.layers.linear import LinearBase
+
+        if not ignored_linear_fp8_enabled():
+            return None
+        if not isinstance(layer, LinearBase):
+            return None
+        excluded = is_layer_skipped(
+            prefix, self.exclude_modules, self.packed_modules_mapping
+        ) or self.is_layer_excluded(prefix)
+        if not excluded or not ignored_linear_fp8_in_scope(prefix):
+            return None
+        return IgnoredLinearOnlineFp8Method(self._ignored_linear_fp8_config(), prefix)
+
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
+        if self.is_checkpoint_nvfp4_serialized:
+            l1_method = self.ignored_linear_fp8_method(layer, prefix)
+            if l1_method is not None:
+                return l1_method
         if not self.is_checkpoint_nvfp4_serialized:
             if isinstance(layer, (LinearBase, ParallelLMHead)):
                 # Load-time quantization applies only to MoE weights.
