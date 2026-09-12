@@ -85,6 +85,16 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     grow_multi_ctas_kv_counter_buffer_if_needed,
     make_persistent_multi_ctas_kv_counter_buffer,
 )
+
+# L14: the trtllm workspace + counter are allocated only when
+# `device_sm_major == 10 or dsa_decode_impl == "trtllm"` (see __init__);
+# every reader asserts on this so a skipped allocation fails loudly.
+_L14_GUARD_MSG = (
+    "L14 guard: dsa_trtllm_workspace is only allocated when "
+    "device_sm_major == 10 or dsa_decode_impl == 'trtllm' "
+    "(DSABackend.__init__); this reader ran on a configuration that "
+    "skipped it: "
+)
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -541,7 +551,11 @@ class DeepseekSparseAttnBackend(
                 ),
             )
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
-        elif self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
+        # L14: only sm_10x (the `use_mha` ragged-prefill path) or a trtllm
+        # decode backend ever reads this 384 MiB buffer; sm_12x with a
+        # tilelang decode never does, so it stays None there and every
+        # reader asserts on it (_L14_GUARD_MSG).
+        elif self.device_sm_major == 10 or self.dsa_decode_impl == "trtllm":
             self.workspace_buffer = get_buffer(
                 "dsa_trtllm_workspace",
                 lambda: torch.empty(
@@ -2940,7 +2954,9 @@ class DeepseekSparseAttnBackend(
             flashinfer_sparse_mla_forward,
         )
 
-        assert self.workspace_buffer is not None
+        assert self.workspace_buffer is not None, (
+            _L14_GUARD_MSG + "_forward_flashinfer_sparse_mla"
+        )
         return flashinfer_sparse_mla_forward(
             q=q_all,
             kv_cache=kv_cache,
@@ -3049,6 +3065,9 @@ class DeepseekSparseAttnBackend(
         if self.device_sm_major >= 10:
             import flashinfer
 
+            assert self.workspace_buffer is not None, (
+                _L14_GUARD_MSG + "_forward_standard_mha"
+            )
             seq_lens = metadata.cache_seqlens_int32
             return flashinfer.prefill.trtllm_ragged_attention_deepseek(
                 query=q,
@@ -3530,6 +3549,12 @@ class DeepseekSparseAttnBackend(
         batch_size = page_table_1.shape[0]
         _, num_heads, head_dim = q_all.shape
 
+        assert self.workspace_buffer is not None, (
+            _L14_GUARD_MSG + "_forward_trtllm"
+        )
+        assert self._multi_ctas_kv_counter_buffer is not None, (
+            _L14_GUARD_MSG + "_forward_trtllm (_multi_ctas_kv_counter_buffer)"
+        )
         self._multi_ctas_kv_counter_buffer = (
             grow_multi_ctas_kv_counter_buffer_if_needed(
                 self._multi_ctas_kv_counter_buffer,
