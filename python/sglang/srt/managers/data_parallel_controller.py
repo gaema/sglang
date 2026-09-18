@@ -110,6 +110,9 @@ class DPBudget:
         self.num_dp_ranks = num_dp_ranks
         self.total_requests = [0] * num_dp_ranks
         self.total_tokens = [0] * num_dp_ranks
+        # Input tokens still awaiting prefill compute per rank (waiting queue
+        # plus the in-flight chunked remainder), from the scheduler snapshot.
+        self.prefill_backlog = [0] * num_dp_ranks
         self.last_timestamp = [0.0] * num_dp_ranks
 
     def update_budget(self, loads):
@@ -122,6 +125,7 @@ class DPBudget:
                 load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
+            self.prefill_backlog[load.dp_rank] = load.num_waiting_uncached_tokens
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
@@ -257,15 +261,13 @@ class DataParallelController:
                 chunk=envs.SGLANG_DP_PREFIX_AFFINITY_CHUNK.get(),
                 max_entries=envs.SGLANG_DP_PREFIX_AFFINITY_MAX_ENTRIES.get(),
             )
-            self.prefix_affinity_slack = envs.SGLANG_DP_PREFIX_AFFINITY_SLACK.get()
             self.prefix_affinity_sticky_tokens = (
                 envs.SGLANG_DP_PREFIX_AFFINITY_STICKY_TOKENS.get()
             )
             self._prefix_affinity_stats = {"hit": 0, "miss": 0, "spread": 0}
             logger.info(
-                "DP dispatch: prefix_affinity chunk=%d slack=%d sticky_tokens=%d max_entries=%d",
+                "DP dispatch: prefix_affinity chunk=%d sticky_tokens=%d max_entries=%d",
                 self.prefix_affinity.chunk,
-                self.prefix_affinity_slack,
                 self.prefix_affinity_sticky_tokens,
                 self.prefix_affinity.max_entries,
             )
@@ -871,59 +873,64 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
         index = self.prefix_affinity
+        budget = self.dp_budget
+        active = self._active_workers
         fps = index.fingerprints(req.input_ids)
         rank, matched = index.lookup(fps)
+        matched_tokens = matched * index.chunk
         target = None
         if (
             rank is not None
-            and rank in self._active_workers
+            and rank in active
             and self.status[rank]
             and self.workers[rank] is not None
         ):
-            others = [
-                self.dp_budget.total_requests[i]
-                for i in self._active_workers
-                if i != rank
-            ]
-            # A long matched prefix always sticks (re-prefilling it costs more
-            # than the queueing the slack guard would avoid); a short one -- e.g.
-            # only a shared system prompt -- follows its rank only while that
-            # rank carries strictly fewer requests than every other active rank
-            # (plus SLACK, default 0); an exact tie goes to the alternating
-            # fallback. Any looser rule funnels every new conversation onto the
-            # rank that first served the shared prompt (measured 27/27 at low
-            # concurrency with a tie-tolerant rule).
-            if (
-                matched * index.chunk >= self.prefix_affinity_sticky_tokens
-                or not others
-                or self.dp_budget.total_requests[rank]
-                < min(others) + self.prefix_affinity_slack
-            ):
+            others = [budget.prefill_backlog[i] for i in active if i != rank]
+            # Cost comparison in prefill tokens (both ranks prefill at the same
+            # rate): following the affinity rank saves re-prefilling the matched
+            # prefix but waits behind that rank's prefill backlog. Stick when the
+            # saving is at least the extra wait. At an exact backlog tie (an idle
+            # server) only a match >= STICKY_TOKENS sticks -- a short one, e.g. a
+            # system prompt shared by every conversation, alternates instead, so
+            # quiet-period conversations do not all home on one rank.
+            if not others:
+                stick = True
+            else:
+                extra_wait = budget.prefill_backlog[rank] - min(others)
+                if extra_wait < 0:
+                    stick = True
+                elif extra_wait == 0:
+                    stick = matched_tokens >= self.prefix_affinity_sticky_tokens
+                else:
+                    stick = matched_tokens >= extra_wait
+            if stick:
                 target = rank
-                # Mirror DPBudget.dispatch's speculative increments; only the
-                # unmatched tail is new work for the rank.
-                self.dp_budget.total_requests[rank] += 1
-                self.dp_budget.total_tokens[rank] += max(
-                    0, len(req.input_ids) - matched * index.chunk
-                )
                 self._prefix_affinity_stats["hit"] += 1
             else:
                 self._prefix_affinity_stats["spread"] += 1
         else:
             self._prefix_affinity_stats["miss"] += 1
         if target is None:
-            # total_tokens choice restricted to active workers (DPBudget.dispatch
-            # ranges over every slot, including ones that are not active).
-            budget = self.dp_budget
-            key = lambda i: (budget.total_tokens[i], budget.total_requests[i])
-            best = min(key(i) for i in self._active_workers)
-            least = [i for i in self._active_workers if key(i) == best]
-            # Exact ties (an idle server) alternate; `min` alone would home every
+            # Least prefill backlog, then fewest requests, then fewest resident
+            # tokens, over ACTIVE workers only (DPBudget.dispatch ranges over
+            # every slot). Exact ties alternate: `min` alone would home every
             # quiet-period conversation on the lowest rank.
+            key = lambda i: (
+                budget.prefill_backlog[i],
+                budget.total_requests[i],
+                budget.total_tokens[i],
+            )
+            best = min(key(i) for i in active)
+            least = [i for i in active if key(i) == best]
             target = least[self.round_robin_counter % len(least)]
             self.round_robin_counter += 1
-            budget.total_requests[target] += 1
-            budget.total_tokens[target] += len(req.input_ids)
+        # Speculative increments until the next snapshot refresh: the new
+        # prefill work is the unmatched tail on the affinity rank, the whole
+        # prompt elsewhere.
+        new_tokens = len(req.input_ids) - (matched_tokens if target == rank else 0)
+        budget.total_requests[target] += 1
+        budget.total_tokens[target] += max(0, new_tokens)
+        budget.prefill_backlog[target] += max(0, new_tokens)
         index.record(fps, target)
         st = self._prefix_affinity_stats
         if (st["hit"] + st["miss"] + st["spread"]) % 200 == 0:
