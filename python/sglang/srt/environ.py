@@ -1486,6 +1486,19 @@ class Envs:
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
 
+    # `--load-balance-method prefix_affinity` (DP controller): a request is routed
+    # to the DP rank that last served the longest matching token prefix, so a
+    # conversation's next turn lands where its radix-cache prefix lives. Prefix
+    # fingerprints are taken every CHUNK tokens; the affinity rank is skipped when
+    # it carries more than SLACK requests above the least-loaded rank (falls back
+    # to total_tokens); the index keeps MAX_ENTRIES fingerprints (LRU).
+    SGLANG_DP_PREFIX_AFFINITY_CHUNK = EnvInt(2048)
+    SGLANG_DP_PREFIX_AFFINITY_SLACK = EnvInt(2)
+    # A match of at least this many tokens always sticks to its rank: re-prefilling
+    # that much costs more than queueing behind the imbalance the slack guard sees.
+    SGLANG_DP_PREFIX_AFFINITY_STICKY_TOKENS = EnvInt(16384)
+    SGLANG_DP_PREFIX_AFFINITY_MAX_ENTRIES = EnvInt(65536)
+
     # ===================================================================
     # CUDA graphs and execution buffers
     # ===================================================================
