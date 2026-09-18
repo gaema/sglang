@@ -91,13 +91,17 @@ class Parallel(msgspec.Struct):
     load_balance_method: A[
         str,
         Arg(
-            help="The load balancing strategy for data parallelism.",
+            help="The load balancing strategy for data parallelism. "
+            "prefix_affinity routes a request to the DP rank that last served "
+            "the longest matching token prefix (radix-cache locality across DP "
+            "ranks), falling back to total_tokens.",
             choices=[
                 "auto",
                 "round_robin",
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "prefix_affinity",
             ],
         ),
     ] = "auto"
