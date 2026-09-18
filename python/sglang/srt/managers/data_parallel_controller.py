@@ -14,11 +14,14 @@
 """A controller that dispatches requests to multiple data parallel workers."""
 
 import faulthandler
+import hashlib
 import logging
 import multiprocessing as mp
 import signal
 import threading
 import time
+from array import array
+from collections import OrderedDict
 from collections.abc import Callable
 from enum import Enum, auto
 
@@ -91,6 +94,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    PREFIX_AFFINITY = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -137,6 +141,58 @@ class DPBudget:
         return target_rank
 
 
+class PrefixAffinityIndex:
+    """Token-prefix fingerprint -> the DP rank that last served it.
+
+    Each DP rank owns its own radix cache, so a conversation whose turns are
+    spread across ranks re-prefills its whole context on every rank it
+    visits. This index approximates the radix cache at the controller: a
+    request is fingerprinted with a cumulative hash at every ``chunk`` tokens,
+    and the longest fingerprint already known names the rank whose cache holds
+    (at least) that much of the prefix. Bounded LRU; a miss is only a cold
+    prefill, never an error.
+    """
+
+    def __init__(self, chunk: int, max_entries: int):
+        self.chunk = max(1, chunk)
+        self.max_entries = max(1, max_entries)
+        self._index: OrderedDict[bytes, int] = OrderedDict()
+
+    def fingerprints(self, input_ids) -> list[bytes]:
+        n = len(input_ids) // self.chunk
+        if n == 0:
+            return []
+        buf = array("q", input_ids[: n * self.chunk]).tobytes()
+        stride = self.chunk * 8
+        h = hashlib.blake2b(digest_size=16)
+        out = []
+        for k in range(n):
+            h.update(buf[k * stride : (k + 1) * stride])
+            out.append(h.digest())
+        return out
+
+    def lookup(self, fps: list[bytes]) -> tuple[int | None, int]:
+        """(rank, number of matched chunks) for the longest known prefix."""
+        idx = self._index
+        for k in range(len(fps) - 1, -1, -1):
+            rank = idx.get(fps[k])
+            if rank is not None:
+                return rank, k + 1
+        return None, 0
+
+    def record(self, fps: list[bytes], rank: int) -> None:
+        idx = self._index
+        for fp in fps:
+            if fp in idx:
+                idx.move_to_end(fp)
+            idx[fp] = rank
+        while len(idx) > self.max_entries:
+            idx.popitem(last=False)
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
 
@@ -168,11 +224,13 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.PREFIX_AFFINITY: self.prefix_affinity_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            LoadBalanceMethod.PREFIX_AFFINITY,
         )
 
         self.launch_dp_size: int = get_parallel().num_dp_ranks
@@ -193,6 +251,24 @@ class DataParallelController:
             port_args,
             caller="DataParallelController",
         )
+        self.prefix_affinity: PrefixAffinityIndex | None = None
+        if self.load_balance_method == LoadBalanceMethod.PREFIX_AFFINITY:
+            self.prefix_affinity = PrefixAffinityIndex(
+                chunk=envs.SGLANG_DP_PREFIX_AFFINITY_CHUNK.get(),
+                max_entries=envs.SGLANG_DP_PREFIX_AFFINITY_MAX_ENTRIES.get(),
+            )
+            self.prefix_affinity_slack = envs.SGLANG_DP_PREFIX_AFFINITY_SLACK.get()
+            self.prefix_affinity_sticky_tokens = (
+                envs.SGLANG_DP_PREFIX_AFFINITY_STICKY_TOKENS.get()
+            )
+            self._prefix_affinity_stats = {"hit": 0, "miss": 0, "spread": 0}
+            logger.info(
+                "DP dispatch: prefix_affinity chunk=%d slack=%d sticky_tokens=%d max_entries=%d",
+                self.prefix_affinity.chunk,
+                self.prefix_affinity_slack,
+                self.prefix_affinity_sticky_tokens,
+                self.prefix_affinity.max_entries,
+            )
         self._last_refresh_time = 0.0
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
@@ -791,10 +867,72 @@ class DataParallelController:
         )
         sock_send(self.workers[target_worker], req)
 
+    def prefix_affinity_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        index = self.prefix_affinity
+        fps = index.fingerprints(req.input_ids)
+        rank, matched = index.lookup(fps)
+        target = None
+        if (
+            rank is not None
+            and rank in self._active_workers
+            and self.status[rank]
+            and self.workers[rank] is not None
+        ):
+            loads = [self.dp_budget.total_requests[i] for i in self._active_workers]
+            # A long matched prefix always sticks (re-prefilling it costs more
+            # than the queueing the slack guard would avoid); a short one -- e.g.
+            # only a shared system prompt -- may be spread for balance.
+            if (
+                matched * index.chunk >= self.prefix_affinity_sticky_tokens
+                or self.dp_budget.total_requests[rank]
+                <= min(loads) + self.prefix_affinity_slack
+            ):
+                target = rank
+                # Mirror DPBudget.dispatch's speculative increments; only the
+                # unmatched tail is new work for the rank.
+                self.dp_budget.total_requests[rank] += 1
+                self.dp_budget.total_tokens[rank] += max(
+                    0, len(req.input_ids) - matched * index.chunk
+                )
+                self._prefix_affinity_stats["hit"] += 1
+            else:
+                self._prefix_affinity_stats["spread"] += 1
+        else:
+            self._prefix_affinity_stats["miss"] += 1
+        if target is None:
+            # total_tokens choice restricted to active workers (DPBudget.dispatch
+            # ranges over every slot, including ones that are not active).
+            budget = self.dp_budget
+            target = min(
+                self._active_workers,
+                key=lambda i: (budget.total_tokens[i], budget.total_requests[i]),
+            )
+            budget.total_requests[target] += 1
+            budget.total_tokens[target] += len(req.input_ids)
+        index.record(fps, target)
+        st = self._prefix_affinity_stats
+        if (st["hit"] + st["miss"] + st["spread"]) % 200 == 0:
+            logger.info(
+                "DP prefix_affinity: hit=%d miss=%d spread=%d index=%d",
+                st["hit"],
+                st["miss"],
+                st["spread"],
+                len(index),
+            )
+        sock_send(self.workers[target], req)
+
     def event_loop(self):
+        # Wait on the socket with a bounded poll instead of spinning on
+        # NOBLOCK: the spin pinned a full host core for the life of the
+        # server. The timeout keeps the soft watchdog fed while idle.
+        poller = zmq.Poller()
+        poller.register(self.recv_from_tokenizer, zmq.POLLIN)
         while True:
+            self.soft_watchdog.feed()
+            poller.poll(timeout=1000)
             while True:
-                self.soft_watchdog.feed()
                 try:
                     recv_req = sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
                 except zmq.ZMQError:
