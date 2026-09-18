@@ -105,6 +105,10 @@ class LoadBalanceMethod(Enum):
             raise ValueError(f"Invalid load balance method: {method}") from exc
 
 
+# A scheduler snapshot this much older than a dispatch cannot have seen it.
+PENDING_DISPATCH_GRACE_S = 0.5
+
+
 class DPBudget:
     def __init__(self, num_dp_ranks: int):
         self.num_dp_ranks = num_dp_ranks
@@ -113,6 +117,14 @@ class DPBudget:
         # Input tokens still awaiting prefill compute per rank (waiting queue
         # plus the in-flight chunked remainder), from the scheduler snapshot.
         self.prefill_backlog = [0] * num_dp_ranks
+        # Dispatches the snapshot cannot have seen yet: (dispatch time, tokens).
+        # A refresh re-adds them on top of the snapshot until a snapshot newer
+        # than the dispatch (plus grace) arrives; without this the 20 ms refresh
+        # wiped the speculative backlog with a stale snapshot between two
+        # arrivals and both landed on one rank.
+        self.pending_dispatches: list[list[tuple[float, int]]] = [
+            [] for _ in range(num_dp_ranks)
+        ]
         self.last_timestamp = [0.0] * num_dp_ranks
 
     def update_budget(self, loads):
@@ -125,7 +137,16 @@ class DPBudget:
                 load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
-            self.prefill_backlog[load.dp_rank] = load.num_waiting_uncached_tokens
+            keep = [
+                (t, tok)
+                for (t, tok) in self.pending_dispatches[load.dp_rank]
+                if t + PENDING_DISPATCH_GRACE_S > load.timestamp
+            ]
+            self.pending_dispatches[load.dp_rank] = keep
+            self.prefill_backlog[load.dp_rank] = load.num_waiting_uncached_tokens + sum(
+                tok for _, tok in keep
+            )
+            self.total_requests[load.dp_rank] += len(keep)
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
@@ -927,10 +948,13 @@ class DataParallelController:
         # Speculative increments until the next snapshot refresh: the new
         # prefill work is the unmatched tail on the affinity rank, the whole
         # prompt elsewhere.
-        new_tokens = len(req.input_ids) - (matched_tokens if target == rank else 0)
+        new_tokens = max(
+            0, len(req.input_ids) - (matched_tokens if target == rank else 0)
+        )
         budget.total_requests[target] += 1
-        budget.total_tokens[target] += max(0, new_tokens)
-        budget.prefill_backlog[target] += max(0, new_tokens)
+        budget.total_tokens[target] += new_tokens
+        budget.prefill_backlog[target] += new_tokens
+        budget.pending_dispatches[target].append((time.time(), new_tokens))
         index.record(fps, target)
         st = self._prefix_affinity_stats
         if (st["hit"] + st["miss"] + st["spread"]) % 200 == 0:
