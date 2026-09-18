@@ -1489,11 +1489,16 @@ class Envs:
     # `--load-balance-method prefix_affinity` (DP controller): a request is routed
     # to the DP rank that last served the longest matching token prefix, so a
     # conversation's next turn lands where its radix-cache prefix lives. Prefix
-    # fingerprints are taken every CHUNK tokens; the affinity rank is skipped when
-    # it carries more than SLACK requests above the least-loaded rank (falls back
-    # to total_tokens); the index keeps MAX_ENTRIES fingerprints (LRU).
+    # fingerprints are taken every CHUNK tokens. A SHORT match (below STICKY_TOKENS,
+    # e.g. only a system prompt shared by every conversation) follows its rank only
+    # when that rank carries at most SLACK requests more than the least-loaded one
+    # -- SLACK 0 means "only when it carries strictly fewer requests than every
+    # other active rank" (an exact tie goes to the alternating fallback); anything looser
+    # funnels every new conversation onto the rank that first saw the shared
+    # prompt at low concurrency (measured: 27/27 requests on one rank at SLACK 2).
+    # The index keeps MAX_ENTRIES fingerprints (LRU).
     SGLANG_DP_PREFIX_AFFINITY_CHUNK = EnvInt(2048)
-    SGLANG_DP_PREFIX_AFFINITY_SLACK = EnvInt(2)
+    SGLANG_DP_PREFIX_AFFINITY_SLACK = EnvInt(0)
     # A match of at least this many tokens always sticks to its rank: re-prefilling
     # that much costs more than queueing behind the imbalance the slack guard sees.
     SGLANG_DP_PREFIX_AFFINITY_STICKY_TOKENS = EnvInt(16384)

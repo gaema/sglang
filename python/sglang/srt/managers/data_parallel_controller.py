@@ -880,14 +880,24 @@ class DataParallelController:
             and self.status[rank]
             and self.workers[rank] is not None
         ):
-            loads = [self.dp_budget.total_requests[i] for i in self._active_workers]
+            others = [
+                self.dp_budget.total_requests[i]
+                for i in self._active_workers
+                if i != rank
+            ]
             # A long matched prefix always sticks (re-prefilling it costs more
             # than the queueing the slack guard would avoid); a short one -- e.g.
-            # only a shared system prompt -- may be spread for balance.
+            # only a shared system prompt -- follows its rank only while that
+            # rank carries strictly fewer requests than every other active rank
+            # (plus SLACK, default 0); an exact tie goes to the alternating
+            # fallback. Any looser rule funnels every new conversation onto the
+            # rank that first served the shared prompt (measured 27/27 at low
+            # concurrency with a tie-tolerant rule).
             if (
                 matched * index.chunk >= self.prefix_affinity_sticky_tokens
+                or not others
                 or self.dp_budget.total_requests[rank]
-                <= min(loads) + self.prefix_affinity_slack
+                < min(others) + self.prefix_affinity_slack
             ):
                 target = rank
                 # Mirror DPBudget.dispatch's speculative increments; only the
@@ -905,10 +915,13 @@ class DataParallelController:
             # total_tokens choice restricted to active workers (DPBudget.dispatch
             # ranges over every slot, including ones that are not active).
             budget = self.dp_budget
-            target = min(
-                self._active_workers,
-                key=lambda i: (budget.total_tokens[i], budget.total_requests[i]),
-            )
+            key = lambda i: (budget.total_tokens[i], budget.total_requests[i])
+            best = min(key(i) for i in self._active_workers)
+            least = [i for i in self._active_workers if key(i) == best]
+            # Exact ties (an idle server) alternate; `min` alone would home every
+            # quiet-period conversation on the lowest rank.
+            target = least[self.round_robin_counter % len(least)]
+            self.round_robin_counter += 1
             budget.total_requests[target] += 1
             budget.total_tokens[target] += len(req.input_ids)
         index.record(fps, target)
