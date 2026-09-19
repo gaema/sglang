@@ -167,21 +167,21 @@ class DPBudget:
 
 
 class PrefixAffinityIndex:
-    """Token-prefix fingerprint -> the DP rank that last served it.
+    """Token-prefix fingerprint -> the DP ranks that have served it.
 
     Each DP rank owns its own radix cache, so a conversation whose turns are
     spread across ranks re-prefills its whole context on every rank it
-    visits. This index approximates the radix cache at the controller: a
+    visits. This index approximates the radix caches at the controller: a
     request is fingerprinted with a cumulative hash at every ``chunk`` tokens,
-    and the longest fingerprint already known names the rank whose cache holds
-    (at least) that much of the prefix. Bounded LRU; a miss is only a cold
-    prefill, never an error.
+    and for each rank the longest fingerprint that rank has served bounds
+    the prefix its cache holds. Bounded LRU; a miss is only a cold prefill,
+    never an error.
     """
 
     def __init__(self, chunk: int, max_entries: int):
         self.chunk = max(1, chunk)
         self.max_entries = max(1, max_entries)
-        self._index: OrderedDict[bytes, int] = OrderedDict()
+        self._index: OrderedDict[bytes, int] = OrderedDict()   # fp -> rank bitmask
 
     def fingerprints(self, input_ids) -> list[bytes]:
         n = len(input_ids) // self.chunk
@@ -196,21 +196,31 @@ class PrefixAffinityIndex:
             out.append(h.digest())
         return out
 
-    def lookup(self, fps: list[bytes]) -> tuple[int | None, int]:
-        """(rank, number of matched chunks) for the longest known prefix."""
+    def lookup(self, fps: list[bytes]) -> dict[int, int]:
+        """{rank: number of matched chunks} -- the longest known prefix per rank."""
         idx = self._index
+        out: dict[int, int] = {}
         for k in range(len(fps) - 1, -1, -1):
-            rank = idx.get(fps[k])
-            if rank is not None:
-                return rank, k + 1
-        return None, 0
+            mask = idx.get(fps[k])
+            if not mask:
+                continue
+            r = 0
+            while mask:
+                if mask & 1 and r not in out:
+                    out[r] = k + 1
+                mask >>= 1
+                r += 1
+        return out
 
     def record(self, fps: list[bytes], rank: int) -> None:
         idx = self._index
+        bit = 1 << rank
         for fp in fps:
             if fp in idx:
                 idx.move_to_end(fp)
-            idx[fp] = rank
+                idx[fp] |= bit
+            else:
+                idx[fp] = bit
         while len(idx) > self.max_entries:
             idx.popitem(last=False)
 
@@ -285,7 +295,7 @@ class DataParallelController:
             self.prefix_affinity_sticky_tokens = (
                 envs.SGLANG_DP_PREFIX_AFFINITY_STICKY_TOKENS.get()
             )
-            self._prefix_affinity_stats = {"hit": 0, "miss": 0, "spread": 0}
+            self._prefix_affinity_stats = {"hit": 0, "miss": 0, "spread": 0, "spread_tokens": 0}
             logger.info(
                 "DP dispatch: prefix_affinity chunk=%d sticky_tokens=%d max_entries=%d",
                 self.prefix_affinity.chunk,
@@ -895,62 +905,48 @@ class DataParallelController:
             return
         index = self.prefix_affinity
         budget = self.dp_budget
-        active = self._active_workers
+        active = [
+            i
+            for i in self._active_workers
+            if self.status[i] and self.workers[i] is not None
+        ]
         fps = index.fingerprints(req.input_ids)
-        rank, matched = index.lookup(fps)
-        matched_tokens = matched * index.chunk
-        target = None
-        if (
-            rank is not None
-            and rank in active
-            and self.status[rank]
-            and self.workers[rank] is not None
-        ):
-            others = [budget.prefill_backlog[i] for i in active if i != rank]
-            # Cost comparison in prefill tokens (both ranks prefill at the same
-            # rate): following the affinity rank saves re-prefilling the matched
-            # prefix but waits behind that rank's prefill backlog. Stick when the
-            # saving is at least the extra wait. At an exact backlog tie (an idle
-            # server) only a match >= STICKY_TOKENS sticks -- a short one, e.g. a
-            # system prompt shared by every conversation, alternates instead, so
-            # quiet-period conversations do not all home on one rank.
-            if not others:
-                stick = True
-            else:
-                extra_wait = budget.prefill_backlog[rank] - min(others)
-                if extra_wait < 0:
-                    stick = True
-                elif extra_wait == 0:
-                    stick = matched_tokens >= self.prefix_affinity_sticky_tokens
-                else:
-                    stick = matched_tokens >= extra_wait
-            if stick:
-                target = rank
-                self._prefix_affinity_stats["hit"] += 1
-            else:
-                self._prefix_affinity_stats["spread"] += 1
-        else:
-            self._prefix_affinity_stats["miss"] += 1
-        if target is None:
-            # Least prefill backlog, then fewest requests, then fewest resident
-            # tokens, over ACTIVE workers only (DPBudget.dispatch ranges over
-            # every slot). Exact ties alternate: `min` alone would home every
-            # quiet-period conversation on the lowest rank.
-            key = lambda i: (
-                budget.prefill_backlog[i],
-                budget.total_requests[i],
-                budget.total_tokens[i],
-            )
-            best = min(key(i) for i in active)
-            least = [i for i in active if key(i) == best]
-            target = least[self.round_robin_counter % len(least)]
+        n = len(req.input_ids)
+        per_rank = index.lookup(fps)
+        matched = {i: per_rank.get(i, 0) * index.chunk for i in active}
+        best_match = max(matched.values()) if matched else 0
+        # Estimated time-to-first-token in prefill tokens (both ranks prefill at
+        # the same rate): wait behind that rank's prefill backlog, then the part
+        # of the prompt its cache does not hold. A rank that already holds the
+        # shared prompt is a free spread; one that holds nothing costs the whole
+        # prompt.
+        cost = {i: budget.prefill_backlog[i] + (n - matched[i]) for i in active}
+        best_rank = min(active, key=lambda i: (cost[i], -matched[i]))
+        # At an exact backlog tie a SHORT best match -- below STICKY_TOKENS, e.g.
+        # only a system prompt shared by every conversation -- alternates among
+        # the ranks whose cost is within that much, so quiet-period conversations
+        # do not all home on one rank; a longer match (a conversation's own
+        # context) sticks.
+        near = [
+            i
+            for i in active
+            if budget.prefill_backlog[i] == budget.prefill_backlog[best_rank]
+            and cost[i] - cost[best_rank] < self.prefix_affinity_sticky_tokens
+        ]
+        if best_match < self.prefix_affinity_sticky_tokens and len(near) > 1:
+            target = near[self.round_robin_counter % len(near)]
             self.round_robin_counter += 1
-        # Speculative increments until the next snapshot refresh: the new
-        # prefill work is the unmatched tail on the affinity rank, the whole
-        # prompt elsewhere.
-        new_tokens = max(
-            0, len(req.input_ids) - (matched_tokens if target == rank else 0)
-        )
+        else:
+            target = best_rank
+        if best_match == 0:
+            self._prefix_affinity_stats["miss"] += 1
+        elif matched[target] == best_match:
+            self._prefix_affinity_stats["hit"] += 1
+        else:
+            self._prefix_affinity_stats["spread"] += 1
+            self._prefix_affinity_stats["spread_tokens"] += best_match - matched[target]
+        # Speculative increments until the next snapshot refresh.
+        new_tokens = max(0, n - matched[target])
         budget.total_requests[target] += 1
         budget.total_tokens[target] += new_tokens
         budget.prefill_backlog[target] += new_tokens
@@ -959,10 +955,11 @@ class DataParallelController:
         st = self._prefix_affinity_stats
         if (st["hit"] + st["miss"] + st["spread"]) % 200 == 0:
             logger.info(
-                "DP prefix_affinity: hit=%d miss=%d spread=%d index=%d",
+                "DP prefix_affinity: hit=%d miss=%d spread=%d spread_tokens=%d index=%d",
                 st["hit"],
                 st["miss"],
                 st["spread"],
+                st["spread_tokens"],
                 len(index),
             )
         sock_send(self.workers[target], req)
