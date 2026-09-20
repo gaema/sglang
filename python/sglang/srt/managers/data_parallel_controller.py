@@ -1032,6 +1032,16 @@ class DataParallelController:
         else:
             self._prefix_affinity_stats["spread"] += 1
             self._prefix_affinity_stats["spread_tokens"] += best_match - matched[target]
+        # 🔴 Captured BEFORE the speculative increments below, because those mutate
+        # `prefill_backlog[target]` and the instrument needs the backlogs the DECISION
+        # SAW, not the post-dispatch ones. Reading them after would have logged a
+        # `bl_target` inflated by this very request's own `new_tokens` -- a wrong D,
+        # silently, in the one field the weight analysis turns on.
+        _obs_bl_target = budget.prefill_backlog[target]
+        _obs_bl_best = (
+            budget.prefill_backlog[max(matched, key=lambda i: matched[i])]
+            if matched else 0
+        )
         # Speculative increments until the next snapshot refresh.
         new_tokens = max(0, n - matched[target])
         budget.total_requests[target] += 1
@@ -1062,15 +1072,27 @@ class DataParallelController:
             self.prefix_affinity_observe_tokens
             and n >= self.prefix_affinity_observe_tokens
         ):
+            # 🔴 `bl_*` are here because WITHOUT THEM THIS LINE CANNOT ANSWER THE
+            # QUESTION IT WAS BUILT FOR -- added 2026-09-20 after an offline attempt
+            # to price REPREFILL_WEIGHT found the instrument one field short.
+            # A spread happens iff D > (W-1)·Δ, where Δ = best_match - matched[target]
+            # (the sacrificed prefix, already logged) and D = the backlog difference
+            # between the best-cached rank and the chosen one. Δ alone says what a
+            # spread COST; only D says whether a different WEIGHT would have REFUSED
+            # it. With both, one window at ANY weight yields the exact refused set for
+            # EVERY candidate weight -- so the next restart settles the weight question
+            # for free instead of needing a live A/B per value.
             logger.info(
                 "DP prefix_affinity dispatch: rid=%s rank=%d n=%d best_match=%d "
-                "matched=%d new=%d",
+                "matched=%d new=%d bl_target=%d bl_best=%d",
                 req.rid,
                 target,
                 n,
                 best_match,
                 matched[target],
                 new_tokens,
+                _obs_bl_target,
+                _obs_bl_best,
             )
         st = self._prefix_affinity_stats
         if (st["hit"] + st["miss"] + st["spread"]) % 200 == 0:
