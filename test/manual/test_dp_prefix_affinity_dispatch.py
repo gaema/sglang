@@ -53,12 +53,27 @@ class FakeBudget:
 
 
 class FakeReq:
-    def __init__(self, n):
+    def __init__(self, n, rid="rid-test"):
         self.input_ids = list(range(n))
+        self.rid = rid
 
 
-def dispatch(matched_tokens, backlog, n, weight, chunk=2048, sticky=16384, rr=0):
-    """Run the REAL scheduler; return (target_rank, stats)."""
+def dispatch(
+    matched_tokens,
+    backlog,
+    n,
+    weight,
+    chunk=2048,
+    sticky=16384,
+    rr=0,
+    observe=0,
+    rid="rid-test",
+    capture_logs=False,
+):
+    """Run the REAL scheduler; return (target_rank, stats), or
+    (target, stats, lines) when `capture_logs` -- only the instrument arms need
+    the emitted text. `observe` defaults to 0 (the shipped default, instrument
+    OFF), so every decision arm also asserts the instrument stays silent."""
     ranks = sorted(matched_tokens)
     per_rank = {i: matched_tokens[i] // chunk for i in ranks}
     ctl = mock.Mock()
@@ -71,12 +86,21 @@ def dispatch(matched_tokens, backlog, n, weight, chunk=2048, sticky=16384, rr=0)
     ctl.prefix_affinity_sticky_tokens = sticky
     ctl.prefix_affinity_reprefill_weight = weight
     ctl.round_robin_counter = rr
+    ctl.prefix_affinity_observe_tokens = observe
     ctl._prefix_affinity_stats = {"hit": 0, "miss": 0, "spread": 0, "spread_tokens": 0}
 
     sent = {}
-    with mock.patch.object(dpc, "sock_send", lambda w, r: sent.setdefault("w", w)):
-        dpc.DataParallelController.prefix_affinity_scheduler(ctl, FakeReq(n))
+    lines = []
+    fake_logger = mock.Mock()
+    fake_logger.info = lambda fmt, *args: lines.append(fmt % args)
+    with mock.patch.object(dpc, "sock_send", lambda w, r: sent.setdefault("w", w)), \
+            mock.patch.object(dpc, "logger", fake_logger):
+        dpc.DataParallelController.prefix_affinity_scheduler(ctl, FakeReq(n, rid=rid))
     target = next(i for i in ranks if ctl.workers[i] is sent["w"])
+    dispatch_lines = [l for l in lines if l.startswith("DP prefix_affinity dispatch:")]
+    if capture_logs:
+        return target, ctl._prefix_affinity_stats, dispatch_lines
+    assert not dispatch_lines, f"instrument fired with observe={observe}: {dispatch_lines}"
     return target, ctl._prefix_affinity_stats
 
 
@@ -214,6 +238,103 @@ class EnvWiring(unittest.TestCase):
         defect inverted -- so the constructor clamps. Mirrors that expression."""
         for raw, want in ((0.0, 1.0), (0.5, 1.0), (1.0, 1.0), (3.5, 3.5)):
             self.assertEqual(max(1.0, float(raw)), want)
+
+
+class EvictionInstrument(unittest.TestCase):
+    """`SGLANG_DP_PREFIX_AFFINITY_OBSERVE_TOKENS` logs `best_match` / `matched`,
+    which the dispatcher otherwise computes and throws away. Its purpose is to
+    make one currently-unanswerable question answerable: is a >100k-uncached-token
+    prefill a re-prefill of an EVICTED conversation, or a genuinely new prompt?
+
+    🔴 It must change no decision and must be silent at its shipped default --
+    the endpoint runs ~0.5 req/s with 200-dispatch summary logging, so a
+    per-request line by default is not affordable."""
+
+    BIG = {0: 100352, 1: 0}          # 49 chunks x 2048 on rank 0
+
+    def test_off_by_default_emits_nothing(self):
+        """MUST-NOT-FIRE: observe=0 (the shipped default) is silent even on a
+        request far larger than any threshold an operator would set."""
+        _, _, lines = dispatch(
+            self.BIG, {0: 0, 1: 0}, 500000, weight=2.0, observe=0, capture_logs=True
+        )
+        self.assertEqual(lines, [])
+
+    def test_below_the_threshold_emits_nothing(self):
+        _, _, lines = dispatch(
+            {0: 0, 1: 0}, {0: 0, 1: 0}, 99999, weight=2.0, observe=100000,
+            capture_logs=True,
+        )
+        self.assertEqual(lines, [])
+
+    def test_at_and_above_the_threshold_emits_exactly_one_line(self):
+        """MUST-FIRE: the pair with the arm above is what proves the threshold is
+        the real gate and not an always-off / always-on knob."""
+        for n in (100000, 400000):
+            _, _, lines = dispatch(
+                {0: 0, 1: 0}, {0: 0, 1: 0}, n, weight=2.0, observe=100000,
+                capture_logs=True,
+            )
+            self.assertEqual(len(lines), 1, f"n={n}: {lines}")
+
+    def test_the_line_carries_every_operand_the_join_needs(self):
+        """The join is against that rank's next `Prefill batch` line, which carries
+        no rid -- so the line must name the RANK (which log stream) and `new` (what
+        that rank's `#new-token` should be), plus `best_match` and `matched` (the
+        eviction discriminator) and `n`. Assert the values, not just the keys."""
+        target, _, lines = dispatch(
+            self.BIG, {0: 0, 1: 0}, 120000, weight=2.0, observe=100000,
+            rid="req-abc123", capture_logs=True,
+        )
+        self.assertEqual(target, 0)          # long match sticks at equal backlog
+        line = lines[0]
+        for operand in (
+            "rid=req-abc123",
+            "rank=0",
+            "n=120000",
+            "best_match=100352",
+            "matched=100352",
+            "new=19648",                     # 120000 - 100352, the expected #new-token
+        ):
+            self.assertIn(operand, line, f"{operand!r} missing from {line!r}")
+
+    def test_it_discriminates_an_eviction_from_a_new_prompt(self):
+        """The whole point. Same prompt length, same backlogs, same threshold:
+        a conversation the index has seen reads `best_match>0` (so a following
+        `#cached-token: 0` convicts the cache of evicting it); a prompt no rank
+        was ever sent reads `best_match=0` and cannot be mistaken for one."""
+        _, _, seen = dispatch(
+            self.BIG, {0: 0, 1: 0}, 120000, weight=2.0, observe=100000,
+            capture_logs=True,
+        )
+        _, _, fresh = dispatch(
+            {0: 0, 1: 0}, {0: 0, 1: 0}, 120000, weight=2.0, observe=100000,
+            capture_logs=True,
+        )
+        self.assertIn("best_match=100352", seen[0])
+        self.assertIn("best_match=0", fresh[0])
+        self.assertIn("new=120000", fresh[0])
+
+    def test_the_instrument_does_not_move_the_decision(self):
+        """An instrument that changes dispatch is not an instrument. Every
+        scenario the decision suite above cares about must pick the same rank
+        with the knob on as with it off."""
+        cases = [
+            ({0: 100352, 1: 0}, {0: 150000, 1: 0}, 120000),
+            ({0: 100352, 1: 0}, {0: 5_000_000, 1: 0}, 120000),
+            ({0: 49152, 1: 49152}, {0: 90000, 1: 10000}, 120000),
+            ({0: 4096, 1: 4096}, {0: 0, 1: 0}, 50000),
+        ]
+        for matched, backlog, n in cases:
+            off, _ = dispatch(matched, backlog, n, weight=2.0, observe=0)
+            on, _, _ = dispatch(
+                matched, backlog, n, weight=2.0, observe=1, capture_logs=True
+            )
+            self.assertEqual(off, on, f"matched={matched} backlog={backlog} n={n}")
+
+    def test_env_field_exists_and_defaults_to_off(self):
+        from sglang.srt.environ import envs
+        self.assertEqual(int(envs.SGLANG_DP_PREFIX_AFFINITY_OBSERVE_TOKENS.get()), 0)
 
 
 if __name__ == "__main__":
