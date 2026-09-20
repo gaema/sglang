@@ -196,14 +196,29 @@ class SpreadIsPricedAgainstWait(unittest.TestCase):
         self.assertEqual(dispatch(matched, {0: just_under, 1: 0}, 120000, 2.0)[0], 0)
         self.assertEqual(dispatch(matched, {0: just_over, 1: 0}, 120000, 2.0)[0], 1)
 
-    def test_short_match_with_unequal_backlogs_does_not_home(self):
-        """The round-robin branch can fire while backlogs DIFFER (near is built around
-        the new best_rank). Bounded and low-stakes because best_match < STICKY, but it
-        must still not collapse onto one rank across a run of requests."""
-        matched = {0: 4096, 1: 2048}
-        backlog = {0: 0, 1: 30000}
-        seen = {dispatch(matched, backlog, 50000, weight=2.0, rr=r)[0] for r in range(4)}
-        self.assertTrue(seen.issubset({0, 1}) and seen, f"unexpected targets {seen}")
+    def test_the_weight_does_not_disable_anti_homing_at_three_ranks(self):
+        """🔴 REGRESSION ARM for a real bug, REPLACING a test that could not fail.
+
+        The old arm asserted `seen.issubset({0,1})` over targets drawn from ranks
+        {0,1} -- a tautology -- and its own scenario homed anyway, so it passed while
+        its docstring claimed the opposite. Both defects found by review 2026-09-20.
+
+        The bug it now covers: `near` was anchored on the WEIGHTED best_rank, so once
+        the weight moved the anchor to a rank at a different backlog level the set
+        collapsed to a singleton and the round-robin silently stopped -- the weight
+        disabling the anti-homing rule. Invisible at dp_size=2 (a non-singleton
+        `near` needs exact backlog equality, where both rules agree), live at 3.
+        Measured before the fix: W=1.0 alternated [1,2,1,2], W=2.0 homed [0,0,0,0].
+
+        The invariant: a SHORT best match alternates identically at any weight."""
+        matched = {0: 8192, 1: 0, 2: 0}
+        backlog = {0: 10000, 1: 0, 2: 0}
+        legacy = [dispatch(matched, backlog, 50000, weight=1.0, rr=r)[0] for r in range(4)]
+        weighted = [dispatch(matched, backlog, 50000, weight=2.0, rr=r)[0] for r in range(4)]
+        self.assertGreater(len(set(legacy)), 1,
+                           "fixture no longer exercises alternation -- test is blind")
+        self.assertEqual(weighted, legacy,
+                         f"weight changed the anti-homing branch: {weighted} vs {legacy}")
 
 
 class StickyBehaviourUnchanged(unittest.TestCase):
@@ -235,9 +250,21 @@ class EnvWiring(unittest.TestCase):
 
     def test_clamp_refuses_a_weight_below_one(self):
         """Below 1.0 the dispatcher would PREFER re-prefilling over waiting -- the
-        defect inverted -- so the constructor clamps. Mirrors that expression."""
-        for raw, want in ((0.0, 1.0), (0.5, 1.0), (1.0, 1.0), (3.5, 3.5)):
-            self.assertEqual(max(1.0, float(raw)), want)
+        defect inverted -- so the value is clamped.
+
+        🔴 This arm previously asserted `max(1.0, float(raw)) == want`: a COPY of the
+        expression, not the code, which would have passed with the constructor line
+        deleted. Commit e0c4233c1a claimed it closed this gap; it did not. The clamp
+        now lives in `resolve_reprefill_weight` -- the function the constructor calls
+        -- so this exercises the shipped path."""
+        for raw, want in ((0.0, 1.0), (0.5, 1.0), (1.0, 1.0), (2, 2.0), (3.5, 3.5)):
+            self.assertEqual(dpc.resolve_reprefill_weight(raw), want, f"raw={raw!r}")
+
+    def test_a_mistyped_weight_degrades_to_the_legacy_chooser(self):
+        """A non-numeric env value must fall back to 1.0 -- the exact old behaviour --
+        rather than to an arbitrary one or a crash at startup."""
+        for raw in ("", "two", None, "abc"):
+            self.assertEqual(dpc.resolve_reprefill_weight(raw), 1.0, f"raw={raw!r}")
 
 
 class EvictionInstrument(unittest.TestCase):
