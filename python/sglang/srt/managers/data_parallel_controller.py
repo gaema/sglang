@@ -938,7 +938,19 @@ class DataParallelController:
         # served recipe) makes the dispatcher prefer waiting over re-prefilling.
         # WEIGHT = 1.0 is arithmetically identical to the old behaviour -- the
         # `n - best_match` remainder is constant across ranks, so it cannot move
-        # the argmin -- and is therefore the exact rollback.
+        # the argmin -- and is therefore the exact rollback. The whole key reduces
+        # to `argmin_i backlog[i] - WEIGHT * matched[i]` (the rest is constant
+        # across ranks), which is the cleanest way to see both that equivalence
+        # and what the weight does.
+        #
+        # 🔴 THE PRICE, so nobody has to rediscover it: a rank is willing to be
+        # WEIGHT * matched[i] tokens MORE backlogged before the request spreads
+        # off it. At WEIGHT=2 and a 100k match that is 200k tokens of extra queue
+        # -- about 17 s at the measured 11.5k tok/s prefill rate -- accepted to
+        # avoid a ~9 s all-rank throttle from re-prefilling that 100k. Mean queue
+        # time before this change was 1.65 s, so the tail this can add is real and
+        # is the thing to watch if TTFT regresses. Lower WEIGHT toward 1.0 if it
+        # does; that is a pure TTFT-vs-waste dial.
         cost = {i: budget.prefill_backlog[i] + (n - matched[i]) for i in active}
         best_rank = min(
             active,
@@ -955,9 +967,16 @@ class DataParallelController:
         # context) sticks.
         #
         # `near` deliberately keeps the UNWEIGHTED cost: it is about this request's
-        # own TTFT among equally-backlogged ranks, and a request whose best match is
-        # a bare system prompt wastes nothing by alternating (the term the weight
-        # scales, best_match - matched[i], is ~0 across the near set by construction).
+        # own TTFT among equally-backlogged ranks.
+        #
+        # What alternating can cost, stated rather than waved away: this branch runs
+        # only when `best_match < STICKY_TOKENS`, so the waste it can accept is
+        # bounded by best_match -- under 16384 tokens at the default, NOT "about
+        # zero". That is the deliberate price of not homing every quiet-period
+        # conversation onto one rank. And when backlogs are EQUAL -- which `near`
+        # requires -- the weighted and unweighted rules select the SAME rank (with
+        # backlog equal, both reduce to argmax matched), so the weight cannot move
+        # the near set in the case this branch actually fires on.
         near = [
             i
             for i in active
