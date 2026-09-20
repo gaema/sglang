@@ -1494,9 +1494,28 @@ class Envs:
     # tie only a match of at least STICKY_TOKENS sticks -- a shorter one (a system
     # prompt shared by every conversation) alternates, so quiet-period conversations
     # do not all home on one rank. The index keeps MAX_ENTRIES fingerprints (LRU).
+    # REPREFILL_WEIGHT prices a SPREAD against a WAIT, which the original cost
+    # function treated as equal and they are not. Waiting behind a rank's prefill
+    # backlog costs THIS request latency, but that work is already committed --
+    # the machine does it either way. Re-prefilling a prefix another rank already
+    # holds is NEW work: GPU time that did not need to exist, and under DP
+    # attention every rank runs the same forward, so a spread's extra prefill
+    # throttles decode on ALL ranks, not only the one that took the request.
+    # Minimising per-request TTFT therefore maximises system-wide waste.
+    #
+    # The dispatcher minimises `backlog[i] + WEIGHT * (best_match - matched[i])`.
+    # WEIGHT = 1.0 reproduces the pre-2026-09-20 behaviour EXACTLY and is the
+    # rollback. The 2.0 default is the measured lockstep factor -- wasted prefill
+    # costs the system dp_size ranks' decode time and dp_size is 2 on the served
+    # recipe -- NOT a tuned optimum; it has never been A/B'd against live traffic.
+    # The waste it targets, measured: 1,646,592 tokens = 6.9% of all computed
+    # prefill in 63.6 min, 10,270 tokens per spread. Evidence, in the claude repo:
+    # ai/models/lm/qwen3-8-flash-next/audit/
+    #   2026-09-20-where-the-served-endpoint-spends-its-time.md
     SGLANG_DP_PREFIX_AFFINITY_CHUNK = EnvInt(2048)
     SGLANG_DP_PREFIX_AFFINITY_STICKY_TOKENS = EnvInt(16384)
     SGLANG_DP_PREFIX_AFFINITY_MAX_ENTRIES = EnvInt(65536)
+    SGLANG_DP_PREFIX_AFFINITY_REPREFILL_WEIGHT = EnvFloat(2.0)
 
     # ===================================================================
     # CUDA graphs and execution buffers

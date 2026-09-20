@@ -295,12 +295,19 @@ class DataParallelController:
             self.prefix_affinity_sticky_tokens = (
                 envs.SGLANG_DP_PREFIX_AFFINITY_STICKY_TOKENS.get()
             )
+            # Clamped at 1.0: a weight below 1 would make the dispatcher PREFER
+            # re-prefilling over waiting, which is the defect inverted.
+            self.prefix_affinity_reprefill_weight = max(
+                1.0, float(envs.SGLANG_DP_PREFIX_AFFINITY_REPREFILL_WEIGHT.get())
+            )
             self._prefix_affinity_stats = {"hit": 0, "miss": 0, "spread": 0, "spread_tokens": 0}
             logger.info(
-                "DP dispatch: prefix_affinity chunk=%d sticky_tokens=%d max_entries=%d",
+                "DP dispatch: prefix_affinity chunk=%d sticky_tokens=%d max_entries=%d "
+                "reprefill_weight=%.2f",
                 self.prefix_affinity.chunk,
                 self.prefix_affinity_sticky_tokens,
                 self.prefix_affinity.max_entries,
+                self.prefix_affinity_reprefill_weight,
             )
         self._last_refresh_time = 0.0
 
@@ -920,13 +927,37 @@ class DataParallelController:
         # of the prompt its cache does not hold. A rank that already holds the
         # shared prompt is a free spread; one that holds nothing costs the whole
         # prompt.
+        #
+        # 🔴 TTFT alone is the WRONG objective to minimise, which is what this
+        # function did before 2026-09-20. A WAIT behind backlog costs this request
+        # latency but adds no work -- the machine was going to do it anyway. A
+        # SPREAD re-prefills `best_match - matched[i]` tokens another rank already
+        # holds: new GPU work that did not need to exist, and under DP attention
+        # every rank runs the same forward, so it throttles decode on ALL ranks.
+        # Weighting that term (REPREFILL_WEIGHT, default 2.0 = dp_size on the
+        # served recipe) makes the dispatcher prefer waiting over re-prefilling.
+        # WEIGHT = 1.0 is arithmetically identical to the old behaviour -- the
+        # `n - best_match` remainder is constant across ranks, so it cannot move
+        # the argmin -- and is therefore the exact rollback.
         cost = {i: budget.prefill_backlog[i] + (n - matched[i]) for i in active}
-        best_rank = min(active, key=lambda i: (cost[i], -matched[i]))
+        best_rank = min(
+            active,
+            key=lambda i: (
+                cost[i] + (self.prefix_affinity_reprefill_weight - 1.0)
+                * (best_match - matched[i]),
+                -matched[i],
+            ),
+        )
         # At an exact backlog tie a SHORT best match -- below STICKY_TOKENS, e.g.
         # only a system prompt shared by every conversation -- alternates among
         # the ranks whose cost is within that much, so quiet-period conversations
         # do not all home on one rank; a longer match (a conversation's own
         # context) sticks.
+        #
+        # `near` deliberately keeps the UNWEIGHTED cost: it is about this request's
+        # own TTFT among equally-backlogged ranks, and a request whose best match is
+        # a bare system prompt wastes nothing by alternating (the term the weight
+        # scales, best_match - matched[i], is ~0 across the near set by construction).
         near = [
             i
             for i in active
