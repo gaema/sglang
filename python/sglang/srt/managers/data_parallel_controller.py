@@ -301,13 +301,18 @@ class DataParallelController:
                 1.0, float(envs.SGLANG_DP_PREFIX_AFFINITY_REPREFILL_WEIGHT.get())
             )
             self._prefix_affinity_stats = {"hit": 0, "miss": 0, "spread": 0, "spread_tokens": 0}
+            # Instrument only -- 0 = off; see the env comment. Never gates a decision.
+            self.prefix_affinity_observe_tokens = (
+                envs.SGLANG_DP_PREFIX_AFFINITY_OBSERVE_TOKENS.get()
+            )
             logger.info(
                 "DP dispatch: prefix_affinity chunk=%d sticky_tokens=%d max_entries=%d "
-                "reprefill_weight=%.2f",
+                "reprefill_weight=%.2f observe_tokens=%d",
                 self.prefix_affinity.chunk,
                 self.prefix_affinity_sticky_tokens,
                 self.prefix_affinity.max_entries,
                 self.prefix_affinity_reprefill_weight,
+                self.prefix_affinity_observe_tokens,
             )
         self._last_refresh_time = 0.0
 
@@ -1002,6 +1007,39 @@ class DataParallelController:
         budget.prefill_backlog[target] += new_tokens
         budget.pending_dispatches[target].append((time.time(), new_tokens))
         index.record(fps, target)
+        # EVICTION vs NEW PROMPT -- the one question the aggregate counters above
+        # cannot answer, because they are summed over every request and carry no
+        # join key. `best_match` is the longest prefix the dispatcher's index says
+        # ANY rank was last sent; `matched` is what the rank we chose was sent.
+        # Both are discarded once `target` is picked, so the >100k-uncached-token
+        # prefills in the scheduler log have no attributable cause today.
+        #
+        # The join: this line names `rank`, so it selects that rank's scheduler log
+        # stream, and `new` is what the dispatcher expects that rank's next
+        # `Prefill batch` line to charge as `#new-token`. A large `best_match` whose
+        # prefill then reports `#cached-token: 0` IS an eviction -- the dispatcher
+        # knew a rank had served that prefix and the cache no longer holds it. A
+        # large `n` with `best_match=0` is a genuinely new prompt.
+        #
+        # 🔴 The instrument is one-sided on purpose. The index's own LRU
+        # (MAX_ENTRIES) can drop an entry a rank still caches, which reads here as
+        # `best_match=0`; and fingerprints are CHUNK-quantised, so `best_match`
+        # rounds DOWN. Both errors under-count evictions and neither can invent one,
+        # so a positive reading is trustworthy and a zero reading is a floor.
+        if (
+            self.prefix_affinity_observe_tokens
+            and n >= self.prefix_affinity_observe_tokens
+        ):
+            logger.info(
+                "DP prefix_affinity dispatch: rid=%s rank=%d n=%d best_match=%d "
+                "matched=%d new=%d",
+                req.rid,
+                target,
+                n,
+                best_match,
+                matched[target],
+                new_tokens,
+            )
         st = self._prefix_affinity_stats
         if (st["hit"] + st["miss"] + st["spread"]) % 200 == 0:
             logger.info(

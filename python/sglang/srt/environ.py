@@ -1516,6 +1516,22 @@ class Envs:
     SGLANG_DP_PREFIX_AFFINITY_STICKY_TOKENS = EnvInt(16384)
     SGLANG_DP_PREFIX_AFFINITY_MAX_ENTRIES = EnvInt(65536)
     SGLANG_DP_PREFIX_AFFINITY_REPREFILL_WEIGHT = EnvFloat(2.0)
+    # OBSERVE_TOKENS is an INSTRUMENT, not a dial: it changes no dispatch decision.
+    # Set it to a prompt length in tokens and every dispatch of a request at least
+    # that long logs the two operands the dispatcher otherwise computes and throws
+    # away -- `best_match` (the longest prefix the index says ANY rank was last
+    # sent) and `matched` (what the chosen rank was sent) -- keyed by rid and rank.
+    # It exists to answer one question that is currently unanswerable from the
+    # logs: are the >100k-uncached-token prefills re-prefills of conversations
+    # whose prefix was EVICTED, or genuinely new prompts? Join the line to that
+    # rank's next `Prefill batch` line -- a large `best_match` whose prefill then
+    # reports `#cached-token: 0` is an eviction; `best_match=0` is a new prompt.
+    # 🔴 Default 0 = OFF, and it must stay off by default: this is one line per
+    # request, and the served endpoint's other prefix_affinity logging is a
+    # once-per-200-dispatch summary precisely because per-request lines are not
+    # affordable there. Pick a threshold that selects the tail you care about
+    # (e.g. 100000), never 1.
+    SGLANG_DP_PREFIX_AFFINITY_OBSERVE_TOKENS = EnvInt(0)
 
     # ===================================================================
     # CUDA graphs and execution buffers
