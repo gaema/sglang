@@ -160,6 +160,27 @@ class SpreadIsPricedAgainstWait(unittest.TestCase):
         self.assertEqual(stats["hit"], 1)
         self.assertEqual(stats["spread"], 0)
 
+    def test_the_documented_tolerance_bound_is_the_real_one(self):
+        """The comment promises a rank is tolerated up to WEIGHT * matched[i] tokens
+        MORE backlogged before the request spreads off it. That bound is what an
+        operator would reason about when TTFT regresses, so assert it rather than
+        trusting the prose: at match 100352 and WEIGHT=2 the crossover must sit at
+        ~200704 tokens of extra backlog, not somewhere else."""
+        matched = {0: 100352, 1: 0}
+        just_under = 2 * 100352 - 2048
+        just_over = 2 * 100352 + 2048
+        self.assertEqual(dispatch(matched, {0: just_under, 1: 0}, 120000, 2.0)[0], 0)
+        self.assertEqual(dispatch(matched, {0: just_over, 1: 0}, 120000, 2.0)[0], 1)
+
+    def test_short_match_with_unequal_backlogs_does_not_home(self):
+        """The round-robin branch can fire while backlogs DIFFER (near is built around
+        the new best_rank). Bounded and low-stakes because best_match < STICKY, but it
+        must still not collapse onto one rank across a run of requests."""
+        matched = {0: 4096, 1: 2048}
+        backlog = {0: 0, 1: 30000}
+        seen = {dispatch(matched, backlog, 50000, weight=2.0, rr=r)[0] for r in range(4)}
+        self.assertTrue(seen.issubset({0, 1}) and seen, f"unexpected targets {seen}")
+
 
 class StickyBehaviourUnchanged(unittest.TestCase):
     def test_short_match_still_alternates_at_equal_backlog(self):
@@ -177,6 +198,22 @@ class StickyBehaviourUnchanged(unittest.TestCase):
         backlog = {0: 0, 1: 0}
         for w in (1.0, 2.0):
             self.assertEqual(dispatch(matched, backlog, 120000, weight=w, rr=1)[0], 0)
+
+
+class EnvWiring(unittest.TestCase):
+    """The one production line the decision tests cannot reach: the constructor's
+    read of the env field. If the field were missing or not float-able, every test
+    above would still pass (they set the attribute directly on the fake)."""
+
+    def test_field_exists_and_defaults_to_the_documented_value(self):
+        from sglang.srt.environ import envs
+        self.assertEqual(float(envs.SGLANG_DP_PREFIX_AFFINITY_REPREFILL_WEIGHT.get()), 2.0)
+
+    def test_clamp_refuses_a_weight_below_one(self):
+        """Below 1.0 the dispatcher would PREFER re-prefilling over waiting -- the
+        defect inverted -- so the constructor clamps. Mirrors that expression."""
+        for raw, want in ((0.0, 1.0), (0.5, 1.0), (1.0, 1.0), (3.5, 3.5)):
+            self.assertEqual(max(1.0, float(raw)), want)
 
 
 if __name__ == "__main__":
