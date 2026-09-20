@@ -166,6 +166,26 @@ class DPBudget:
         return target_rank
 
 
+def resolve_reprefill_weight(raw) -> float:
+    """Clamp the re-prefill weight at 1.0 and coerce it to float.
+
+    Below 1.0 the dispatcher would PREFER re-prefilling over waiting -- the defect
+    the weight exists to fix, inverted -- so a smaller value is clamped rather than
+    honoured. A non-numeric value falls back to 1.0, which is the exact legacy
+    chooser, because a mistyped env var must degrade to the old behaviour and not to
+    an arbitrary one.
+
+    Module-level so a test can reach THE LINE THE CONSTRUCTOR RUNS. It was inline in
+    __init__ until 2026-09-20, and the test that claimed to cover it asserted a COPY
+    of the expression (`max(1.0, float(raw))`) rather than this code -- a tautology
+    that would have passed had the constructor been deleted. Found by review.
+    """
+    try:
+        return max(1.0, float(raw))
+    except (TypeError, ValueError):
+        return 1.0
+
+
 class PrefixAffinityIndex:
     """Token-prefix fingerprint -> the DP ranks that have served it.
 
@@ -295,10 +315,8 @@ class DataParallelController:
             self.prefix_affinity_sticky_tokens = (
                 envs.SGLANG_DP_PREFIX_AFFINITY_STICKY_TOKENS.get()
             )
-            # Clamped at 1.0: a weight below 1 would make the dispatcher PREFER
-            # re-prefilling over waiting, which is the defect inverted.
-            self.prefix_affinity_reprefill_weight = max(
-                1.0, float(envs.SGLANG_DP_PREFIX_AFFINITY_REPREFILL_WEIGHT.get())
+            self.prefix_affinity_reprefill_weight = resolve_reprefill_weight(
+                envs.SGLANG_DP_PREFIX_AFFINITY_REPREFILL_WEIGHT.get()
             )
             self._prefix_affinity_stats = {"hit": 0, "miss": 0, "spread": 0, "spread_tokens": 0}
             # Instrument only -- 0 = off; see the env comment. Never gates a decision.
@@ -965,28 +983,42 @@ class DataParallelController:
                 -matched[i],
             ),
         )
+        # The UNWEIGHTED (pure-TTFT) pick, used only to anchor the anti-homing set
+        # below. Identical to `best_rank` whenever the weight is 1.0.
+        ttft_rank = min(active, key=lambda i: (cost[i], -matched[i]))
         # At an exact backlog tie a SHORT best match -- below STICKY_TOKENS, e.g.
         # only a system prompt shared by every conversation -- alternates among
         # the ranks whose cost is within that much, so quiet-period conversations
         # do not all home on one rank; a longer match (a conversation's own
         # context) sticks.
         #
-        # `near` deliberately keeps the UNWEIGHTED cost: it is about this request's
-        # own TTFT among equally-backlogged ranks.
+        # `near` deliberately keeps the UNWEIGHTED cost AND anchors on `ttft_rank`,
+        # not on the weighted `best_rank`: this branch is about one request's own
+        # TTFT among equally-backlogged ranks, and the weight has no business in it.
+        #
+        # 🔴 ANCHORING IT ON `best_rank` WAS A BUG AT dp_size >= 3, fixed 2026-09-20
+        # after an independent review measured it. `near` is built from the ranks
+        # sharing the ANCHOR's backlog, so once the weight moved the anchor to a rank
+        # at a DIFFERENT backlog level the set could collapse to a singleton and the
+        # round-robin silently stopped happening -- i.e. the weight disabled the very
+        # anti-homing rule this block exists for. Measured with the real scheduler at
+        # 3 ranks, matched {0:8192,1:0,2:0}, backlog {0:10000,1:0,2:0}, n=50000:
+        # W=1.0 alternated [1,2,1,2] and W=2.0 homed [0,0,0,0]. It was invisible at
+        # dp_size=2 (the served recipe), where a non-singleton `near` requires exact
+        # backlog equality and both rules then agree -- which is exactly why the
+        # comment that claimed the weight "cannot move the near set" read as true.
+        # Anchoring on `ttft_rank` makes this branch weight-independent at ANY dp_size.
         #
         # What alternating can cost, stated rather than waved away: this branch runs
         # only when `best_match < STICKY_TOKENS`, so the waste it can accept is
         # bounded by best_match -- under 16384 tokens at the default, NOT "about
         # zero". That is the deliberate price of not homing every quiet-period
-        # conversation onto one rank. And when backlogs are EQUAL -- which `near`
-        # requires -- the weighted and unweighted rules select the SAME rank (with
-        # backlog equal, both reduce to argmax matched), so the weight cannot move
-        # the near set in the case this branch actually fires on.
+        # conversation onto one rank.
         near = [
             i
             for i in active
-            if budget.prefill_backlog[i] == budget.prefill_backlog[best_rank]
-            and cost[i] - cost[best_rank] < self.prefix_affinity_sticky_tokens
+            if budget.prefill_backlog[i] == budget.prefill_backlog[ttft_rank]
+            and cost[i] - cost[ttft_rank] < self.prefix_affinity_sticky_tokens
         ]
         if best_match < self.prefix_affinity_sticky_tokens and len(near) > 1:
             target = near[self.round_robin_counter % len(near)]
