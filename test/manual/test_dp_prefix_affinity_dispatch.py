@@ -304,6 +304,25 @@ class EvictionInstrument(unittest.TestCase):
             )
             self.assertEqual(len(lines), 1, f"n={n}: {lines}")
 
+    def test_the_backlogs_are_the_ones_the_DECISION_saw(self):
+        """🔴 MUST-FIRE on a mistake made while adding these very fields: the
+        speculative increments mutate `prefill_backlog[target]` a few lines before the
+        log call, so reading the backlog AT the log site returns a value inflated by
+        this request's own `new_tokens`. That would silently corrupt D -- the single
+        field the whole weight analysis turns on -- while every other field stayed
+        right.
+
+        Here rank 1 is chosen with backlog 5000 and contributes new_tokens = n - 0 =
+        120000, so the post-increment value would read 125000. The decision saw 5000."""
+        target, _, lines = dispatch(
+            {0: 100352, 1: 0}, {0: 900000, 1: 5000}, 120000, weight=2.0,
+            observe=100000, capture_logs=True,
+        )
+        self.assertEqual(target, 1, "fixture must pick the un-cached rank to be a test")
+        self.assertIn("bl_target=5000", lines[0],
+                      f"logged the POST-increment backlog: {lines[0]}")
+        self.assertIn("bl_best=900000", lines[0], lines[0])
+
     def test_the_line_carries_every_operand_the_join_needs(self):
         """The join is against that rank's next `Prefill batch` line, which carries
         no rid -- so the line must name the RANK (which log stream) and `new` (what
