@@ -170,6 +170,224 @@ class _PLEBatchTraceable(NamedTuple):
 # and the shipped pinned-table gather.
 _QSA_SPLIT_OP_GATE = bool(envs.SGLANG_QWEN4_QSA_SPLIT_OP.get())
 _PLE_BATCH_CLS = _PLEBatchTraceable if _QSA_SPLIT_OP_GATE else _PLEBatch
+if _QSA_SPLIT_OP_GATE:
+    # R2d (fn:N286): every JIT kernel this model's traced extend body reaches
+    # is handed out by `load_jit` as a raw tvm_ffi Function, which Dynamo
+    # refuses; with the split-op gate on, the JIT layer routes the exports
+    # declared in `sglang.kernels.jit.traceable.SPECS` through custom ops.
+    # Done at import, before any lazily-loaded kernel is first reached.
+    from sglang.kernels.jit import traceable as _jit_traceable
+
+    _jit_traceable.enable()
+
+# R2d (fn:N286 obstacle 7): the PLE prefetch forks its UVA gather onto a side
+# stream and joins it back. Traced by Dynamo, the fork/join become
+# `torch.ops.streams.wait_stream(i, j)` on streams fixed at TRACE time, so the
+# captured graph makes the side stream wait on the compile pass's default
+# stream -- "dependency created on uncaptured work in another stream". Under
+# the gate both edges run inside opaque custom ops that read
+# `torch.cuda.current_stream()` when they execute (the capture stream during
+# capture), exactly the eager code below. Handles index this table because a
+# custom op cannot take a module argument.
+#
+# fn:N286 obstacle 8 (UNPROBED -- found at the boot cap): with those ops the
+# fork IS captured, and capture then fails with "capturing stream has unjoined
+# work", because the prefetch is armed before layer i's attention (a split-op
+# boundary) and consumed inside layer i+1 -- in a PIECEWISE graph the fork and
+# its join land in different pieces, and a piece must end joined. So on the
+# piecewise/breakable extend surface (`single_stream=1`, the same predicate
+# that selects the indexer split op) the gather runs on the current stream
+# and the join is a no-op: same kernel, same bytes, no cross-layer overlap
+# for the captured extend pass only. Decode graphs and eager keep the fork.
+_PLE_PREFETCH_LAYERS: list = []
+
+
+def _ple_prefetch_register(layer: Any) -> int:
+    _PLE_PREFETCH_LAYERS.append(layer)
+    return len(_PLE_PREFETCH_LAYERS) - 1
+
+
+if _QSA_SPLIT_OP_GATE:
+    from sglang.srt.utils.custom_op import register_custom_op
+
+    def _ple_prefetch_fork_fake(
+        handle: int, single_stream: int, lookup_ids: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        return None
+
+    def _ple_prefetch_join_fake(handle: int, single_stream: int, out: torch.Tensor) -> None:
+        return None
+
+    def _ple_prefetch_fork_impl(
+        handle: int, single_stream: int, lookup_ids: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        layer = _PLE_PREFETCH_LAYERS[handle]
+        embedding = layer.ple_embedding.ngram_embedding
+        out_view = out.view(*lookup_ids.shape, -1)
+        if single_stream:
+            embedding.gather(lookup_ids, out=out_view)
+            return
+        stream = layer._prefetch_stream
+        stream.wait_stream(torch.cuda.current_stream())
+        lookup_ids.record_stream(stream)
+        with torch.cuda.stream(stream):
+            embedding.gather(lookup_ids, out=out_view)
+
+    def _ple_prefetch_join_impl(handle: int, single_stream: int, out: torch.Tensor) -> None:
+        if single_stream:
+            return
+        layer = _PLE_PREFETCH_LAYERS[handle]
+        torch.cuda.current_stream().wait_stream(layer._prefetch_stream)
+
+    qwen4_ple_prefetch_fork = register_custom_op(
+        _ple_prefetch_fork_impl,
+        op_name="qwen4_ple_prefetch_fork",
+        mutates_args=["out"],
+        fake_impl=_ple_prefetch_fork_fake,
+    )
+    qwen4_ple_prefetch_join = register_custom_op(
+        _ple_prefetch_join_impl,
+        op_name="qwen4_ple_prefetch_join",
+        mutates_args=["out"],
+        fake_impl=_ple_prefetch_join_fake,
+    )
+
+# R3b (fn:N289): on the captured extend surface the WHOLE PLE path runs as
+# registered split ops -- eagerly, between the captured pieces -- instead of
+# inside the traced body. `_prepare_ple_batch` reads per-batch HOST metadata
+# (`global_num_token_non_padded_cpu`, an int; `extend_seq_lens_cpu`, a list)
+# that Dynamo can only specialise: the capture batch carries the bucket
+# (`prefill_cuda_graph_runner.py` capture batch), every real batch carries
+# its own count, so the first served request failed the guard, recompiled
+# (`Compiling a graph for dynamic shape`) onto a fresh backend that has no
+# capture stream, and every piece of the recompiled callable ran eager
+# (`cuda_piecewise_backend.py` "PCG capture stream is not set"). Beneath
+# that, the prep and the PLE layer consume live per-request tensors
+# (`extend_seq_lens`, `req_pool_indices`) and the runner keeps no static
+# request-axis buffers under tc_piecewise, so a captured piece would bake
+# dead addresses. Both go away when the prep, the per-layer PLE forward and
+# the post-layer commit run as split ops that read the LIVE forward batch
+# from the tc_piecewise forward context (the static batch, real host
+# metadata) exactly as the QSA indexer split op does. Contract (DSA/QSA
+# `with_output`): the call site allocates `out` inside the traced body so
+# the next piece reads it at a fixed graph-pool address; the op mutates it.
+_PLE_SPLIT_LAYERS: list = []
+_PLE_SPLIT_STATE: dict = {"ctx": None, "batch": None, "model": None}
+# Replay readback: forwards that ran the split-op PLE path OUTSIDE the
+# compile pass and OUTSIDE a capture session -- i.e. served forwards on the
+# captured surface. Logged at 1, 2, 4, 8, ... so the log carries the count.
+_PLE_SPLIT_REPLAY: dict = {"forwards": 0}
+
+
+def _ple_split_register(layer: Any) -> int:
+    _PLE_SPLIT_LAYERS.append(layer)
+    return len(_PLE_SPLIT_LAYERS) - 1
+
+
+def _ple_split_surface(forward_batch: ForwardBatch) -> bool:
+    """True iff the gate is on and this forward is a captured (tc_piecewise /
+    breakable) plain extend -- the indexer split-op predicate."""
+    if not _QSA_SPLIT_OP_GATE:
+        return False
+    from sglang.srt.layers.attention.qsa.prefill_cuda_graph import (
+        is_graph_qsa_split_op_surface,
+    )
+
+    return is_graph_qsa_split_op_surface(forward_batch)
+
+
+if _QSA_SPLIT_OP_GATE:
+    from sglang.srt.compilation.compilation_config import register_split_op
+
+    def _ple_split_context():
+        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+            get_tc_piecewise_forward_context,
+        )
+
+        ctx = get_tc_piecewise_forward_context()
+        if ctx is None or ctx.forward_batch is None:
+            raise RuntimeError(
+                "qwen4 PLE split op called outside a prefill graph forward context"
+            )
+        return ctx
+
+    def _ple_split_batch(ctx) -> Optional[_PLEBatch]:
+        """The PLE batch for THIS forward, prepared once per forward context
+        from the live (static) forward batch and cached until the commit op
+        clears it."""
+        if _PLE_SPLIT_STATE["ctx"] is not ctx:
+            model = _PLE_SPLIT_STATE["model"]
+            if model is None:
+                raise RuntimeError("qwen4 PLE split op: no model registered")
+            fb = ctx.forward_batch
+            _PLE_SPLIT_STATE["batch"] = _prepare_ple_batch(
+                fb.input_ids,
+                fb,
+                ngram_size=model.ple_ngram_size,
+                ngram_eos_token_id=model.ple_ngram_eos_token_id,
+            )
+            _PLE_SPLIT_STATE["ctx"] = ctx
+        return _PLE_SPLIT_STATE["batch"]
+
+    def _ple_layer_split_fake(handle: int, ple_query: torch.Tensor, out: torch.Tensor) -> None:
+        if out.shape != ple_query.shape or out.dtype != ple_query.dtype:
+            raise ValueError(
+                "qwen4_ple_layer_split: out must match ple_query, got "
+                f"{tuple(out.shape)}/{out.dtype} vs {tuple(ple_query.shape)}/{ple_query.dtype}"
+            )
+        return None
+
+    def _ple_layer_split_impl(handle: int, ple_query: torch.Tensor, out: torch.Tensor) -> None:
+        layer = _PLE_SPLIT_LAYERS[handle]
+        ctx = _ple_split_context()
+        fb = ctx.forward_batch
+        batch = _ple_split_batch(ctx)
+        if batch is None:
+            layer.forward_idle(fb)
+            out.zero_()
+            return
+        out.copy_(layer(ple_query, fb, batch))
+
+    def _ple_commit_split_fake(hidden_states: torch.Tensor) -> None:
+        return None
+
+    def _ple_commit_split_impl(hidden_states: torch.Tensor) -> None:
+        # Declared as mutating `hidden_states` so the trace keeps and orders
+        # it after the last layer; it writes nothing into it.
+        ctx = _ple_split_context()
+        if _PLE_SPLIT_STATE["ctx"] is ctx:
+            _commit_ple_batch(_PLE_SPLIT_STATE["batch"], ctx.forward_batch)
+        _PLE_SPLIT_STATE["ctx"] = None
+        _PLE_SPLIT_STATE["batch"] = None
+        from sglang.srt.compilation.compile_phase import (
+            get_pcg_capture_stream,
+            is_in_torch_compile_warmup,
+        )
+
+        if get_pcg_capture_stream() is None and not is_in_torch_compile_warmup():
+            n = _PLE_SPLIT_REPLAY["forwards"] = _PLE_SPLIT_REPLAY["forwards"] + 1
+            if n & (n - 1) == 0:
+                logger.info(
+                    "Qwen4 PLE split-op replay forward #%d (num_tokens=%s raw=%s)",
+                    n,
+                    ctx.num_tokens,
+                    ctx.raw_num_tokens,
+                )
+
+    # The split-op registry keys on the CUSTOM op name (`sglang.<op_name>`),
+    # so the name is passed explicitly rather than taken from the impl.
+    qwen4_ple_layer_split = register_custom_op(
+        register_split_op("qwen4_ple_layer_split")(_ple_layer_split_impl),
+        op_name="qwen4_ple_layer_split",
+        mutates_args=["out"],
+        fake_impl=_ple_layer_split_fake,
+    )
+    qwen4_ple_commit_split = register_custom_op(
+        register_split_op("qwen4_ple_commit_split")(_ple_commit_split_impl),
+        op_name="qwen4_ple_commit_split",
+        mutates_args=["hidden_states"],
+        fake_impl=_ple_commit_split_fake,
+    )
 
 
 def _prepare_ple_batch(
@@ -246,11 +464,21 @@ def _prepare_ple_batch(
             raise RuntimeError(f"PLE requires sequence lengths in {mode!r}")
         lengths = forward_batch.extend_seq_lens.long()
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-        row_width = (
-            max(extend_seq_lens_cpu, default=0)
-            if extend_seq_lens_cpu is not None
-            else processed_tokens
-        )
+        if _QSA_SPLIT_OP_GATE:
+            # R2d (fn:N286 obstacle 5): Dynamo has no handler for the
+            # `default=` keyword of builtin max ("invalid call to builtin op
+            # handler"); this spelling is the same value on a List[int].
+            row_width = (
+                (max(extend_seq_lens_cpu) if extend_seq_lens_cpu else 0)
+                if extend_seq_lens_cpu is not None
+                else processed_tokens
+            )
+        else:
+            row_width = (
+                max(extend_seq_lens_cpu, default=0)
+                if extend_seq_lens_cpu is not None
+                else processed_tokens
+            )
         query_start_loc = torch.cat(
             [lengths.new_zeros(1), torch.cumsum(lengths, dim=0)]
         )
@@ -1053,6 +1281,15 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
+        # R2d (fn:N286 obstacle 7): -1 unless the gate is on and a side
+        # stream exists; then the index of this layer in _PLE_PREFETCH_LAYERS.
+        self._ple_prefetch_handle = (
+            _ple_prefetch_register(self)
+            if _QSA_SPLIT_OP_GATE and self._prefetch_stream is not None
+            else -1
+        )
+        # R3b (fn:N289): the layer's index in _PLE_SPLIT_LAYERS, -1 gate OFF.
+        self._ple_split_handle = _ple_split_register(self) if _QSA_SPLIT_OP_GATE else -1
         self._prefetch_state = None
 
     def _apply_ple_norm(self, norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -1248,6 +1485,15 @@ class Qwen4ExpPLELayer(nn.Module):
                 self._prefetch_stream.synchronize()
         self._prefetch_state = None
 
+    @staticmethod
+    def _ple_prefetch_single_stream(forward_batch: ForwardBatch) -> int:
+        """1 on the piecewise/breakable extend surface (fn:N286 obstacle 8)."""
+        from sglang.srt.layers.attention.qsa.prefill_cuda_graph import (
+            is_graph_qsa_split_op_surface,
+        )
+
+        return 1 if is_graph_qsa_split_op_surface(forward_batch) else 0
+
     def start_prefetch(
         self,
         batch: Optional[_PLEBatch],
@@ -1280,10 +1526,19 @@ class Qwen4ExpPLELayer(nn.Module):
         offloaded_embedding = self.ple_embedding.ngram_embedding
 
         stream = self._prefetch_stream
-        stream.wait_stream(torch.cuda.current_stream())
-        lookup_ids.record_stream(stream)
-        with torch.cuda.stream(stream):
-            offloaded_embedding.gather(lookup_ids, out=output_view)
+        if self._ple_prefetch_handle >= 0:
+            # R2d (fn:N286 obstacle 7): the same fork, inside an opaque op.
+            qwen4_ple_prefetch_fork(
+                self._ple_prefetch_handle,
+                self._ple_prefetch_single_stream(forward_batch),
+                lookup_ids,
+                prefetched,
+            )
+        else:
+            stream.wait_stream(torch.cuda.current_stream())
+            lookup_ids.record_stream(stream)
+            with torch.cuda.stream(stream):
+                offloaded_embedding.gather(lookup_ids, out=output_view)
         self._prefetch_state = prefetched, semantic_tokens, physical_tokens
 
     def _consume_prefetched_embeddings(
@@ -1292,7 +1547,16 @@ class Qwen4ExpPLELayer(nn.Module):
         if self._prefetch_state is None:
             raise RuntimeError("PLE prefetch state is missing")
         embeddings, semantic_tokens, physical_tokens = self._prefetch_state
-        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+        if self._ple_prefetch_handle >= 0:
+            # R2d (fn:N286 obstacle 7): the same join, inside an opaque op
+            # that mutates `embeddings` so the trace keeps it before the reduce.
+            qwen4_ple_prefetch_join(
+                self._ple_prefetch_handle,
+                self._ple_prefetch_single_stream(forward_batch),
+                embeddings,
+            )
+        else:
+            torch.cuda.current_stream().wait_stream(self._prefetch_stream)
         embeddings = self.ple_embedding.ngram_embedding.reduce(embeddings)
         embeddings = embeddings * self.ple_embedding.ngram_embedding.weight_scale
         embeddings = self.ple_embedding._finish_embedding_lookup(
@@ -1469,7 +1733,18 @@ class Qwen4ExpLayerExtensionMixin:
             )
 
         if self.ple is not None:
-            if ple_batch is None:
+            if self.ple._ple_split_handle >= 0 and _ple_split_surface(forward_batch):
+                # R3b (fn:N289): the PLE layer as an eager split op on the
+                # captured extend surface; `out` is allocated HERE, inside the
+                # traced body, so the next captured piece reads it at a fixed
+                # graph-pool address (the QSA/DSA `with_output` contract).
+                ple_query = (
+                    hidden_states if residual is None else hidden_states + residual
+                )
+                ple_out = torch.empty_like(ple_query)
+                qwen4_ple_layer_split(self.ple._ple_split_handle, ple_query, ple_out)
+                hidden_states = hidden_states + ple_out
+            elif ple_batch is None:
                 if not _get_ple_forward_mode(forward_batch).is_idle():
                     raise RuntimeError(
                         "non-idle Qwen4 PLE forward is missing its batch"
@@ -1863,6 +2138,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             for module in self.modules():
                 if isinstance(module, GroupedGemmaRMSNorm):
                     module.use_traceable_kernel = True
+            # R3b (fn:N289): the PLE split ops prepare the batch with this
+            # model's n-gram parameters (the draft model, is_nextn, has no PLE
+            # layers and must not displace the target).
+            if self.has_ple and not is_nextn:
+                _PLE_SPLIT_STATE["model"] = self
 
     def _abort_ple_prefetch(self) -> None:
         """Unwind every PLE prefetch an aborted forward left armed.
@@ -1912,6 +2192,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             # there is no separate residual at a PP boundary (hc_hidden_size contract).
             residual = None
 
+        # R3b (fn:N289): on the captured extend surface the PLE batch is
+        # prepared, consumed and committed by split ops OUTSIDE the traced body
+        # (see _PLE_SPLIT_LAYERS); the body carries no PLE host metadata and no
+        # prefetch fork. Gate OFF, decode, speculative and eager extend keep
+        # the shipped path below unchanged.
+        ple_split = self.has_ple and _ple_split_surface(forward_batch)
         ple_batch = (
             _prepare_ple_batch(
                 input_ids,
@@ -1919,14 +2205,14 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 ngram_size=self.ple_ngram_size,
                 ngram_eos_token_id=self.ple_ngram_eos_token_id,
             )
-            if self.has_ple
+            if self.has_ple and not ple_split
             else None
         )
         aux_hidden_states = AuxHiddenStateList()
         try:
             for i in range(self.start_layer, self.end_layer):
                 layer = self.layers[i]
-                if i + 1 < self.end_layer:
+                if i + 1 < self.end_layer and not ple_split:
                     next_ple = self.layers[i + 1].ple
                     if next_ple is not None:
                         next_ple.start_prefetch(ple_batch, forward_batch)
@@ -1950,7 +2236,10 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             self._abort_ple_prefetch()
             raise
 
-        _commit_ple_batch(ple_batch, forward_batch)
+        if ple_split:
+            qwen4_ple_commit_split(hidden_states)
+        else:
+            _commit_ple_batch(ple_batch, forward_batch)
 
         if not self.pp_group.is_last_rank:
             proxy_tensors = {"hidden_states": hidden_states}

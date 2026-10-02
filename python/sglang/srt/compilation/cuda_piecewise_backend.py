@@ -26,6 +26,28 @@ from sglang.srt.utils.common import print_warning_once
 
 logger = logging.getLogger(__name__)
 
+# R3b (fn:N289, local): replay readback, gated by SGLANG_PCG_REPLAY_LOG (read
+# once at import; OFF leaves __call__ byte-for-byte the shipped path). Counts
+# captured-piece replays and eager fallbacks; logs at 1, 2, 4, 8, ... replays.
+try:
+    from sglang.srt.environ import envs as _envs
+
+    _REPLAY_LOG = bool(_envs.SGLANG_PCG_REPLAY_LOG.get())
+except Exception:  # pragma: no cover - environ unavailable at import
+    _REPLAY_LOG = False
+_REPLAY_COUNTS = {"replays": 0, "eager_fallbacks": 0}
+
+
+def _note_replay(runtime_shape: int) -> None:
+    n = _REPLAY_COUNTS["replays"] = _REPLAY_COUNTS["replays"] + 1
+    if n & (n - 1) == 0:
+        logger.info(
+            "PCG replay #%d (piece shape=%s, eager_fallbacks=%d)",
+            n,
+            runtime_shape,
+            _REPLAY_COUNTS["eager_fallbacks"],
+        )
+
 
 @dataclasses.dataclass
 class ConcreteSizeEntry:
@@ -164,6 +186,8 @@ class CUDAPiecewiseBackend:
             # their captured graphs.
             stream = get_pcg_capture_stream()
             if stream is None:
+                if _REPLAY_LOG:
+                    _REPLAY_COUNTS["eager_fallbacks"] += 1
                 print_warning_once(
                     "PCG capture stream is not set. This can be a Dynamo runtime "
                     "recompilation or an optional VLM branch pre-warmed outside "
@@ -226,4 +250,6 @@ class CUDAPiecewiseBackend:
             )
         with graph_pool_replay_scope():
             entry.cudagraph.replay()
+        if _REPLAY_LOG:
+            _note_replay(runtime_shape)
         return entry.output

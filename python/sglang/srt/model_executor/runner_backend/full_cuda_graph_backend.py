@@ -30,12 +30,14 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_utils import ds4_graph_exec_prefetch
 from sglang.srt.model_executor.runner_utils.pool import (
     GraphPoolPrecarve,
     get_or_create_global_graph_memory_pool,
     graph_pool_capture_scope,
     graph_pool_replay_scope,
 )
+from sglang.srt.model_executor.runner_utils import ds4_decode_graph_chunks
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -108,9 +110,18 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             self._pool = get_or_create_global_graph_memory_pool(self._device_module)
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
+        # ds4:T2 -- place the chunk cuts over the decoder stack. No-op when the
+        # chunk gate is 1; the hooks it installs are inert outside this
+        # backend's own capture.
+        ds4_decode_graph_chunks.install_hooks(
+            self._cuda_graph_runner.model_runner.model
+        )
         try:
             yield
         finally:
+            # ds4:T1 -- one summary line per capture session. Returns on a
+            # module-level boolean when the gate is off.
+            ds4_graph_exec_prefetch.log_summary()
             self._capture_stream = None
 
     def capture_one(
@@ -174,8 +185,17 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         else:
             graph_ctx = self._device_module.graph
 
+        # ds4:T2 (plan/ds4-concept-transfer.md) -- when the chunk gate is > 1 the
+        # shape is captured as K back-to-back CUDA graphs with NO eager work
+        # between them, replayed in order on one stream. `capture_target` returns
+        # its two arguments UNCHANGED when the gate is off, and the container it
+        # returns when on exposes the same `.replay()`, so nothing downstream of
+        # here changes shape.
+        graph, graph_ctx = ds4_decode_graph_chunks.capture_target(graph, graph_ctx)
+
         with (
             graph_pool_capture_scope(),
+            ds4_decode_graph_chunks.active(),
             graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
         ):
             self._precarve.mint()
@@ -191,8 +211,15 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         if profiler is not None:
             profiler.step()
 
+        ds4_decode_graph_chunks.note_captured(graph)
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+
+        # ds4:T1 (plan/ds4-concept-transfer.md) -- move this exec's device-side
+        # upload from its FIRST replay at serve time to here, at capture time.
+        # Gated OFF by default: with SGLANG_DS4_T1_GRAPH_EXEC_PREFETCH unset this
+        # returns on a module-level boolean and the prior path is bit-for-bit.
+        ds4_graph_exec_prefetch.upload(graph, self._capture_stream)
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs

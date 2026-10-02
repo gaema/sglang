@@ -338,6 +338,20 @@ class Envs:
     # `Qwen4ExpForConditionalGeneration` joins the multimodal tc_piecewise
     # allowlist. OFF (default) leaves every one of those code paths untouched.
     SGLANG_QWEN4_QSA_SPLIT_OP = EnvBool(False)
+    # R2d (local, UNMEASURED): `load_jit` returns a proxy that routes the JIT
+    # exports declared in `sglang.kernels.jit.traceable.SPECS` through
+    # registered torch custom ops (eager impl = the raw tvm_ffi Function, fake
+    # impl = None, out-parameter contract) so a tc_piecewise trace can see
+    # them; undeclared exports and every module with this OFF are the raw
+    # tvm_ffi module. A model opting in (Qwen4-Exp under
+    # SGLANG_QWEN4_QSA_SPLIT_OP) turns it on for its process.
+    SGLANG_JIT_TRACEABLE_OPS = EnvBool(False)
+    # R3b (local, fn:N289): replay READBACK for the tc_piecewise prefill
+    # graph -- count every captured-piece replay and every eager fallback in
+    # `cuda_piecewise_backend` and log the running counts at 1, 2, 4, 8, ...
+    # replays, so a serving arm whose log shows no replay is VOID rather than
+    # mistaken for a lever reading. OFF (default) touches nothing.
+    SGLANG_PCG_REPLAY_LOG = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
@@ -1504,7 +1518,7 @@ class Envs:
     # Minimising per-request TTFT therefore maximises system-wide waste.
     #
     # The dispatcher minimises `backlog[i] + WEIGHT * (best_match - matched[i])`.
-    # WEIGHT = 1.0 reproduces the pre-2026-09-20 behaviour EXACTLY and is the
+    # 🔴 WEIGHT = 1.0 reproduces the pre-2026-09-20 behaviour EXACTLY and is the
     # rollback. The 2.0 default is the measured lockstep factor -- wasted prefill
     # costs the system dp_size ranks' decode time and dp_size is 2 on the served
     # recipe -- NOT a tuned optimum; it has never been A/B'd against live traffic.
