@@ -8,6 +8,36 @@ from __future__ import annotations
 
 import logging
 import math
+
+# N63 -- mixed-batch decode-tail rows in the QSA write plan, env-gated
+# (SGLANG_QSA_MIXED_ROWS=1); unset = upstream path.
+import os as _n63_os
+_n63_mixed_rows = _n63_os.environ.get("SGLANG_QSA_MIXED_ROWS", "") == "1"
+# SGLANG_QSA_MIXED_DEBUG=1: log the offending rows (a host sync) before the
+# invariant assert -- diagnostics only, never set in a measured arm.
+_n63_debug = _n63_mixed_rows and _n63_os.environ.get("SGLANG_QSA_MIXED_DEBUG", "") == "1"
+_n63_log = logging.getLogger(__name__)
+
+
+def _n63_tail_rows(sequence_lengths, extend_seq_lens, ratio):
+    """Rows of a MIXED batch that are decode tails: a 1-token extend whose
+    prefix (seq_len - 1) is not group-aligned. A 1-token extend on an aligned
+    prefix is a legitimate extend row and both formulas agree on it."""
+    lengths = sequence_lengths.long()
+    ext = extend_seq_lens.long()[: lengths.numel()]
+    prefix = (lengths - ext).clamp_min(0)
+    return (ext == 1) & (prefix % ratio != 0)
+
+
+def _n63_tail_ring_slots(slots, token_to_batch_idx, req_pool_indices,
+                         sequence_lengths, extend_seq_lens, logical_positions, ratio):
+    """Pending-ring slots with the DECODE rule restored for tail tokens."""
+    import torch
+    n = logical_positions.numel()
+    rows = token_to_batch_idx.long()[:n]
+    tail = _n63_tail_rows(sequence_lengths, extend_seq_lens, ratio)[rows]
+    decode_slots = req_pool_indices.long()[rows] * ratio + logical_positions.long() % ratio
+    return torch.where(tail, decode_slots, slots)
 from copy import copy
 from functools import lru_cache
 from typing import Dict, Optional, Tuple
@@ -564,20 +594,48 @@ class QwenSparseAttnBackend(AttentionBackend):
         # Prefix sharing is page-granular and the page is a ratio
         # multiple, so a matched prefix always covers whole groups. A
         # misaligned prefix would leave a shared group half-written.
-        torch._assert_async((prefix_lens % ratio == 0).all())
+        if _n63_mixed_rows:
+            # N63: a MIXED batch carries decode-tail rows (extend_len 1,
+            # prefix = seq_len - 1, not group-aligned). They take the decode
+            # block range and source their group members from the pending
+            # ring (member row -1); true extend rows keep the invariant.
+            tail_rows = (extend_lens == 1) & (prefix_lens % ratio != 0)
+            if _n63_debug:
+                _bad = ~((prefix_lens % ratio == 0) | tail_rows)
+                if bool(_bad.any()):
+                    _n63_log.warning(
+                        "[N63] write-plan invariant: rows=%s prefix=%s extend=%s len=%s mode=%s",
+                        _bad.nonzero().flatten().tolist(),
+                        prefix_lens[_bad].tolist(), extend_lens[_bad].tolist(),
+                        lengths[_bad].tolist(), forward_batch.forward_mode,
+                    )
+            torch._assert_async(((prefix_lens % ratio == 0) | tail_rows).all())
+        else:
+            tail_rows = None
+            torch._assert_async((prefix_lens % ratio == 0).all())
         # Each row spans at most ceil(extend_len / ratio) blocks, so the
         # token count and row count bound the plan without a sync.
         capacity = int(forward_batch.input_ids.numel()) // ratio + int(lengths.numel())
         row_token_starts = torch.cumsum(extend_lens, 0) - extend_lens
-        return self._qsa_write_plan(
+        start_blocks = prefix_lens // ratio
+        if tail_rows is not None:
+            start_blocks = torch.where(
+                tail_rows, end_blocks - (lengths % ratio == 0).long(), start_blocks
+            )
+        write_locs, group_end_positions, rows, member_rows = self._qsa_write_plan(
             token_slot_table=token_slot_table,
-            start_blocks=prefix_lens // ratio,
+            start_blocks=start_blocks,
             end_blocks=end_blocks,
             capacity=capacity,
             compress_ratio=ratio,
             row_token_starts=row_token_starts,
             prefix_lens=prefix_lens,
         )
+        if tail_rows is not None and member_rows is not None:
+            member_rows = torch.where(
+                tail_rows[rows], torch.full_like(member_rows, -1), member_rows
+            )
+        return write_locs, group_end_positions, rows, member_rows
 
     def _metadata_from_forward_batch(self, forward_batch) -> QwenSparseAttnMetadata:
         self._require_chain_speculation(
@@ -726,6 +784,22 @@ class QwenSparseAttnBackend(AttentionBackend):
                 compress_ratio=self.compress_ratio,
                 is_extend=group_member_rows is not None,
             )
+            if (
+                _n63_mixed_rows
+                and group_member_rows is not None
+                and forward_batch.extend_seq_lens is not None
+            ):
+                # N63: tail tokens keep the decode ring rule so a group
+                # completing this step finds all its members in the ring.
+                pending_ring_slots = _n63_tail_ring_slots(
+                    pending_ring_slots,
+                    token_to_batch_idx,
+                    row_req_pool_indices,
+                    sequence_lengths,
+                    forward_batch.extend_seq_lens,
+                    ring_logical_positions,
+                    self.compress_ratio,
+                )
             if write_locs.numel():
                 if group_member_rows is not None:
                     rope_source = (

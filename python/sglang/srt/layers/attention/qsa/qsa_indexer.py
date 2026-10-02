@@ -6,6 +6,31 @@ from typing import Tuple
 
 import torch
 
+# N63 -- mixed-batch member sourcing, env-gated (SGLANG_QSA_MIXED_ROWS=1).
+import os as _n63_os
+_n63_mixed_rows = _n63_os.environ.get("SGLANG_QSA_MIXED_ROWS", "") == "1"
+
+
+def _n63_mixed_member_sources(token_k, token_rope, ring_keys, ring_rope,
+                              member_rows, token_locs, ring_locs, dtype):
+    """Concatenate the pending ring behind this forward's packed keys and
+    redirect the groups whose member row is the -1 sentinel (decode-tail rows
+    of a MIXED batch) to their ring slots, offset by the packed row count.
+    Groups of true extend rows keep their chunk-local member rows."""
+    n_tok = token_k.shape[0]
+    keys = torch.cat(
+        [
+            token_k.reshape(n_tok, -1).to(dtype),
+            ring_keys.reshape(ring_keys.shape[0], -1).to(dtype),
+        ],
+        0,
+    )
+    rope = torch.cat([token_rope.to(ring_rope.dtype), ring_rope], 0)
+    tail = (member_rows < 0)[:, None]
+    locs = torch.where(tail, ring_locs.long() + n_tok, token_locs.long())
+    return keys, rope, locs
+
+
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -351,6 +376,22 @@ class QSAIndexer(MultiPlatformOp):
             if source_rope is None:
                 source_rope = build_rope_position_matrix(
                     rope_positions, token_k.shape[0]
+                )
+            if _n63_mixed_rows:
+                # N63: sentinel groups (decode-tail rows) source their
+                # members from the pending ring; one launch, no host sync.
+                ring_locs = self._group_ring_slots(
+                    metadata, group_end_positions, metadata.compress_sequence_ids.long()
+                )
+                source_keys, source_rope, group_locs = _n63_mixed_member_sources(
+                    token_k,
+                    source_rope,
+                    pool.get_qsa_key_state_buffer(self.layer_id),
+                    pool.qsa_rope_position_buffer,
+                    member_rows,
+                    group_locs,
+                    ring_locs,
+                    pool.index_state_dtype,
                 )
         else:
             # Paged eager rows (speculative fallback) complete at most one

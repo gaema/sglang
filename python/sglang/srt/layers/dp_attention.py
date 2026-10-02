@@ -172,6 +172,15 @@ class DpPaddingMode(IntEnum):
             # fabricated-row conversion; other models keep mainline SUM_LEN.
             if get_flags().dp.max_len_with_idle and min(global_num_tokens) == 0:
                 return DpPaddingMode.MAX_LEN
+            # fn:PG -- ENV-GATED extend-path override, DEFAULT OFF.
+            # SUM_LEN gathers by SUMMING a zero-padded full-width buffer, so the
+            # message is sum_len x hidden x 2 B = 2x the per-rank slice at
+            # dp_size 2. MAX_LEN gathers the slice with all_gather_into_tensor.
+            # Unset leaves the upstream branch byte-for-byte.
+            import os as _pg_os
+
+            if _pg_os.environ.get("SGLANG_DP_EXTEND_MAX_LEN", "0") == "1":
+                return DpPaddingMode.MAX_LEN
             return DpPaddingMode.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
