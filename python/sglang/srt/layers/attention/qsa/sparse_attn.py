@@ -6,6 +6,22 @@ import torch
 import triton
 import triton.language as tl
 
+# N64 (fp8 KV upcast) is NOT carried here: upstream #38855 (55b45cb45a) casts the
+# pool-gathered K/V tile to Q's dtype unconditionally in _sparse_gqa_chunk_prefill,
+# and _sparse_gqa_prefill only ever receives the forward's own (unquantized) K/V.
+# SGLANG_QSA_FP8_KV is therefore no longer read by this module.
+
+# N57 -- ENV-GATED multi-row tiling for _sparse_gqa_chunk_prefill (R query rows
+# share every gathered K/V row), DEFAULT OFF: with SGLANG_QSA_MULTIROW unset this
+# module launches upstream's kernel with upstream's config table unchanged.
+import os as _n57_os
+_n57_multirow = _n57_os.environ.get("SGLANG_QSA_MULTIROW", "") == "1"
+if _n57_multirow:
+    from sglang.srt.layers.attention.qsa.sparse_attn_multirow import (
+        qsa_multirow_supported as _n57_supported,
+        sparse_gqa_fwd_interface_multirow as _n57_fwd,
+    )
+
 _H20_CONFIGS = [
     (32, (32, 8, 2)),
     (64, (64, 8, 2)),
@@ -272,6 +288,10 @@ def _sparse_gqa_chunk_prefill(
 
 def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
     k, v = k.contiguous(), v.contiguous()
+    if _n57_multirow and _n57_supported(q, indices):
+        # N57: same out tensor as upstream from the same inputs (token sets per
+        # row identical; fp32 summation order differs).
+        return _n57_fwd(q, k, v, indices, cu_q, cu_k, kv_lens, scale)
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
