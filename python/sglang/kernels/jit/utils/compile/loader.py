@@ -135,7 +135,7 @@ def load_jit(
     prebuilt = _find_prebuilt(spec=spec, scope=scope)
     if prebuilt is not None:
         try:
-            return _load(prebuilt)
+            module = _load(prebuilt)
         except Exception as e:
             # Also the benign case where a concurrent GC unlinked the leaf
             # between the lookup and the load.
@@ -144,6 +144,8 @@ def load_jit(
                 spec.module_name,
                 e,
             )
+        else:
+            return _finish(module, spec)
 
     # Before the lock: with the flag set no process ever publishes a build,
     # so waiting on the lock cannot turn this miss into a hit.
@@ -163,7 +165,7 @@ def load_jit(
         prebuilt = _find_prebuilt(spec=spec, scope=scope)
         if prebuilt is not None:
             try:
-                return _load(prebuilt)
+                module = _load(prebuilt)
             except Exception as e:
                 logger.warning(
                     "Cached JIT module %s failed to load; rebuilding. Got error: %s",
@@ -176,6 +178,8 @@ def load_jit(
                 # one -- leaving every later process to fail twice and rebuild
                 # for nothing. We hold the lock, so drop it now.
                 shutil.rmtree(prebuilt.parent, ignore_errors=True)
+            else:
+                return _finish(module, spec)
 
         # Build into a private staging directory, then publish it by renaming.
         # Building in place would let another process observe a leaf that exists
@@ -196,7 +200,7 @@ def load_jit(
                 staging=staging,
                 dependencies=ninja.scan_dependencies(staging),
             )
-            return module
+            return _finish(module, spec)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
@@ -242,6 +246,20 @@ def _filter_hgcc_cuda_flags(flags: List[str]) -> List[str]:
     if dropped:
         logger.warning("Dropping nvcc-only flags hgcc does not accept: %s", dropped)
     return kept
+def _finish(module: Module, spec: BuildSpec) -> Module:
+    """R2d (SGLANG_JIT_TRACEABLE_OPS, default OFF): with the gate ON, a module
+    whose family has exports declared in `sglang.kernels.jit.traceable.SPECS`
+    is returned behind a proxy that routes THOSE exports through registered
+    torch custom ops so a Dynamo trace can see them; every other export, and
+    every module with the gate OFF, is exactly the tvm_ffi module."""
+    from sglang.kernels.jit.traceable import wrap_module
+
+    return wrap_module(
+        module,
+        module_name=spec.module_name,
+        module_args=spec.module_args,
+        exports=[export for export, _kernel in spec.wrappers],
+    )
 
 
 @contextlib.contextmanager

@@ -15,6 +15,19 @@ import triton.language as tl
 
 _FUSED_MIX_MAX_ROWS = 16
 
+# N53 -- ENV-GATED row gate, DEFAULT UNCHANGED (unset = 16 = upstream). The DP
+# decode batch is 128 rows/rank; raising this sends those mixes to the
+# persistent kernel instead of the five-kernel cuBLAS/compile chain.
+import os as _n53_os
+_n53_rows = _n53_os.environ.get("SGLANG_HC_FUSED_MIX_MAX_ROWS", "")
+if _n53_rows:
+    _FUSED_MIX_MAX_ROWS = int(_n53_rows)
+    # Readback: one line per importing process, so a server log proves the gate
+    # reached the scheduler; the launcher prints its first call's row count too.
+    print(f"[N53] hc_mix_triton gate raised: _FUSED_MIX_MAX_ROWS={_FUSED_MIX_MAX_ROWS} pid={_n53_os.getpid()}", flush=True)
+_n53_first_call = [True]
+_n53_seen_shapes = set()
+
 
 @triton.jit
 def _grid_barrier(counter_ptr, num_ctas):
@@ -35,7 +48,12 @@ def _hc_mix_persistent_kernel(
     LOWRANK,
     HS,
     num_rows,
-    num_ctas,
+    # R2d (fn:N286 obstacle 6): named `num_ctas` until 2026-09-11. That is a
+    # Triton LAUNCH option name; positional eager launches never collide, but
+    # a Dynamo-captured launch (`triton_kernel_wrapper_mutation`) re-issues
+    # every argument by keyword and the binder then sees `num_ctas` twice.
+    # A rename of a kernel parameter changes no generated code.
+    grid_ctas,
     inv_hc,
     ROWS: tl.constexpr,
     HC: tl.constexpr,
@@ -50,16 +68,16 @@ def _hc_mix_persistent_kernel(
 
     zero_span = ROWS * LOWRANK
     offs_z = tl.arange(0, 256)
-    for z0 in range(pid * 256, zero_span, num_ctas * 256):
+    for z0 in range(pid * 256, zero_span, grid_ctas * 256):
         idx = z0 + offs_z
         tl.store(t_raw_ptr + idx, 0.0, mask=idx < zero_span)
-    _grid_barrier(counters_ptr + 0, num_ctas)
+    _grid_barrier(counters_ptr + 0, grid_ctas)
 
     offs_k = tl.arange(0, BLOCK_K)
     offs_n = tl.arange(0, BLOCK_N)
     n_blocks = tl.cdiv(LOWRANK, BLOCK_N)
     k_chunks = tl.cdiv(K, BLOCK_K)
-    for tile in range(pid, n_blocks * k_chunks, num_ctas):
+    for tile in range(pid, n_blocks * k_chunks, grid_ctas):
         nb = tile % n_blocks
         kc = tile // n_blocks
         n = nb * BLOCK_N + offs_n
@@ -83,13 +101,13 @@ def _hc_mix_persistent_kernel(
             sem="relaxed",
             scope="gpu",
         )
-    _grid_barrier(counters_ptr + 1, num_ctas)
+    _grid_barrier(counters_ptr + 1, grid_ctas)
 
     offs_j = tl.arange(0, BLOCK_J)
     offs_r = tl.arange(0, BLOCK_R)
     offs_g = tl.arange(0, HC)
     j_blocks = tl.cdiv(HS, BLOCK_J)
-    for jb in range(pid, j_blocks, num_ctas):
+    for jb in range(pid, j_blocks, grid_ctas):
         j = jb * BLOCK_J + offs_j
         mask_j = j < HS
         gj = offs_g[:, None] * HS + j[None, :]
@@ -131,7 +149,7 @@ def _hc_mix_persistent_kernel(
         )
 
     ticket = tl.atomic_add(counters_ptr + 2, 1, sem="acq_rel", scope="gpu")
-    if ticket == num_ctas - 1:
+    if ticket == grid_ctas - 1:
         tl.store(counters_ptr + 0, 0)
         tl.store(counters_ptr + 1, 0)
         tl.store(counters_ptr + 2, 0)
@@ -165,6 +183,14 @@ def fused_hc_mix_supported(
     # device-scope atomics, so summation order varies across replays.
     if _deterministic_inference():
         return False
+    if _n53_rows and tuple(hyper_input_normed.shape) not in _n53_seen_shapes:
+        _n53_seen_shapes.add(tuple(hyper_input_normed.shape))
+        # Readback of the first call per SHAPE this process sees, accepted or
+        # declined -- a rank whose 128-row shape never reaches "fused_hc_mix
+        # first call" is declining it on one of the predicates below.
+        print(f"[N53] fused_hc_mix_supported new shape: shape={tuple(hyper_input_normed.shape)} "
+              f"dtype={hyper_input_normed.dtype} contig={hyper_input_normed.is_contiguous()} "
+              f"dim={hyper_input_normed.dim()} gate={_FUSED_MIX_MAX_ROWS} pid={_n53_os.getpid()}", flush=True)
     return (
         hyper_input_normed.is_cuda
         and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
@@ -189,6 +215,13 @@ def fused_hc_mix(
     rows, k = hyper_input_normed.shape
     lowrank = w_down.shape[0]
     rows_pad = 16
+    # N53: ROWS is a tl.arange extent, so pad to the next power of two >= 16.
+    # With the gate at upstream's 16 this loop never runs (rows <= 16).
+    while rows_pad < rows:
+        rows_pad *= 2
+    if _n53_rows and _n53_first_call[0]:
+        _n53_first_call[0] = False
+        print(f"[N53] fused_hc_mix first call: rows={rows} rows_pad={rows_pad} pid={_n53_os.getpid()}", flush=True)
     device = hyper_input_normed.device
     num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
     t_raw = torch.empty((rows_pad, lowrank), dtype=torch.float32, device=device)
@@ -211,8 +244,12 @@ def fused_hc_mix(
         ROWS=rows_pad,
         HC=hc,
         BLOCK_N=32,
-        BLOCK_K=256,
-        BLOCK_J=32,
+        # N53: at ROWS > 16 the [ROWS, HC*BLOCK_J] accumulator must shrink or the
+        # CTA runs out of shared memory (BLOCK_J=32 at 128 rows: 114688 B needed
+        # against 101376); BLOCK_K=128 was the best of a 7-config sweep at 128
+        # rows (19.23 us vs 25.95 at 64 and 31.25 at 32). 16 rows keep upstream's.
+        BLOCK_K=256 if rows_pad <= 16 else 128,
+        BLOCK_J=32 if rows_pad <= 16 else 16,
         BLOCK_R=64,
         num_warps=8,
     )
