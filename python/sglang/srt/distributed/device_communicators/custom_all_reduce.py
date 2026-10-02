@@ -49,6 +49,15 @@ class CustomAllreduce:
         # crossover is at 128MB buffer size for MUSA
         _MAX_CAR_SIZE = 16 * 8196 * 1024
 
+    # fn:N95-PREFILL -- ENV-GATED ceiling override, DEFAULT UNCHANGED.
+    # should_custom_ar() admits a message only when inp_size <= max_size, so this
+    # constant decides whether a collective runs the CUSTOM all-reduce (which
+    # SGLANG_N95_FP8_ALLREDUCE patches) or falls through to NCCL. Unset leaves the
+    # upstream value byte-for-byte, so the shipped path is unchanged.
+    _car_mb_override = os.environ.get("SGLANG_MAX_CAR_SIZE_MB", "")
+    if _car_mb_override:
+        _MAX_CAR_SIZE = int(_car_mb_override) * 1024 * 1024
+
     # max_size: max supported allreduce size
     def __init__(
         self,

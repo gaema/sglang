@@ -10,6 +10,14 @@ from einops import rearrange
 from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from sglang.kernels.ops.attention.fla.chunk_fwd import chunk_gated_delta_rule_fwd_intra
 from sglang.kernels.ops.attention.fla.chunk_o import chunk_fwd_o
+
+# N54 -- ENV-GATED fused GDN chunk kernel (chunk_h with recompute_w_u folded in,
+# optionally chunk_o too), DEFAULT OFF: with SGLANG_GDN_FUSED_HO unset this
+# module runs upstream's intra -> chunk_h -> chunk_o chain unchanged.
+import os as _n54_os
+_n54_fused_ho = _n54_os.environ.get("SGLANG_GDN_FUSED_HO", "") == "1"
+if _n54_fused_ho:
+    from sglang.kernels.ops.attention.fla.chunk_delta_h_o import fused_gdn_fwd as _n54_fused_fwd
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
@@ -49,6 +57,11 @@ def chunk_gated_delta_rule_fwd(
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
     )
+    if _n54_fused_ho:
+        # N54: same 6-tuple contract (w is None: never materialised).
+        return _n54_fused_fwd(q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                              initial_state=initial_state, initial_state_indices=initial_state_indices,
+                              cu_seqlens=cu_seqlens, chunk_indices=chunk_indices)
 
     # fused kkt + solve_tril + recompute_w_u
     w, u, A = chunk_gated_delta_rule_fwd_intra(
