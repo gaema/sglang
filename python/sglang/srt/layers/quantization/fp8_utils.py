@@ -1207,6 +1207,9 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
             input, weight, block_size, weight_scale, input_scale, bias
         )
 
+    if _q38fn_sl_splitk_on(input, weight, weight_scale):  # _q38fn_sl
+        return _q38fn_sl_splitk_linear(input, weight, weight_scale, bias)
+
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
@@ -2521,3 +2524,55 @@ def validate_fp8_block_shape(
                     f"{output_partition_size} is not divisible by "
                     f"weight quantization block_n = {block_n}."
                 )
+
+
+_q38fn_sl_splitk_said = [False]
+
+
+def _q38fn_sl_splitk_on(input, weight, weight_scale):  # _q38fn_sl
+    import os as _os
+
+    if _os.environ.get("SGLANG_FP8_SMALLN_SPLITK", "1") != "1":
+        return False
+    m = input.numel() // input.shape[-1]
+    return (
+        m <= 32
+        and tuple(weight.shape) == (2560, 6144)
+        and weight.dtype == torch.float8_e4m3fn
+        and weight_scale.dtype == torch.float32
+    )
+
+
+def _q38fn_sl_splitk_linear(input, weight, weight_scale, bias):  # _q38fn_sl
+    import os as _os
+
+    import triton
+
+    from sglang.kernels.ops.gemm.fp8_kernel import (
+        _reduce_block_fp8_split_k,
+        _w8a8_block_fp8_matmul_hopper,
+    )
+
+    x2 = input.view(-1, input.shape[-1])
+    m, k = x2.shape
+    n = weight.shape[0]
+    q, s = per_token_group_quant_fp8(x2, 128, column_major_scales=False)
+    sk = 4
+    out = torch.empty((m, n), device=x2.device, dtype=x2.dtype)
+    parts = torch.empty((sk, m, n), device=x2.device, dtype=torch.float32)
+    grid = (triton.cdiv(m, 16) * triton.cdiv(n, 32), sk)
+    _w8a8_block_fp8_matmul_hopper[grid](
+        q, weight, parts, s, weight_scale, m, n, k, 128, 128,
+        q.stride(-2), q.stride(-1), weight.stride(1), weight.stride(0),
+        out.stride(-2), out.stride(-1), s.stride(-2), s.stride(-1),
+        weight_scale.stride(1), weight_scale.stride(0),
+        BLOCK_SIZE_M=16, BLOCK_SIZE_N=32, BLOCK_SIZE_K=128, GROUP_SIZE_M=1, SPLIT_K=sk,
+        num_warps=4, num_stages=3, needs_masking=False,
+    )
+    _reduce_block_fp8_split_k[(triton.cdiv(m * n, 256),)](parts, out, m * n, sk, 256)
+    if not _q38fn_sl_splitk_said[0]:
+        _q38fn_sl_splitk_said[0] = True
+        print(f"[q38fn-sl] fp8 split-K on: first call m={m} n={n} k={k} pid={_os.getpid()}", flush=True)
+    if bias is not None:
+        out += bias
+    return out.view(*input.shape[:-1], n)

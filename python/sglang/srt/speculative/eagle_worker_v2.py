@@ -5,6 +5,39 @@ from typing import List, Optional
 
 import torch
 
+
+class _Q38fnSlFp8HeadMethod:  # _q38fn_sl
+    """quant_method for the draft's FP8 head: per-row fp8 activations (rows
+    padded to 16 for _scaled_mm), per-output-row weight scales, bf16 logits."""
+
+    def apply(self, layer, x, bias=None):
+        m = x.shape[0]
+        mp = max(16, (m + 15) // 16 * 16)
+        xp = torch.nn.functional.pad(x, (0, 0, 0, mp - m)) if mp != m else x
+        xs = xp.float().abs().amax(dim=1, keepdim=True).clamp(min=1e-12) / 448.0
+        x8 = (xp.float() / xs).to(torch.float8_e4m3fn)
+        y = torch._scaled_mm(
+            x8, layer.weight.t(), scale_a=xs, scale_b=layer.w_scale_t, out_dtype=torch.bfloat16
+        )[:m]
+        return y if bias is None else y + bias
+
+
+class _Q38fnSlFp8Head(torch.nn.Module):  # _q38fn_sl
+    def __init__(self, w):
+        super().__init__()
+        n, k = w.shape
+        q = torch.empty((n, k), device=w.device, dtype=torch.float8_e4m3fn)
+        s = torch.empty((n, 1), device=w.device, dtype=torch.float32)
+        for r0 in range(0, n, 8192):  # chunked: no full-width fp32 temporary
+            c = w[r0 : r0 + 8192].float()
+            cs = c.abs().amax(dim=1, keepdim=True).clamp(min=1e-12) / 448.0
+            s[r0 : r0 + 8192] = cs
+            q[r0 : r0 + 8192] = (c / cs).to(torch.float8_e4m3fn)
+            del c, cs
+        self.weight = torch.nn.Parameter(q, requires_grad=False)
+        self.register_buffer("w_scale_t", s.t().contiguous(), persistent=False)
+        self.quant_method = _Q38fnSlFp8HeadMethod()
+
 from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
@@ -351,6 +384,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
+            if (
+                __import__("os").environ.get("SGLANG_DRAFT_FP8_HEAD", "1") == "1"
+                and self.hot_token_id is None
+            ):  # _q38fn_sl
+                _src = self.draft_runner.model.lm_head
+                self.draft_runner.model.lm_head = _Q38fnSlFp8Head(_src.weight.data)
+                print(
+                    f"[q38fn-sl] draft fp8 head on: shard={tuple(_src.weight.shape)} "
+                    f"target head kept {_src.weight.dtype} "
+                    f"pid={__import__('os').getpid()}",
+                    flush=True,
+                )
 
     def _resolve_shared_embed_and_head(self):
         target_runner = self.target_worker.model_runner
