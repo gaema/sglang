@@ -248,9 +248,20 @@ def fused_hc_mix(
         # CTA runs out of shared memory (BLOCK_J=32 at 128 rows: 114688 B needed
         # against 101376); BLOCK_K=128 was the best of a 7-config sweep at 128
         # rows (19.23 us vs 25.95 at 64 and 31.25 at 32). 16 rows keep upstream's.
-        BLOCK_K=256 if rows_pad <= 16 else 128,
-        BLOCK_J=32 if rows_pad <= 16 else 16,
+        BLOCK_K=(128 if _q38fn_sl_hc_v2(rows_pad) else 256) if rows_pad <= 16 else 128,
+        BLOCK_J=(16 if _q38fn_sl_hc_v2(rows_pad) else 32) if rows_pad <= 16 else 16,
         BLOCK_R=64,
-        num_warps=8,
+        num_warps=4 if _q38fn_sl_hc_v2(rows_pad) else 8,
     )
     return out
+
+
+_q38fn_sl_hc_said = [False]
+
+
+def _q38fn_sl_hc_v2(rows_pad):  # _q38fn_sl
+    on = _n53_os.environ.get("SGLANG_HC_MIX_TILE_V2", "1") == "1" and rows_pad <= 16
+    if on and not _q38fn_sl_hc_said[0]:
+        _q38fn_sl_hc_said[0] = True
+        print(f"[q38fn-sl] hc_mix tile v2 on: BLOCK_K=128 BLOCK_J=16 num_warps=4 pid={_n53_os.getpid()}", flush=True)
+    return on
