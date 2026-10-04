@@ -649,7 +649,7 @@ def _dp_gather_via_all_gather(
 # rank to max_len (all_gather) or all-reducing a sum_len zero-buffer (all_reduce),
 # gather exactly sum(per-rank tokens) via all_gatherv. Env-gated; only the simple
 # tp_size==attn_dp_size (attn_tp_size==1) case is supported for now (e.g. tp8, attn_dp8).
-_USE_DP_GATHERV = get_bool_env_var("SGLANG_DP_USE_GATHERV")
+_USE_DP_GATHERV = get_bool_env_var("SGLANG_DP_USE_GATHERV", "true")
 
 _DP_GATHER_FP8_GROUP = 128
 # Grow-only gathered fp8 payload / scales buffers, keyed by device.

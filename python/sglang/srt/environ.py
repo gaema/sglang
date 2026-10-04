@@ -916,7 +916,7 @@ class Envs:
     # the wire — same group quantization the MoE expert GEMMs apply to their
     # input anyway, but router/shared-expert reads see rounded values, so this
     # stays accuracy-gated and default OFF.
-    SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
+    SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(True)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
