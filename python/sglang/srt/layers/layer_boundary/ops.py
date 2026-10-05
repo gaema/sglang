@@ -303,11 +303,36 @@ def _dp_scatter_group() -> GroupCoordinator:
     return parallel.attn_tp_group
 
 
+# q38fn (local, fork): an FFN-output combine over attention DP with an FP8
+# payload, owned by a model that opts in at construction (Qwen4Exp registers
+# models/qwen4_exp.py `_q38fn_cfp8_ok` / `_q38fn_cfp8_combine`). The model
+# decides per call (SGLANG_DP_COMBINE_FP8, default on; prefill-sized combines
+# only); with no model registered, or when it declines, this is upstream's
+# bf16 reduce_scatterv unchanged.
+_DP_COMBINE_OVERRIDE: Optional[
+    Tuple[
+        Callable[[torch.Tensor, List[int]], bool],
+        Callable[[torch.Tensor, torch.Tensor, List[int]], None],
+    ]
+] = None
+
+
+def set_dp_combine_override(ok, combine) -> None:
+    global _DP_COMBINE_OVERRIDE
+    _DP_COMBINE_OVERRIDE = (ok, combine)
+
+
 def dp_reduce_scatterv(
     local_hidden_states: torch.Tensor,
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch,
 ) -> None:
+    override = _DP_COMBINE_OVERRIDE
+    if override is not None:
+        sizes = get_dp_global_num_tokens()
+        if override[0](hidden_states, sizes):
+            override[1](hidden_states, local_hidden_states, sizes)
+            return
     get_parallel().tp_group.reduce_scatterv(
         hidden_states,
         output=local_hidden_states,
