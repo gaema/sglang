@@ -1816,7 +1816,13 @@ class Qwen4ExpLayerExtensionMixin:
                 get_local_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
-            if use_reduce_scatterv:
+            if use_reduce_scatterv and _q38fn_cfp8_ok(  # _q38fn_cfp8
+                global_hidden_states, get_dp_global_num_tokens()
+            ):
+                _q38fn_cfp8_combine(
+                    global_hidden_states, hidden_states, get_dp_global_num_tokens()
+                )
+            elif use_reduce_scatterv:
                 get_parallel().tp_group.reduce_scatterv(
                     global_hidden_states,
                     output=hidden_states,
@@ -2778,3 +2784,83 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
 
 EntryClass = [Qwen4ExpForConditionalGeneration]
+
+
+_q38fn_cfp8_said = [False]
+
+
+def _q38fn_cfp8_ok(inp, sizes):  # _q38fn_cfp8
+    import os as _os
+
+    if _os.environ.get("SGLANG_DP_COMBINE_FP8", "1") != "1":
+        return False
+    g = get_parallel().tp_group
+    return (
+        sizes is not None
+        and len(sizes) == g.world_size
+        and sum(sizes) == inp.shape[0]
+        and inp.shape[0] >= int(_os.environ.get("SGLANG_DP_COMBINE_FP8_MIN_ROWS", "1024"))
+        and inp.dtype == torch.bfloat16
+        and inp.dim() == 2
+        and inp.shape[1] % 128 == 0
+        and g.pynccl_comm is not None
+    )
+
+
+def _q38fn_cfp8_combine(inp, out, sizes):  # _q38fn_cfp8
+    """reduce_scatterv with an FP8 payload: send each peer its rows of my
+    partial (quantized), receive my rows of each peer's partial, add locally."""
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+    from sglang.srt.layers.dp_attention import _dequant_per_token_group_fp8_kernel
+
+    G = 128
+    g = get_parallel().tp_group
+    comm = g.pynccl_comm
+    me, world = g.rank_in_group, g.world_size
+    hidden = inp.shape[1]
+    offs = [0]
+    for s in sizes:
+        offs.append(offs[-1] + int(s))
+    n_me = int(sizes[me])
+    sends, recvs = [], []
+    for p in range(world):
+        if p == me:
+            continue
+        n_p = int(sizes[p])
+        if n_p > 0:
+            q, s = sglang_per_token_group_quant_fp8(inp[offs[p] : offs[p] + n_p].contiguous(), G)
+            sends.append((p, q.view(torch.uint8).contiguous(), s.contiguous()))
+        if n_me > 0:
+            recvs.append(
+                (
+                    p,
+                    torch.empty((n_me, hidden), dtype=torch.uint8, device=inp.device),
+                    torch.empty((n_me, hidden // G), dtype=torch.float32, device=inp.device),
+                )
+            )
+    with comm.change_state(enable=True):
+        comm.group_start()
+        for p, q, s in sends:
+            comm.send(q, p)
+            comm.send(s, p)
+        for p, rq, rs in recvs:
+            comm.recv(rq, p)
+            comm.recv(rs, p)
+        comm.group_end()
+    if n_me > 0:
+        o = out[:n_me]
+        o.copy_(inp[offs[me] : offs[me] + n_me])
+        tmp = torch.empty((n_me, hidden), dtype=inp.dtype, device=inp.device)
+        for p, rq, rs in recvs:
+            _dequant_per_token_group_fp8_kernel[(n_me,)](
+                rq.view(torch.float8_e4m3fn), rs, tmp,
+                HIDDEN=hidden, NGROUPS=hidden // G, GROUP=G, BLOCK=2048,
+            )
+            o.add_(tmp)
+    if not _q38fn_cfp8_said[0]:
+        import os as _os
+
+        _q38fn_cfp8_said[0] = True
+        print(f"[q38fn-cfp8] combine fp8 on: rows={inp.shape[0]} sizes={list(sizes)} me={me} pid={_os.getpid()}", flush=True)
