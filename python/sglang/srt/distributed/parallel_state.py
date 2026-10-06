@@ -714,6 +714,9 @@ class GroupCoordinator:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
 
+        if _q38fn_tparfp8_ok(self, input_):  # _q38fn_tparfp8
+            return _q38fn_tparfp8(self, input_)
+
         if self.hpu_communicator is not None and not self.hpu_communicator.disabled:
             return self.hpu_communicator.all_reduce(input_)
 
@@ -3541,3 +3544,72 @@ __all__ = [
     for _public in list(globals())
     if not _public.startswith("_") and _public not in _CONTEXT_NAME_OF
 ]
+
+
+_q38fn_tparfp8_said = [False]
+
+
+def _q38fn_tparfp8_ok(group, inp):  # _q38fn_tparfp8
+    import os as _os
+
+    if _os.environ.get("SGLANG_TP_AR_FP8", "1") == "0":
+        return False
+    return (
+        group.world_size == 2
+        and group.unique_name.split(":")[0] == "tp"
+        and group.pynccl_comm is not None
+        and inp.dtype == torch.bfloat16
+        and inp.dim() >= 2
+        and inp.is_contiguous()
+        and inp.shape[-1] % 128 == 0
+        and inp.numel() // inp.shape[-1]
+        >= int(_os.environ.get("SGLANG_TP_AR_FP8_MIN_ROWS", "1024"))
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
+def _q38fn_tparfp8(group, inp):  # _q38fn_tparfp8
+    """Two-rank all-reduce with an FP8 payload; both ranks compute
+    dq(q(partial_0)) + dq(q(partial_1)) in rank order, written into inp."""
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+    from sglang.srt.layers.dp_attention import _dequant_per_token_group_fp8_kernel
+
+    G = 128
+    comm = group.pynccl_comm
+    me = group.rank_in_group
+    peer = 1 - me
+    hidden = inp.shape[-1]
+    x = inp.view(-1, hidden)
+    rows = x.shape[0]
+    q, s = sglang_per_token_group_quant_fp8(x, G)
+    q = q.view(torch.uint8).contiguous()
+    s = s.contiguous()
+    rq = torch.empty_like(q)
+    rs = torch.empty_like(s)
+    with comm.change_state(enable=True):
+        comm.group_start()
+        comm.send(q, peer)
+        comm.send(s, peer)
+        comm.recv(rq, peer)
+        comm.recv(rs, peer)
+        comm.group_end()
+    first, second = ((q, s), (rq, rs)) if me == 0 else ((rq, rs), (q, s))
+    tmp = torch.empty((rows, hidden), dtype=inp.dtype, device=inp.device)
+    _dequant_per_token_group_fp8_kernel[(rows,)](
+        first[0].view(torch.float8_e4m3fn), first[1], x,
+        HIDDEN=hidden, NGROUPS=hidden // G, GROUP=G, BLOCK=2048,
+    )
+    _dequant_per_token_group_fp8_kernel[(rows,)](
+        second[0].view(torch.float8_e4m3fn), second[1], tmp,
+        HIDDEN=hidden, NGROUPS=hidden // G, GROUP=G, BLOCK=2048,
+    )
+    x.add_(tmp)
+    if not _q38fn_tparfp8_said[0]:
+        import os as _os
+
+        _q38fn_tparfp8_said[0] = True
+        print(f"[q38fn-tparfp8] tp all-reduce fp8 on: group={group.unique_name} rows={rows} "
+              f"hidden={hidden} me={me} pid={_os.getpid()}", flush=True)
+    return inp
