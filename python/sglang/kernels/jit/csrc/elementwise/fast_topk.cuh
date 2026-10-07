@@ -47,6 +47,8 @@ SGL_DEVICE void naive_topk(int32_t* __restrict__ indice, int32_t length) {
 }
 
 // Radix-select top-k. Assumes length > kTopK (checked by the caller).
+// q38fn_rescan: exact histograms plus a global-memory rescan for any round whose
+// threshold-bin candidates overflow the shared list (see fast_topk_rescan_patch.py).
 template <int kTopK>
 SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
   int topk = kTopK;
@@ -58,12 +60,25 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
   alignas(128) __shared__ int s_counter;
   alignas(128) __shared__ int s_threshold_bin_id;
   alignas(128) __shared__ int s_num_input[2];
+  // q38fn_rescan: s_thr[0] = stage-1 (fp16) threshold bin, s_thr[r + 1] = round r's fp32-byte threshold
+  __shared__ int s_thr[5];
 
   auto& s_histogram = s_histogram_buf[0];
   // allocate for two rounds
   extern __shared__ int s_input_idx[][SMEM_INPUT_SIZE];
 
   const int tx = threadIdx.x;
+
+  // q38fn_rescan: does element idx still match every threshold chosen before round `upto`?
+  const auto prefix_ok = [&](int idx, int upto) -> bool {
+    const auto x = input[idx + row_start];
+    if (static_cast<int>(convert_to_uint8(x)) != s_thr[0]) return false;
+    const auto key = convert_to_uint32(x);
+    for (int j = 0; j < upto; ++j) {
+      if (static_cast<int>((key >> (24 - j * 8)) & 0xFF) != s_thr[j + 1]) return false;
+    }
+    return true;
+  };
 
   // stage 1: 8bit coarse histogram
   if (tx < RADIX + 1) s_histogram[tx] = 0;
@@ -95,6 +110,7 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
   run_cumsum();
   if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
     s_threshold_bin_id = tx;
+    s_thr[0] = tx;
     s_num_input[0] = 0;
     s_counter = 0;
   }
@@ -128,12 +144,11 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
         index[pos] = idx;
       } else if (bin == threshold_bin) {
         const auto pos = ::atomicAdd(&s_num_input[0], 1);
-        // fuse the histogram computation here
+        // q38fn_rescan: the histogram counts every candidate; only the list is capped
+        const auto sub_bin = (convert_to_uint32(raw_input) >> 24) & 0xFF;
+        ::atomicAdd(&s_histogram[sub_bin], 1);
         if (pos < int(SMEM_INPUT_SIZE)) {
           s_input_idx[0][pos] = idx;
-          const auto bin = convert_to_uint32(raw_input);
-          const auto sub_bin = (bin >> 24) & 0xFF;
-          ::atomicAdd(&s_histogram[sub_bin], 1);
         }
       }
     }
@@ -146,13 +161,15 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
     __shared__ int s_last_remain;
     const auto r_idx = round % 2;
 
-    // clip here to prevent overflow
+    // q38fn_rescan: an overflowed list is incomplete -- walk the whole row instead
     const auto _raw_num_input = s_num_input[r_idx];
-    const auto num_input = (_raw_num_input < int(SMEM_INPUT_SIZE)) ? _raw_num_input : int(SMEM_INPUT_SIZE);
+    const bool rescan = _raw_num_input > int(SMEM_INPUT_SIZE);
+    const auto num_items = rescan ? length : _raw_num_input;
 
     run_cumsum();
     if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
       s_threshold_bin_id = tx;
+      s_thr[round + 1] = tx;
       s_num_input[r_idx ^ 1] = 0;
       s_last_remain = topk - s_histogram[tx + 1];
     }
@@ -160,11 +177,12 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
 
     const auto threshold_bin = s_threshold_bin_id;
     topk -= s_histogram[threshold_bin + 1];
+    const auto offset = 24 - round * 8;
 
     if (topk == 0) {
-      for (int i = tx; i < num_input; i += BLOCK_SIZE) {
-        const auto idx = s_input_idx[r_idx][i];
-        const auto offset = 24 - round * 8;
+      for (int i = tx; i < num_items; i += BLOCK_SIZE) {
+        const auto idx = rescan ? i : s_input_idx[r_idx][i];
+        if (rescan && !prefix_ok(idx, round)) continue;
         const auto bin = (convert_to_uint32(input[idx + row_start]) >> offset) & 0xFF;
         if (bin > threshold_bin) {
           const auto pos = ::atomicAdd(&s_counter, 1);
@@ -179,10 +197,10 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
         s_histogram[tx] = 0;
       }
       __syncthreads();
-      for (int i = tx; i < num_input; i += BLOCK_SIZE) {
-        const auto idx = s_input_idx[r_idx][i];
+      for (int i = tx; i < num_items; i += BLOCK_SIZE) {
+        const auto idx = rescan ? i : s_input_idx[r_idx][i];
+        if (rescan && !prefix_ok(idx, round)) continue;
         const auto raw_input = input[idx + row_start];
-        const auto offset = 24 - round * 8;
         const auto bin = (convert_to_uint32(raw_input) >> offset) & 0xFF;
         if (bin > threshold_bin) {
           const auto pos = ::atomicAdd(&s_counter, 1);
@@ -195,12 +213,11 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
             }
           } else {
             const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
+            // q38fn_rescan: count every candidate; store only what fits
+            const auto sub_bin = (convert_to_uint32(raw_input) >> (offset - 8)) & 0xFF;
+            ::atomicAdd(&s_histogram[sub_bin], 1);
             if (pos < int(SMEM_INPUT_SIZE)) {
-              // fuse the histogram computation here
               s_input_idx[r_idx ^ 1][pos] = idx;
-              const auto bin = convert_to_uint32(raw_input);
-              const auto sub_bin = (bin >> (offset - 8)) & 0xFF;
-              ::atomicAdd(&s_histogram[sub_bin], 1);
             }
           }
         }
