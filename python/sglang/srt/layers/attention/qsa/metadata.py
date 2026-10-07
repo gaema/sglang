@@ -99,6 +99,8 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     # ``QSAIndexer`` grows the cos/sin cache from it instead of syncing on
     # ``positions.max().item()``; None (the default) keeps the sync.
     max_position: Optional[int] = None
+    # _q38fn_nosync: host copy of sequence_lengths (non-speculative eager path)
+    sequence_lengths_cpu: Optional[tuple] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)
@@ -148,6 +150,8 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         parts = []
         sequence_lengths = self.sequence_lengths.to(torch.int32)
         sequence_lengths_list = self.prefill_sequence_lengths_cpu
+        if sequence_lengths_list is None and self.sequence_lengths_cpu is not None:
+            sequence_lengths_list = list(self.sequence_lengths_cpu)  # _q38fn_nosync
         if sequence_lengths_list is None:
             sequence_lengths_list = sequence_lengths.tolist()
         for sequence_id in range(len(sequence_lengths_list)):

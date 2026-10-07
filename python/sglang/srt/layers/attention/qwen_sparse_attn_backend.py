@@ -44,6 +44,8 @@ from typing import Dict, Optional, Tuple
 
 import msgspec
 import torch
+
+_Q38FN_NOSYNC = __import__("os").environ.get("SGLANG_Q38FN_QSA_NOSYNC", "0") == "1"  # _q38fn_nosync
 import torch.nn.functional as F
 
 from sglang.srt.environ import envs
@@ -686,6 +688,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         # coordinate independently of the paged position, so they keep the
         # indexer's own sync (None).
         max_position: Optional[int] = None
+        _q38fn_seq_cpu = None  # _q38fn_nosync
         if speculative_paged:
             logical_positions = forward_batch.positions
             if logical_positions.ndim == 2:
@@ -712,6 +715,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         else:
             sequence_lengths = forward_batch.seq_lens.to(torch.int32)
             batch_size = sequence_lengths.numel()
+            if _Q38FN_NOSYNC and forward_batch.seq_lens_cpu is not None:  # _q38fn_nosync
+                _q38fn_seq_cpu = tuple(int(x) for x in forward_batch.seq_lens_cpu[:batch_size])
             if forward_batch.seq_lens_cpu is not None:
                 max_length = int(forward_batch.seq_lens_cpu[:batch_size].max())
             else:
@@ -865,6 +870,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             ),
             prefill_sequence_lengths_cpu=prefill_sequence_lengths_cpu,
             max_position=max_position,
+            sequence_lengths_cpu=_q38fn_seq_cpu,  # _q38fn_nosync
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
@@ -1625,8 +1631,12 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         # Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
-        sequence_lens_tensor = torch.tensor(
-            sequence_lens, dtype=torch.int32, device=q.device
+        # The K/V gather is upstream's pack_qsa_prefill_kv (device req indices,
+        # no host sync); only the kv-length tensor below is ours.
+        sequence_lens_tensor = (  # _q38fn_nosync: device lengths, no pageable H2D copy
+            forward_batch.seq_lens[: len(sequence_lens)].to(device=q.device, dtype=torch.int32)
+            if _Q38FN_NOSYNC
+            else torch.tensor(sequence_lens, dtype=torch.int32, device=q.device)
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         packed_k, packed_v = pack_qsa_prefill_kv(
@@ -1648,6 +1658,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             cu_seqlens_k,
             sequence_lens_tensor,
             layer.scaling,
+            max_q=(max(extend_lens, default=1) if _Q38FN_NOSYNC else None),  # _q38fn_nosync
         )
         return self._pad_extend_output(output, num_output_rows)
 
