@@ -3564,7 +3564,10 @@ def _q38fn_tparfp8_ok(group, inp):  # _q38fn_tparfp8
         and inp.shape[-1] % 128 == 0
         and inp.numel() // inp.shape[-1]
         >= int(_os.environ.get("SGLANG_TP_AR_FP8_MIN_ROWS", "1024"))
-        and not torch.cuda.is_current_stream_capturing()
+        and (
+            not torch.cuda.is_current_stream_capturing()
+            or _os.environ.get("SGLANG_TP_AR_FP8_IN_GRAPH", "0") == "1"  # _q38fn_arg
+        )
     )
 
 
