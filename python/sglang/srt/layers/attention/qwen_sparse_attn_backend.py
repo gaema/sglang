@@ -1331,7 +1331,34 @@ class QwenSparseAttnBackend(AttentionBackend):
         is_last = torch.ones_like(row_req_pool_indices, dtype=torch.bool)
         if row_req_pool_indices.numel() > 1:
             is_last[:-1] = row_req_pool_indices[:-1] != row_req_pool_indices[1:]
-        anchor_rows = is_last.nonzero().flatten()
+        _q38fn_anchor = None  # _q38fn_fwdnosync
+        from sglang.kernels.ops.attention.fla import index as _q38fn_fla_index
+
+        _q38fn_ext = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if (
+            _q38fn_fla_index._Q38FN_ON
+            and _q38fn_ext is not None
+            and len(_q38fn_ext) == metadata.req_pool_indices.numel()
+            and all(int(n) > 0 for n in _q38fn_ext)
+            and sum(int(n) for n in _q38fn_ext) == topk_indices.shape[0]
+        ):
+            _q38fn_rows, _q38fn_acc = [], 0
+            for _q38fn_n in _q38fn_ext:
+                _q38fn_acc += int(_q38fn_n)
+                _q38fn_rows.append(_q38fn_acc - 1)
+            _q38fn_anchor = torch.tensor(
+                _q38fn_rows, dtype=torch.int64, pin_memory=True
+            ).to(is_last.device, non_blocking=True)
+        if _q38fn_anchor is not None and not _q38fn_fla_index._Q38FN_CHECK:
+            anchor_rows = _q38fn_anchor
+        else:
+            anchor_rows = is_last.nonzero().flatten()
+            if _q38fn_anchor is not None:
+                _q38fn_fla_index.q38fn_checked("mtp_anchor_rows")
+                if not torch.equal(anchor_rows, _q38fn_anchor):
+                    _q38fn_fla_index.q38fn_report(
+                        "mtp_anchor_rows", _q38fn_anchor.tolist(), anchor_rows.tolist()
+                    )
         req_rows = row_req_pool_indices[anchor_rows]
         captured_lens = metadata.get_seqlens_expanded()[anchor_rows]
         state.capture(topk_indices[anchor_rows], req_rows, captured_lens, layer_id)

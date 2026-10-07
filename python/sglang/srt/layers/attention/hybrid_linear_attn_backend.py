@@ -287,6 +287,17 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )
+                if (  # _q38fn_fwdnosync
+                    forward_batch.extend_seq_lens_cpu is not None
+                    and len(forward_batch.extend_seq_lens_cpu) == bs
+                    and forward_batch.tbo_parent_token_range is None
+                ):
+                    from sglang.kernels.ops.attention.fla import index as _q38fn_fla_index
+
+                    _q38fn_cu = [0]
+                    for _q38fn_n in forward_batch.extend_seq_lens_cpu:
+                        _q38fn_cu.append(_q38fn_cu[-1] + int(_q38fn_n))
+                    _q38fn_fla_index.q38fn_set_host_cu_seqlens(query_start_loc, _q38fn_cu)
                 if (
                     forward_batch.extend_seq_lens_cpu is not None
                     and len(forward_batch.extend_seq_lens_cpu) == bs
