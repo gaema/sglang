@@ -79,6 +79,7 @@ from typing import (
 import msgspec
 import numpy as np
 import torch
+from sglang.srt.mem_cache import q38fn_pp_mirror as _q38fn_pp  # _q38fn_schednosync
 
 from sglang.srt.beam_search.batch_tail import (
     BeamTail,
@@ -948,6 +949,8 @@ class ReqKvInfo:
     # Mamba state: an independent resource; whether it is held is `holds_mamba`.
     mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
     mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
+    # _q38fn_schednosync: (buffer object, [slot != -1, ...]) host mirror
+    mamba_pp_valid_cpu: Optional[tuple] = None
     mamba_next_track_idx: Optional[int] = None  # 0 or 1
     mamba_last_track_idx: Optional[int] = None  # 0 or 1
     # Seq len of the last cached mamba state
@@ -3000,21 +3003,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if get_exec().mamba.enable_mamba_extra_buffer:
             self.mamba_prefill_track_mask_cpu = mamba_track_mask_cpu
             self.mamba_track_seqlens_cpu = mamba_track_seqlens_cpu
-            self.mamba_track_indices = torch.tensor(
-                mamba_track_indices_cpu,
-                dtype=torch.int64,
-                device=self.device,
-            )
-            self.mamba_track_mask = torch.tensor(
-                mamba_track_mask_cpu,
-                dtype=torch.bool,
-                device=self.device,
-            )
-            self.mamba_track_seqlens = torch.tensor(
-                mamba_track_seqlens_cpu,
-                dtype=torch.int64,
-                device=self.device,
-            )
+            if _q38fn_pp.ENABLED and mamba_track_indices_cpu and isinstance(
+                mamba_track_indices_cpu[0], torch.Tensor
+            ):  # _q38fn_schednosync
+                self.mamba_track_indices = torch.cat(mamba_track_indices_cpu).to(
+                    torch.int64
+                )
+                self.mamba_track_mask = torch.tensor(
+                    mamba_track_mask_cpu, dtype=torch.bool, pin_memory=True
+                ).to(self.device, non_blocking=True)
+                self.mamba_track_seqlens = torch.tensor(
+                    mamba_track_seqlens_cpu, dtype=torch.int64, pin_memory=True
+                ).to(self.device, non_blocking=True)
+            else:
+                self.mamba_track_indices = torch.tensor(
+                    mamba_track_indices_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                self.mamba_track_mask = torch.tensor(
+                    mamba_track_mask_cpu,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                self.mamba_track_seqlens = torch.tensor(
+                    mamba_track_seqlens_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
 
         # Collect mamba init info for deferred ops on forward stream
         if any(req.kv.holds_mamba for req in reqs):
@@ -3077,9 +3093,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 prefix_len
                 + (req.extend_range.length // checkpoint_grid) * checkpoint_grid
             )
-        track_index = req.kv.mamba_ping_pong_track_buffer[
-            req.kv.mamba_next_track_idx
-        ].item()
+        if _q38fn_pp.ENABLED:  # _q38fn_schednosync
+            track_index = req.kv.mamba_ping_pong_track_buffer.narrow(
+                0, req.kv.mamba_next_track_idx, 1
+            ).clone()
+        else:
+            track_index = req.kv.mamba_ping_pong_track_buffer[
+                req.kv.mamba_next_track_idx
+            ].item()
         mamba_track_seqlen = -1
         if mask:
             # mamba_track_seqlen is used to calculate the indices to track in
@@ -3499,7 +3520,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if self.seq_lens_cpu[i].item() % mamba_track_interval != 0:
                 continue
             other_idx = 1 - req.kv.mamba_next_track_idx
-            if buf[other_idx].item() != -1:
+            if _q38fn_pp.valid(req.kv, other_idx):  # _q38fn_schednosync
                 # With overlap the previous forward's post-processing
                 # (which frees this slot) hasn't run yet. Skip.
                 continue
@@ -3537,7 +3558,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 track_positions.append(req.kv.mamba_next_track_idx)
                 continue
             other_idx = 1 - req.kv.mamba_next_track_idx
-            has_pending = buf[other_idx].item() != -1
+            has_pending = _q38fn_pp.valid(req.kv, other_idx)  # _q38fn_schednosync
             if not has_pending:
                 if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
                     new_slot = None

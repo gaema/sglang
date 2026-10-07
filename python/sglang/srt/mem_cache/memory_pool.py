@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+from sglang.srt.mem_cache import q38fn_pp_mirror as _q38fn_pp  # _q38fn_schednosync
 import triton
 import triton.language as tl
 
@@ -1479,10 +1480,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
             )
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
-        self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
+        _q38fn_si = select_index  # _q38fn_schednosync
+        if _q38fn_pp.ENABLED and isinstance(select_index, list):
+            _q38fn_si = torch.tensor(
+                select_index, dtype=torch.int64, pin_memory=True
+            ).to(self.req_index_to_mamba_index_mapping.device, non_blocking=True)
+        self.req_index_to_mamba_index_mapping[_q38fn_si] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
             ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping[_q38fn_si] = (
                 ping_pong_tensor
             )
         return select_index
@@ -1619,6 +1625,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
         buf[:n] = slots
         req.kv.mamba_ping_pong_track_buffer = buf
+        _q38fn_pp.set_all(req.kv, buf, n)  # _q38fn_schednosync
         req.kv.mamba_prev_track_seqlen = None
         req.kv.mamba_next_track_idx = 0
         req.kv.mamba_last_track_idx = (
@@ -1634,7 +1641,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
         req_index_to_mamba_ping_pong_track_buffer_mapping in sync so that
         set_mamba_track_indices_from_reqs reads correct slot indices.
         """
-        req.kv.mamba_ping_pong_track_buffer[idx] = value
+        if _q38fn_pp.ENABLED:  # _q38fn_schednosync
+            _q38fn_el = req.kv.mamba_ping_pong_track_buffer.narrow(0, idx, 1)
+            if isinstance(value, torch.Tensor):
+                _q38fn_el.copy_(value.reshape(1), non_blocking=True)
+            else:
+                _q38fn_el.fill_(value)
+            _q38fn_pp.set_one(req.kv, idx, value)
+        else:
+            req.kv.mamba_ping_pong_track_buffer[idx] = value
         self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.kv.req_pool_idx] = (
             req.kv.mamba_ping_pong_track_buffer
         )
@@ -1706,11 +1721,30 @@ class HybridReqToTokenPool(ReqToTokenPool):
                         mamba_ping_pong_track_buffer_to_free[0:0]
                     )
             if self.enable_mamba_extra_buffer_lazy:
-                mamba_ping_pong_track_buffer_to_free = (
-                    mamba_ping_pong_track_buffer_to_free[
-                        mamba_ping_pong_track_buffer_to_free != -1
-                    ]
-                )
+                _q38fn_sel = None  # _q38fn_schednosync
+                if _q38fn_pp.ENABLED:
+                    _q38fn_size = self.mamba_ping_pong_track_buffer_size
+                    if mamba_ping_pong_track_buffer_to_keep is None:
+                        _q38fn_pos = list(range(_q38fn_size))
+                    elif _q38fn_size == 2:
+                        _q38fn_pos = [1 - mamba_ping_pong_track_buffer_to_keep]
+                    else:
+                        _q38fn_pos = []
+                    _q38fn_sel = _q38fn_pp.select_valid(
+                        req.kv,
+                        self.req_index_to_mamba_ping_pong_track_buffer_mapping[
+                            req.kv.req_pool_idx
+                        ],
+                        _q38fn_pos,
+                    )
+                if _q38fn_sel is not None:
+                    mamba_ping_pong_track_buffer_to_free = _q38fn_sel
+                else:
+                    mamba_ping_pong_track_buffer_to_free = (
+                        mamba_ping_pong_track_buffer_to_free[
+                            mamba_ping_pong_track_buffer_to_free != -1
+                        ]
+                    )
             self.mamba_allocator.free(mamba_ping_pong_track_buffer_to_free)
             # Match the req.kv.mamba_pool_idx=None clear above so the next
             # alloc() doesn't see a stale ping-pong reference on the req

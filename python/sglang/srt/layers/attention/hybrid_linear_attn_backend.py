@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
+from sglang.srt.mem_cache import q38fn_pp_mirror as _q38fn_pp  # _q38fn_schednosync
 
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
@@ -414,6 +415,10 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=start_indices.dtype,
         )
 
+        if _q38fn_pp.ENABLED:  # _q38fn_schednosync
+            return torch.minimum(
+                indices.clamp_min(0), (query_start_loc[-1] - 1).to(indices.dtype)
+            )
         return indices.clamp(0, query_start_loc[-1] - 1)
 
     def _init_track_ssm_indices(

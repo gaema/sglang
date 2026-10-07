@@ -14,6 +14,7 @@ from typing import (
 
 import numpy as np
 import torch
+from sglang.srt.mem_cache import q38fn_pp_mirror as _q38fn_pp  # _q38fn_schednosync
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -1540,9 +1541,9 @@ class SchedulerBatchResultProcessor:
             other_idx = 1 - req.kv.mamba_next_track_idx
             # Recompute the in-flight verify's plan (kv_committed_len is
             # frozen since its prepare, so the recompute is exact).
-            keep_may_be_written_in_flight = req.kv.mamba_ping_pong_track_buffer[
-                other_idx
-            ].item() == -1 and mamba_lazy_spec_in_window(
+            keep_may_be_written_in_flight = (
+                not _q38fn_pp.valid(req.kv, other_idx)  # _q38fn_schednosync
+            ) and mamba_lazy_spec_in_window(
                 req,
                 mamba_track_grid(self.tree_cache.page_size),
                 max_speculative_num_draft_tokens(),
@@ -1619,8 +1620,7 @@ class SchedulerBatchResultProcessor:
         req.kv.mamba_last_track_idx = track_idx
         req.kv.mamba_next_track_idx = track_idx
         other_idx = 1 - track_idx
-        other_val = req.kv.mamba_ping_pong_track_buffer[other_idx].item()
-        if other_val != -1:
+        if _q38fn_pp.valid(req.kv, other_idx):  # _q38fn_schednosync
             pool = batch.req_to_token_pool
             pool.mamba_allocator.free(
                 req.kv.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)

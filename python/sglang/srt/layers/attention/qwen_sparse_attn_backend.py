@@ -44,6 +44,7 @@ from typing import Dict, Optional, Tuple
 
 import msgspec
 import torch
+from sglang.srt.mem_cache import q38fn_pp_mirror as _q38fn_pp  # _q38fn_schednosync
 
 _Q38FN_NOSYNC = __import__("os").environ.get("SGLANG_Q38FN_QSA_NOSYNC", "0") == "1"  # _q38fn_nosync
 import torch.nn.functional as F
@@ -727,6 +728,19 @@ class QwenSparseAttnBackend(AttentionBackend):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 if extend_seq_lens is None:
                     raise ValueError("QSA extend metadata requires extend_seq_lens")
+                _q38fn_out = None  # _q38fn_schednosync
+                _q38fn_ext = getattr(forward_batch, "extend_seq_lens_cpu", None)
+                if (
+                    _q38fn_pp.ENABLED
+                    and _q38fn_ext is not None
+                    and len(_q38fn_ext) == batch_size
+                    and extend_seq_lens.numel() == batch_size
+                ):
+                    _q38fn_out = int(sum(int(x) for x in _q38fn_ext))
+                    if not _q38fn_pp.check_total(
+                        "qsa_extend_rows", _q38fn_out, extend_seq_lens
+                    ):
+                        _q38fn_out = None
                 token_to_batch_idx = torch.repeat_interleave(
                     torch.arange(
                         batch_size,
@@ -734,6 +748,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                         dtype=torch.int32,
                     ),
                     extend_seq_lens.to(torch.long),
+                    output_size=_q38fn_out,
                 )
                 # More mapped rows than physical would index past them;
                 # fewer is fine (DP MAX_LEN padding is trimmed downstream).
