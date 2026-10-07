@@ -44,6 +44,8 @@ from typing import Dict, Optional, Tuple
 
 import msgspec
 import torch
+
+_Q38FN_NOSYNC = __import__("os").environ.get("SGLANG_Q38FN_QSA_NOSYNC", "0") == "1"  # _q38fn_nosync
 import torch.nn.functional as F
 
 from sglang.srt.environ import envs
@@ -667,6 +669,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         # coordinate independently of the paged position, so they keep the
         # indexer's own sync (None).
         max_position: Optional[int] = None
+        _q38fn_seq_cpu = None  # _q38fn_nosync
         if speculative_paged:
             logical_positions = forward_batch.positions
             if logical_positions.ndim == 2:
@@ -693,6 +696,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         else:
             sequence_lengths = forward_batch.seq_lens.to(torch.int32)
             batch_size = sequence_lengths.numel()
+            if _Q38FN_NOSYNC and forward_batch.seq_lens_cpu is not None:  # _q38fn_nosync
+                _q38fn_seq_cpu = tuple(int(x) for x in forward_batch.seq_lens_cpu[:batch_size])
             if forward_batch.seq_lens_cpu is not None:
                 max_length = int(forward_batch.seq_lens_cpu[:batch_size].max())
             else:
@@ -841,6 +846,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 and decode_logical_positions is not None
             ),
             max_position=max_position,
+            sequence_lengths_cpu=_q38fn_seq_cpu,  # _q38fn_nosync
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
@@ -1600,7 +1606,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
         req_to_token = self.req_to_token_pool.req_to_token
-        req_indices = forward_batch.req_pool_indices.tolist()
+        if _Q38FN_NOSYNC:  # _q38fn_nosync: gather the batch's rows on the device, index by position
+            req_to_token = req_to_token.index_select(0, forward_batch.req_pool_indices.long())
+            req_indices = list(range(len(sequence_lens)))
+        else:
+            req_indices = forward_batch.req_pool_indices.tolist()
         k_parts = [
             k_buffer.index_select(
                 0, req_to_token[req_indices[i], : sequence_lens[i]].long()
@@ -1613,8 +1623,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             for i in range(len(sequence_lens))
         ]
-        sequence_lens_tensor = torch.tensor(
-            sequence_lens, dtype=torch.int32, device=q.device
+        sequence_lens_tensor = (  # _q38fn_nosync: device lengths, no pageable H2D copy
+            forward_batch.seq_lens[: len(sequence_lens)].to(device=q.device, dtype=torch.int32)
+            if _Q38FN_NOSYNC
+            else torch.tensor(sequence_lens, dtype=torch.int32, device=q.device)
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         output = sparse_gqa_fwd_interface_triton_ck(
@@ -1626,6 +1638,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             cu_seqlens_k,
             sequence_lens_tensor,
             layer.scaling,
+            max_q_hint=(max(extend_lens, default=1) if _Q38FN_NOSYNC else None),  # _q38fn_nosync
         )
         return self._pad_extend_output(output, num_output_rows)
 

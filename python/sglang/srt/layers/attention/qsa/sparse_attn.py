@@ -286,7 +286,7 @@ def _sparse_gqa_chunk_prefill(
     )
 
 
-def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
+def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, scale, max_q_hint=None):  # _q38fn_nosync
     k, v = k.contiguous(), v.contiguous()
     if _n57_multirow and _n57_supported(q, indices):
         # N57: same out tensor as upstream from the same inputs (token sets per
@@ -295,7 +295,9 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
-    max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
+    max_q = (  # _q38fn_nosync
+        int(max_q_hint) if max_q_hint is not None else int((cu_q[1:] - cu_q[:-1]).max().item())
+    )
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q)
     out = torch.empty_like(q)
