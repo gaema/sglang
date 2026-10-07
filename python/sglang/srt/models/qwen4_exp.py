@@ -2017,7 +2017,9 @@ class Qwen4ExpLayerExtensionMixin:
             # HERE, inside the traced body, so the next captured piece reads it
             # at a fixed graph-pool address (the QSA/DSA `with_output` contract).
             ple_out = torch.empty_like(residual)
-            qwen4_ple_layer_split(self.ple._ple_split_handle, residual, ple_out)
+            _q38fn_bcg_pick(qwen4_ple_layer_split)(  # _q38fn_bcg
+                self.ple._ple_split_handle, residual, ple_out
+            )
             return residual + ple_out
         if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
             output = torch.empty_like(residual)
@@ -2191,6 +2193,30 @@ class Qwen4ExpAttentionDecoderLayer(
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if self._qsa_split_op_surface(forward_batch):
+            # R2d (SGLANG_QWEN4_QSA_SPLIT_OP): under a piecewise/breakable
+            # prefill graph the indexer is a registered split op. It writes a
+            # static, padded, -1-filled buffer allocated here in the traced
+            # body (the DSA contract); the attention split op narrows it to
+            # the real query rows. The MTP seed capture runs inside the op.
+            from sglang.srt.layers.attention.qsa.prefill_cuda_graph import (
+                pcg_qsa_indexer_prefill_split,
+                qsa_topk_result_width,
+            )
+
+            topk_result = torch.full(
+                (hidden_states.shape[0], qsa_topk_result_width(self.indexer)),
+                -1,
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+            _q38fn_bcg_pick(pcg_qsa_indexer_prefill_split)(  # _q38fn_bcg
+                layer_id=self.layer_id,
+                hidden_states=hidden_states,
+                positions=positions,
+                topk_result=topk_result,
+            )
+            return topk_result
         if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
             return _breakable_qsa_indexer(
                 layer=self, hidden_states=hidden_states, positions=positions
@@ -2211,31 +2237,6 @@ class Qwen4ExpAttentionDecoderLayer(
             get_qsa_indexer_metadata,
             resolve_qsa_sparse_backend,
         )
-
-        if self._qsa_split_op_surface(forward_batch):
-            # R2d (SGLANG_QWEN4_QSA_SPLIT_OP): under a piecewise/breakable
-            # prefill graph the indexer is a registered split op. It writes a
-            # static, padded, -1-filled buffer allocated here in the traced
-            # body (the DSA contract); the attention split op narrows it to
-            # the real query rows. The MTP seed capture runs inside the op.
-            from sglang.srt.layers.attention.qsa.prefill_cuda_graph import (
-                pcg_qsa_indexer_prefill_split,
-                qsa_topk_result_width,
-            )
-
-            topk_result = torch.full(
-                (hidden_states.shape[0], qsa_topk_result_width(self.indexer)),
-                -1,
-                dtype=torch.int32,
-                device=hidden_states.device,
-            )
-            pcg_qsa_indexer_prefill_split(
-                layer_id=self.layer_id,
-                hidden_states=hidden_states,
-                positions=positions,
-                topk_result=topk_result,
-            )
-            return topk_result
 
         backend = get_attn_backend()
         sparse_backend = resolve_qsa_sparse_backend(backend)
@@ -2560,7 +2561,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             raise
 
         if ple_split:
-            qwen4_ple_commit_split(hidden_states)
+            _q38fn_bcg_pick(qwen4_ple_commit_split)(hidden_states)  # _q38fn_bcg
         elif breakable_ple:
             _breakable_commit_ple_batch(batch=ple_batch)
         else:
@@ -2621,6 +2622,7 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         self.last_hc_hidden_states = None
+        self._q38fn_forward_ran = True  # _q38fn_hcbcg
         # mm routine passes input_ids=None; PLE needs the real ids.
         if input_ids is None:
             input_ids = forward_batch.input_ids
@@ -2635,6 +2637,7 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
             return model_output
         if isinstance(model_output, tuple):
             hidden_states, self.last_hc_hidden_states = model_output
+            _q38fn_hcbcg_record(self, hidden_states, self.last_hc_hidden_states)  # _q38fn_hcbcg
             return hidden_states
         return model_output
 
@@ -2689,6 +2692,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        self.model._q38fn_forward_ran = False  # _q38fn_hcbcg
         output = super().forward(
             input_ids=input_ids,
             positions=positions,
@@ -2696,7 +2700,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             get_embedding=get_embedding,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        hc_hidden_states = self.model.last_hc_hidden_states
+        hc_hidden_states = _q38fn_hcbcg_resolve(self.model, output)  # _q38fn_hcbcg
         if hc_hidden_states is not None and isinstance(output, LogitsProcessorOutput):
             output.hidden_states = hc_hidden_states
         return output
@@ -3201,3 +3205,85 @@ def _q38fn_cfp8_combine(inp, out, sizes):  # _q38fn_cfp8
 
         _q38fn_cfp8_said[0] = True
         print(f"[q38fn-cfp8] combine fp8 on: rows={inp.shape[0]} sizes={list(sizes)} me={me} pid={_os.getpid()}", flush=True)
+
+
+_q38fn_bcg_wrapped = {}
+
+
+def _q38fn_bcg_pick(fn):  # _q38fn_bcg
+    """Inside a breakable prefill graph, the eager_on_graph wrapper of `fn`
+    (a graph break around the split op); otherwise `fn` itself."""
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        eager_on_graph,
+        is_in_breakable_cuda_graph,
+    )
+
+    if not is_in_breakable_cuda_graph():
+        return fn
+    w = _q38fn_bcg_wrapped.get(id(fn))
+    if w is None:
+        w = eager_on_graph(True)(fn)
+        _q38fn_bcg_wrapped[id(fn)] = w
+        logger.info("[q38fn-bcg] eager break wrapped around %s", getattr(fn, "__name__", repr(fn)))
+    return w
+
+
+def _q38fn_hcbcg_record(model, hidden, hc):  # _q38fn_hcbcg
+    """During a breakable prefill capture, copy the body's HC output into ONE
+    shared static buffer (a copy kernel captured into the graph, so every
+    replay refreshes it) and remember the row count per static body output.
+    Holding each shape's own HC tensor instead pins it in the graph pool and
+    ran the capture out of memory (r43a)."""
+    import torch
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        is_in_breakable_cuda_graph,
+    )
+
+    if hidden is None or hc is None or not is_in_breakable_cuda_graph():
+        return
+    if not torch.cuda.is_current_stream_capturing():
+        # warm-up passes run inside the breakable context without capturing
+        # (r43b); only a captured pass may register a shape. A shape whose
+        # capture never registers raises at replay in _q38fn_hcbcg_resolve.
+        return
+    rows = hc.shape[0]
+    buf = model.__dict__.get("_q38fn_hc_buf")
+    if buf is None:
+        cap = int(__import__("os").environ.get("SGLANG_Q38FN_HC_BUF_ROWS", "4096"))
+        buf = torch.empty((cap,) + tuple(hc.shape[1:]), dtype=hc.dtype, device=hc.device)
+        model.__dict__["_q38fn_hc_buf"] = buf
+    if rows > buf.shape[0] or tuple(hc.shape[1:]) != tuple(buf.shape[1:]):
+        raise RuntimeError(
+            "[q38fn-hcbcg] captured HC shape %s does not fit the shared buffer %s "
+            "(SGLANG_Q38FN_HC_BUF_ROWS)" % (tuple(hc.shape), tuple(buf.shape))
+        )
+    buf[:rows].copy_(hc)
+    model.last_hc_hidden_states = buf[:rows]
+    # Keyed by row count, not address: static outputs share and move addresses
+    # in the graph pool (r43c missed a replay by address with 34 entries). Each
+    # captured shape's graph copies into the same buffer, so the key only has to
+    # prove the replayed shape was captured with the copy.
+    table = model.__dict__.setdefault("_q38fn_hc_rows", set())
+    table.add(rows)
+    __import__("logging").getLogger(__name__).info(
+        "[q38fn-hcbcg] recorded HC output for a captured body: rows=%d entries=%d",
+        rows, len(table),
+    )
+
+
+def _q38fn_hcbcg_resolve(model, output):  # _q38fn_hcbcg
+    """HC hidden states for this forward: the body's attribute when its Python
+    ran, else the static HC tensor of the replayed captured shape."""
+    if getattr(model, "_q38fn_forward_ran", True):
+        return model.last_hc_hidden_states
+    hidden = getattr(output, "hidden_states", None)
+    if hidden is None:
+        return None
+    table = model.__dict__.get("_q38fn_hc_rows", set())
+    rows = hidden.shape[0]
+    if rows not in table:
+        raise RuntimeError(
+            "[q38fn-hcbcg] replayed prefill body output (rows=%d) has no recorded "
+            "HC hidden states; %d captured entries" % (hidden.shape[0], len(table))
+        )
+    return model.__dict__["_q38fn_hc_buf"][:rows]

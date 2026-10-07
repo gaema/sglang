@@ -510,6 +510,10 @@ def capture_prefill_graph(
     # init_lm_head so graphs capture the final embedding weights.
     if model_runner.is_draft_worker and not force_for_draft_worker:
         return result(None)
+    if model_runner.is_draft_worker and __import__("os").environ.get(  # _q38fn_bcg
+        "SGLANG_Q38FN_NO_DRAFT_PREFILL_CG", "0"
+    ) == "1":
+        return result(None)
 
     if model_runner.is_draft_worker and get_parallel().enable_prefill_cp:
         from sglang.srt.layers.cp.base import is_interleave
