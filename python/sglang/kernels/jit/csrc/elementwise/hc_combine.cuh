@@ -376,6 +376,33 @@ struct HcCombineSplitKernel {
         .enable_pdl(kUsePDL)(gate_kernel, params);
     LaunchKernel(dim3(num_tokens, kSplit, 1), kApplyThreads, device.unwrap()).enable_pdl(kUsePDL)(apply_kernel, params);
   }
+
+  // _q38fn_fold: the apply stage alone, on partials another kernel produced.
+  static void run_apply(
+      const tvm::ffi::TensorView block_output,
+      const tvm::ffi::TensorView residual,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView partials) {
+    using namespace host;
+    using namespace hc_combine_split_detail;
+    auto M = SymbolicSize{"num_tokens"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({M, kHiddenSize}).with_dtype<DType>().with_device(device).verify(block_output);
+    TensorMatcher({M, kHcCount * kHiddenSize}).with_dtype<DType>().with_device(device).verify(residual).verify(output);
+    auto part_rows = SymbolicSize{"partial_rows"};
+    TensorMatcher({part_rows, kSplit, kHcCount}).with_dtype<fp32_t>().with_device(device).verify(partials);
+    const auto params = HcCombineSplitParams{
+        .block_output = block_output.data_ptr(),
+        .residual = residual.data_ptr(),
+        .normed_residual = nullptr,
+        .inject_weight = nullptr,
+        .output = output.data_ptr(),
+        .partials = static_cast<float*>(partials.data_ptr()),
+    };
+    const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    LaunchKernel(dim3(num_tokens, kSplit, 1), kApplyThreads, device.unwrap()).enable_pdl(kUsePDL)(apply_kernel, params);
+  }
 };
 
 }  // namespace sglang

@@ -44,6 +44,8 @@ def _hc_mix_persistent_kernel(
     t_raw_ptr,
     out_ptr,
     counters_ptr,
+    w_gate_ptr,  # _q38fn_fold: [GATE, K] inject weight (unused when GATE == 0)
+    partials_ptr,  # _q38fn_fold: [rows, SPLIT, GATE] combine partials
     K,
     LOWRANK,
     HS,
@@ -61,12 +63,14 @@ def _hc_mix_persistent_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_J: tl.constexpr,
     BLOCK_R: tl.constexpr,
+    GATE: tl.constexpr = 0,  # _q38fn_fold
+    SPLIT: tl.constexpr = 8,
 ):
     pid = tl.program_id(0)
     offs_m = tl.arange(0, ROWS)
     mask_m = offs_m < num_rows
 
-    zero_span = ROWS * LOWRANK
+    zero_span = ROWS * (LOWRANK + GATE)  # _q38fn_fold
     offs_z = tl.arange(0, 256)
     for z0 in range(pid * 256, zero_span, grid_ctas * 256):
         idx = z0 + offs_z
@@ -75,27 +79,37 @@ def _hc_mix_persistent_kernel(
 
     offs_k = tl.arange(0, BLOCK_K)
     offs_n = tl.arange(0, BLOCK_N)
-    n_blocks = tl.cdiv(LOWRANK, BLOCK_N)
+    n_blocks_down = tl.cdiv(LOWRANK, BLOCK_N)  # _q38fn_fold
+    n_blocks = n_blocks_down + (1 if GATE > 0 else 0)
     k_chunks = tl.cdiv(K, BLOCK_K)
     for tile in range(pid, n_blocks * k_chunks, grid_ctas):
         nb = tile % n_blocks
         kc = tile // n_blocks
-        n = nb * BLOCK_N + offs_n
         k = kc * BLOCK_K + offs_k
-        mask_n = n < LOWRANK
         xt = tl.load(
             x_ptr + offs_m[:, None] * K + k[None, :],
             mask=mask_m[:, None],
             other=0.0,
         )
-        w = tl.load(
-            w_down_ptr + n[:, None] * K + k[None, :],
-            mask=mask_n[:, None],
-            other=0.0,
-        )
+        if nb < n_blocks_down:
+            n = nb * BLOCK_N + offs_n
+            mask_n = n < LOWRANK
+            w = tl.load(
+                w_down_ptr + n[:, None] * K + k[None, :],
+                mask=mask_n[:, None],
+                other=0.0,
+            )
+        else:
+            n = LOWRANK + offs_n
+            mask_n = offs_n < GATE
+            w = tl.load(
+                w_gate_ptr + offs_n[:, None] * K + k[None, :],
+                mask=mask_n[:, None],
+                other=0.0,
+            )
         acc = tl.dot(xt, tl.trans(w))
         tl.atomic_add(
-            t_raw_ptr + offs_m[:, None] * LOWRANK + n[None, :],
+            t_raw_ptr + offs_m[:, None] * (LOWRANK + GATE) + n[None, :],
             acc,
             mask=mask_n[None, :],
             sem="relaxed",
@@ -120,7 +134,7 @@ def _hc_mix_persistent_kernel(
             r = r0 + offs_r
             mask_r = r < LOWRANK
             a = tl.load(
-                t_raw_ptr + offs_m[:, None] * LOWRANK + r[None, :],
+                t_raw_ptr + offs_m[:, None] * (LOWRANK + GATE) + r[None, :],  # _q38fn_fold
                 mask=mask_r[None, :],
                 other=0.0,
             )
@@ -150,6 +164,19 @@ def _hc_mix_persistent_kernel(
 
     ticket = tl.atomic_add(counters_ptr + 2, 1, sem="acq_rel", scope="gpu")
     if ticket == grid_ctas - 1:
+        if GATE > 0:  # _q38fn_fold
+            offs_c = tl.arange(0, GATE)
+            logits = tl.load(
+                t_raw_ptr + offs_m[:, None] * (LOWRANK + GATE) + LOWRANK + offs_c[None, :]
+            )
+            base = offs_m[:, None] * (SPLIT * GATE) + offs_c[None, :]
+            tl.store(partials_ptr + base, logits, mask=mask_m[:, None])
+            for s in tl.static_range(1, SPLIT):
+                tl.store(
+                    partials_ptr + base + s * GATE,
+                    tl.zeros((ROWS, GATE), dtype=tl.float32),
+                    mask=mask_m[:, None],
+                )
         tl.store(counters_ptr + 0, 0)
         tl.store(counters_ptr + 1, 0)
         tl.store(counters_ptr + 2, 0)
@@ -211,9 +238,12 @@ def fused_hc_mix(
     w_up: torch.Tensor,
     hc: int,
     hs: int,
+    w_gate: torch.Tensor = None,  # _q38fn_fold
+    partials: torch.Tensor = None,
 ) -> torch.Tensor:
     rows, k = hyper_input_normed.shape
     lowrank = w_down.shape[0]
+    gate = int(w_gate.shape[0]) if w_gate is not None else 0  # _q38fn_fold
     rows_pad = 16
     # N53: ROWS is a tl.arange extent, so pad to the next power of two >= 16.
     # With the gate at upstream's 16 this loop never runs (rows <= 16).
@@ -224,7 +254,7 @@ def fused_hc_mix(
         print(f"[N53] fused_hc_mix first call: rows={rows} rows_pad={rows_pad} pid={_n53_os.getpid()}", flush=True)
     device = hyper_input_normed.device
     num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
-    t_raw = torch.empty((rows_pad, lowrank), dtype=torch.float32, device=device)
+    t_raw = torch.empty((rows_pad, lowrank + gate), dtype=torch.float32, device=device)  # _q38fn_fold
     out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
     if rows == 0:
         return out
@@ -235,6 +265,8 @@ def fused_hc_mix(
         t_raw,
         out,
         _get_counters(device),
+        w_gate if w_gate is not None else w_down,  # _q38fn_fold
+        partials if partials is not None else t_raw,
         k,
         lowrank,
         hs,
@@ -251,6 +283,7 @@ def fused_hc_mix(
         BLOCK_K=(128 if _q38fn_sl_hc_v2(rows_pad) else 256) if rows_pad <= 16 else 128,
         BLOCK_J=(16 if _q38fn_sl_hc_v2(rows_pad) else 32) if rows_pad <= 16 else 16,
         BLOCK_R=64,
+        GATE=gate,  # _q38fn_fold
         num_warps=4 if _q38fn_sl_hc_v2(rows_pad) else 8,
     )
     return out
