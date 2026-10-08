@@ -624,6 +624,7 @@ def sglang_per_token_group_quant_fp8_row_padded(
     group_size: int,
     eps: float = 1e-10,
     row_alignment: int = 4,
+    zero_pad: bool = True,  # _q38fn_padnz: False when the caller slices the GEMM output to m
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-token-group quant writing into row-padded buffers (col-major scales).
 
@@ -673,7 +674,7 @@ def sglang_per_token_group_quant_fp8_row_padded(
             fuse_silu_and_mul=False,
             masked_m=None,
         )
-    if m_pad != m:
+    if m_pad != m and zero_pad:  # _q38fn_padnz
         # Tail rows feed the cutlass GEMM's padded region; zero them so the padded
         # GEMM stays bit-exact with the legacy pad_tensor path (torch.empty is garbage).
         x_q[m:].zero_()

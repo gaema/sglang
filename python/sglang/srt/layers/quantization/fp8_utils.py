@@ -1218,7 +1218,11 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     # kernels per GEMM). weight_scale.T is left as a K-major view because the
     # kernel requires scales_b.stride(0) == 1 and materializes it internally.
     q_input, x_scale = sglang_per_token_group_quant_fp8_row_padded(
-        input_2d, block_size[1]
+        input_2d,
+        block_size[1],
+        # _q38fn_padnz: the output is sliced to m rows below, so the pad rows'
+        # contents reach only discarded rows; skip their two zero fills.
+        zero_pad=__import__("os").environ.get("SGLANG_Q38FN_PAD_NOZERO", "0") != "1",
     )
     output = fp8_blockwise_scaled_mm(
         q_input, weight.T, x_scale, weight_scale.T, out_dtype=input_2d.dtype
