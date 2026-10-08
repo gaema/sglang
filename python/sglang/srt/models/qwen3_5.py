@@ -1023,6 +1023,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
+        _q38fn_o = _q38fn_gdn_norm_out(self, core_attn_out, z, z_shape_og)  # _q38fn_gdnq
+        if _q38fn_o is not None:
+            return _q38fn_o
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(
@@ -1032,6 +1035,49 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         output, _ = self.out_proj(core_attn_out)
         return output
+
+
+def _q38fn_gdn_norm_out(gdn, x, z, z_shape_og):  # _q38fn_gdnq
+    """Fused gated RMSNorm + FP8 group quant + split-K out_proj, or None."""
+    import os as _os
+
+    if (
+        _os.environ.get("SGLANG_Q38FN_GDN_NORM_QUANT", "0") != "1"
+        or _os.environ.get("SGLANG_Q38FN_SPLITK_TP2", "0") != "1"
+    ):
+        return None
+    norm, proj = gdn.norm, gdn.out_proj
+    w = getattr(proj, "weight", None)
+    ws = getattr(proj, "weight_scale_inv", None)
+    if (
+        w is None
+        or ws is None
+        or w.dtype != torch.float8_e4m3fn
+        or tuple(w.shape) != (2560, 3072)
+        or ws.dtype != torch.float32
+        or getattr(proj, "bias", None) is not None
+        or getattr(norm, "group_size", 0) is not None
+        or not getattr(norm, "norm_before_gate", False)
+        or getattr(norm, "activation", "") != "sigmoid"
+        or x.dtype != torch.bfloat16
+        or z.dtype != torch.bfloat16
+        or x.dim() != 2
+        or x.shape != z.shape
+        or x.shape[-1] != 128
+        or not x.is_contiguous()
+        or not z.is_contiguous()
+        or len(z_shape_og) < 2
+    ):
+        return None
+    tokens = x.shape[0] * 128 // 3072
+    if tokens * 3072 != x.shape[0] * 128 or tokens == 0 or tokens > 32:
+        return None
+    from sglang.kernels.ops.elementwise.q38fn_gdn_norm_quant import gdn_norm_quant
+    from sglang.srt.layers.quantization.fp8_utils import _q38fn_splitk_preq
+
+    q, s = gdn_norm_quant(x, z, norm.weight, norm.eps)
+    out = _q38fn_splitk_preq(q.view(tokens, 3072), s.view(tokens, 24), w, ws, torch.bfloat16)
+    return out.view(*z_shape_og[:-2], 2560)
 
 
 class Qwen3_5LinearDecoderLayer(nn.Module):

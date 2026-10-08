@@ -2541,7 +2541,13 @@ def _q38fn_sl_splitk_on(input, weight, weight_scale):  # _q38fn_sl
     m = input.numel() // input.shape[-1]
     return (
         m <= 32
-        and tuple(weight.shape) == (2560, 6144)
+        and (
+            tuple(weight.shape) == (2560, 6144)
+            or (  # _q38fn_gdnq: the TP2 per-rank out_proj / o_proj shape
+                tuple(weight.shape) == (2560, 3072)
+                and _os.environ.get("SGLANG_Q38FN_SPLITK_TP2", "0") == "1"
+            )
+        )
         and weight.dtype == torch.float8_e4m3fn
         and weight_scale.dtype == torch.float32
     )
@@ -2580,3 +2586,31 @@ def _q38fn_sl_splitk_linear(input, weight, weight_scale, bias):  # _q38fn_sl
     if bias is not None:
         out += bias
     return out.view(*input.shape[:-1], n)
+
+
+def _q38fn_splitk_preq(q, s, weight, weight_scale, out_dtype, sk=4):  # _q38fn_gdnq
+    """The _q38fn_sl split-K matmul on an already-quantized activation:
+    q [m, k] fp8, s [m, k // 128] fp32 row-major (per_token_group_quant_fp8's
+    column_major_scales=False layout)."""
+    import triton
+
+    from sglang.kernels.ops.gemm.fp8_kernel import (
+        _reduce_block_fp8_split_k,
+        _w8a8_block_fp8_matmul_hopper,
+    )
+
+    m, k = q.shape
+    n = weight.shape[0]
+    out = torch.empty((m, n), device=q.device, dtype=out_dtype)
+    parts = torch.empty((sk, m, n), device=q.device, dtype=torch.float32)
+    grid = (triton.cdiv(m, 16) * triton.cdiv(n, 32), sk)
+    _w8a8_block_fp8_matmul_hopper[grid](
+        q, weight, parts, s, weight_scale, m, n, k, 128, 128,
+        q.stride(-2), q.stride(-1), weight.stride(1), weight.stride(0),
+        out.stride(-2), out.stride(-1), s.stride(-2), s.stride(-1),
+        weight_scale.stride(1), weight_scale.stride(0),
+        BLOCK_SIZE_M=16, BLOCK_SIZE_N=32, BLOCK_SIZE_K=128, GROUP_SIZE_M=1, SPLIT_K=sk,
+        num_warps=4, num_stages=3, needs_masking=False,
+    )
+    _reduce_block_fp8_split_k[(triton.cdiv(m * n, 256),)](parts, out, m * n, sk, 256)
+    return out
