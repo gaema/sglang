@@ -87,10 +87,16 @@ def _qsa_fused_kv_prepare(
         oldoff = slot[:, None] * H * D + head * D + d[None, :]
         nkoff = input_row.to(tl.int64)[:, None] * NK_STRIDE + head * D + d[None, :]
         nvoff = input_row.to(tl.int64)[:, None] * NV_STRIDE + head * D + d[None, :]
-        kp = tl.where(fresh[:, None], NK + nkoff, K + oldoff)
-        vp = tl.where(fresh[:, None], NV + nvoff, V + oldoff)
-        k = tl.load(kp, valid[:, None], 0.0)
-        v = tl.load(vp, valid[:, None], 0.0)
+        # _q38fn_kvcast: two complementary masked loads instead of one pointer
+        # select, so NK / NV may arrive in bf16 and are cast in-register.
+        fm = (valid & fresh)[:, None]
+        om = (valid & ~fresh)[:, None]
+        kf = tl.load(NK + nkoff, fm, 0.0).to(K.dtype.element_ty)
+        ko = tl.load(K + oldoff, om, 0.0)
+        k = tl.where(fresh[:, None], kf, ko)
+        vf = tl.load(NV + nvoff, fm, 0.0).to(V.dtype.element_ty)
+        vo = tl.load(V + oldoff, om, 0.0)
+        v = tl.where(fresh[:, None], vf, vo)
         outoff = (row.to(tl.int64) * S + c[:, None]) * H * D + head * D + d[None, :]
         tl.store(OK + outoff, k, (c < S)[:, None])
         tl.store(OV + outoff, v, (c < S)[:, None])

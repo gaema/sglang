@@ -92,6 +92,36 @@ def hc_combine(
     return out.reshape(residual.shape)
 
 
+@cache_once
+def _jit_hc_combine_apply_module(  # _q38fn_fold
+    hc_count: int, hidden_size: int, dtype: torch.dtype
+) -> Module:
+    _jit_hc_combine_module(hc_count, hidden_size, dtype)  # same validation
+    args = make_cpp_args(hc_count, hidden_size, is_arch_support_pdl(), dtype)
+    return load_jit(
+        "hc_combine_q38fn_apply",
+        *args,
+        cuda_files=["elementwise/hc_combine.cuh"],
+        cuda_wrappers=[("hc_combine_apply", f"HcCombineSplitKernel<{args}>::run_apply")],
+    )
+
+
+def hc_combine_apply(  # _q38fn_fold
+    block_output: torch.Tensor,
+    residual: torch.Tensor,
+    partials: torch.Tensor,
+    hc_count: int,
+    hidden_size: int,
+) -> torch.Tensor:
+    """Apply stage of the split combine on partials the fused HC mix wrote."""
+    y = block_output.reshape(-1, hidden_size)
+    r = residual.reshape(-1, hc_count * hidden_size)
+    out = torch.empty_like(r)
+    module = _jit_hc_combine_apply_module(hc_count, hidden_size, residual.dtype)
+    module.hc_combine_apply(y, r, out, partials)
+    return out.reshape(residual.shape)
+
+
 _SPLIT = 8
 _MAX_ROWS = 32
 _partials_cache = {}

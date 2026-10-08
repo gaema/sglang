@@ -968,12 +968,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
-            intermediate_state_indices = select_verify_intermediate_state_indices(
-                self.verify_intermediate_state_indices,
-                forward_batch.req_pool_indices,
-                cache_indices[: query_start_loc.shape[0] - 1] >= 0,
-                self.req_to_token_pool.size,
-            )
+            if __import__("os").environ.get(
+                "SGLANG_Q38FN_GDN_LAZY_MASK", "0"
+            ) == "1" and not __import__(
+                "sglang.srt.layers.attention.linear.utils", fromlist=["x"]
+            ).pp_spec_stable_rows_enabled():  # _q38fn_lazymask
+                intermediate_state_indices = self.verify_intermediate_state_indices
+            else:
+                intermediate_state_indices = select_verify_intermediate_state_indices(
+                    self.verify_intermediate_state_indices,
+                    forward_batch.req_pool_indices,
+                    cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                    self.req_to_token_pool.size,
+                )
             mamba_pool = self.req_to_token_pool.mamba_pool
             use_replayssm_fold = (
                 mamba_cache_params.replayssm_rawv is not None

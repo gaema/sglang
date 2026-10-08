@@ -239,6 +239,7 @@ class GatedResidual(HyperConnectionBase):
             )
             return mixed_input, (hyper_input, hyper_input)
 
+        self._q38fn_partials = None  # _q38fn_fold
         if self.config.hc_per_branch_norm:
             hyper_input_normed = self.hc_norm(hyper_input)
         else:
@@ -272,13 +273,29 @@ class GatedResidual(HyperConnectionBase):
             self.input_mix_weight_down.weight,
             self.input_mix_weight_up.weight,
         ):
+            _q38fn_parts = None  # _q38fn_fold
+            if (
+                __import__("os").environ.get("SGLANG_Q38FN_HC_GATE_FOLD", "0") == "1"
+                and getattr(self, "_split_combine_ok", False)
+                and hyper_input_normed.shape[0] <= 32
+                and self.block_inject_weight.weight.dtype == hyper_input_normed.dtype
+                and self.block_inject_weight.weight.is_contiguous()
+            ):
+                from sglang.kernels.ops.elementwise.hc_combine import _get_partials
+
+                _q38fn_parts = _get_partials(
+                    self.hc_count, hyper_input_normed.device, hyper_input_normed.shape[0]
+                )[: hyper_input_normed.shape[0]]
             mixed_input = fused_hc_mix(
                 hyper_input_normed,
                 self.input_mix_weight_down.weight,
                 self.input_mix_weight_up.weight,
                 self.hc_count,
                 self.hidden_size,
+                w_gate=self.block_inject_weight.weight if _q38fn_parts is not None else None,
+                partials=_q38fn_parts,
             ).to(self.params_dtype)
+            self._q38fn_partials = _q38fn_parts
         else:
             mixed_input = self._mix_compute(
                 hyper_input_normed,
@@ -305,6 +322,14 @@ class GatedResidual(HyperConnectionBase):
             and self.block_inject_weight.weight.dtype == block_output.dtype
         ):
             if self._split_combine_ok and block_output.shape[0] <= 32:
+                _q38fn_parts = getattr(self, "_q38fn_partials", None)  # _q38fn_fold
+                self._q38fn_partials = None
+                if _q38fn_parts is not None and _q38fn_parts.shape[0] == block_output.shape[0]:
+                    from sglang.kernels.ops.elementwise.hc_combine import hc_combine_apply
+
+                    return hc_combine_apply(
+                        block_output, hyper_input, _q38fn_parts, self.hc_count, self.hidden_size
+                    )
                 from sglang.kernels.ops.elementwise.hc_combine import (
                     hc_combine_split,
                 )

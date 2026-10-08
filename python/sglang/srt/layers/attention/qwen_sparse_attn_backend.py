@@ -1539,8 +1539,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             or q.dtype != torch.bfloat16
         ):
             return None
-        k = k.reshape(rows, kc.shape[1], 256).to(kc.dtype)
-        v = v.reshape(rows, kc.shape[1], 256).to(vc.dtype)
+        k = k.reshape(rows, kc.shape[1], 256)
+        v = v.reshape(rows, kc.shape[1], 256)
+        if __import__("os").environ.get("SGLANG_Q38FN_QSA_KV_CAST_FOLD", "0") != "1":  # _q38fn_kvcast
+            k = k.to(kc.dtype)
+            v = v.to(vc.dtype)
         if (
             k.stride(1) != 256
             or v.stride(1) != 256
