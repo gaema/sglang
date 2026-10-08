@@ -286,14 +286,36 @@ class GatedResidual(HyperConnectionBase):
                 _q38fn_parts = _get_partials(
                     self.hc_count, hyper_input_normed.device, hyper_input_normed.shape[0]
                 )[: hyper_input_normed.shape[0]]
+            _q38fn_w = None  # _q38fn_mixfp8
+            if __import__("os").environ.get("SGLANG_Q38FN_MIX_FP8", "0") == "1":
+                _q38fn_w = getattr(self, "_q38fn_fp8w", None)
+                if _q38fn_w is None and not torch.cuda.is_current_stream_capturing():
+                    from sglang.kernels.ops.gemm.hc_mix import q38fn_quant_rows_fp8
+
+                    _q38fn_w = (
+                        *q38fn_quant_rows_fp8(self.input_mix_weight_down.weight),
+                        *q38fn_quant_rows_fp8(self.input_mix_weight_up.weight),
+                    )
+                    self._q38fn_fp8w = _q38fn_w
+                    GatedResidual._q38fn_fp8_count = getattr(
+                        GatedResidual, "_q38fn_fp8_count", 0
+                    ) + 1
+                    if GatedResidual._q38fn_fp8_count in (1, 96):
+                        print(
+                            f"[q38fn-mixfp8] fp8 HC mix weights built for "
+                            f"{GatedResidual._q38fn_fp8_count} mixes",
+                            flush=True,
+                        )
             mixed_input = fused_hc_mix(
                 hyper_input_normed,
-                self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
+                _q38fn_w[0] if _q38fn_w else self.input_mix_weight_down.weight,
+                _q38fn_w[2] if _q38fn_w else self.input_mix_weight_up.weight,
                 self.hc_count,
                 self.hidden_size,
                 w_gate=self.block_inject_weight.weight if _q38fn_parts is not None else None,
                 partials=_q38fn_parts,
+                w_down_scale=_q38fn_w[1] if _q38fn_w else None,
+                w_up_scale=_q38fn_w[3] if _q38fn_w else None,
             ).to(self.params_dtype)
             self._q38fn_partials = _q38fn_parts
         else:
