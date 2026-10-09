@@ -1925,6 +1925,10 @@ class Qwen4ExpLayerExtensionMixin:
             ).residual_ops(),
             linear_attention=linear_attention,
         )
+        if __import__("os").environ.get("SGLANG_Q38FN_L2PF", "0") == "1":  # _q38fn_l2pf
+            from sglang.kernels.ops.elementwise.q38fn_l2_prefetch import q38fn_l2pf_register
+
+            q38fn_l2pf_register(self, layer_id)
 
         from sglang.srt.layers.moe.qwen4_decode import prepare_qwen4_decode_comm
 
