@@ -22,6 +22,12 @@ def _select_recurrent_launch_config(
     target_verify: bool = False,
 ) -> tuple[int, int]:
     """Select the value tile and warp count for recurrent GDN."""
+    import os as _q38fn_os  # _q38fn_gdnbv: SGLANG_Q38FN_GDN_VERIFY_BV="<BV>,<warps>"
+
+    _q38fn_bv = _q38fn_os.environ.get("SGLANG_Q38FN_GDN_VERIFY_BV", "")
+    if _q38fn_bv and target_verify and not is_kda and not _is_hip and k == 128 and v == 128:
+        _bv, _w = (int(t) for t in _q38fn_bv.split(","))
+        return _bv, _w
     if (
         _is_hip
         and _is_gfx95
