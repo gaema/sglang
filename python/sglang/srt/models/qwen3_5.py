@@ -831,7 +831,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.alt_stream.wait_stream(current_stream)
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             with torch.cuda.stream(self.alt_stream):
-                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+                _q38fn_ba = None  # _q38fn_bagemm
+                if __import__("os").environ.get("SGLANG_Q38FN_GDN_BA_GEMM", "0") == "1":
+                    from sglang.kernels.ops.gemm.q38fn_ba_gemm import q38fn_ba_gemm, q38fn_ba_gemm_ok
+
+                    if q38fn_ba_gemm_ok(hidden_states, self.in_proj_ba):
+                        _q38fn_ba = q38fn_ba_gemm(hidden_states, self.in_proj_ba.weight)
+                if _q38fn_ba is not None:
+                    projected_states_ba = _q38fn_ba
+                else:
+                    projected_states_ba, _ = self.in_proj_ba(hidden_states)
             current_stream.wait_stream(self.alt_stream)
         elif self._fused_input_proj_cpu_enabled.value:
             projected_states_qkvz, projected_states_ba = (
