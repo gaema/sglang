@@ -69,6 +69,7 @@ def _hc_mix_persistent_kernel(
     WFP8: tl.constexpr = 0,  # _q38fn_mixfp8
     S1: tl.constexpr = 1,  # _q38fn_mixtune: phase-1 pipeline stages
     S2: tl.constexpr = 1,  # _q38fn_mixtune: phase-2 pipeline stages
+    OWNK: tl.constexpr = 0,  # _q38fn_mixownk: phase-1 K-range ownership
     SPLIT: tl.constexpr = 8,
 ):
     pid = tl.program_id(0)
@@ -87,7 +88,59 @@ def _hc_mix_persistent_kernel(
     n_blocks_down = tl.cdiv(LOWRANK, BLOCK_N)  # _q38fn_fold
     n_blocks = n_blocks_down + (1 if GATE > 0 else 0)
     k_chunks = tl.cdiv(K, BLOCK_K)
-    for tile in tl.range(pid, n_blocks * k_chunks, grid_ctas, num_stages=S1):  # _q38fn_mixtune
+    if OWNK > 0:  # _q38fn_mixownk: one n-block + a contiguous k run per CTA
+        ksplit = grid_ctas // n_blocks
+        per = tl.cdiv(k_chunks, ksplit)
+        if pid < n_blocks * ksplit:
+            onb = pid // ksplit
+            kc0 = (pid % ksplit) * per
+            kc1 = tl.minimum(kc0 + per, k_chunks)
+            oacc = tl.zeros((ROWS, BLOCK_N), dtype=tl.float32)
+            if onb < n_blocks_down:
+                on = onb * BLOCK_N + offs_n
+                omask = on < LOWRANK
+                for kc in tl.range(kc0, kc1, num_stages=S1):
+                    k = kc * BLOCK_K + offs_k
+                    xt = tl.load(
+                        x_ptr + offs_m[:, None] * K + k[None, :],
+                        mask=mask_m[:, None],
+                        other=0.0,
+                    )
+                    w = tl.load(
+                        w_down_ptr + on[:, None] * K + k[None, :],
+                        mask=omask[:, None],
+                        other=0.0,
+                    ).to(x_ptr.dtype.element_ty)
+                    oacc = tl.dot(xt, tl.trans(w), oacc)
+                if WFP8 > 0:
+                    oacc = oacc * tl.load(sd_ptr + on, mask=omask, other=0.0)[None, :]
+            else:
+                on = LOWRANK + offs_n
+                omask = offs_n < GATE
+                for kc in tl.range(kc0, kc1, num_stages=S1):
+                    k = kc * BLOCK_K + offs_k
+                    xt = tl.load(
+                        x_ptr + offs_m[:, None] * K + k[None, :],
+                        mask=mask_m[:, None],
+                        other=0.0,
+                    )
+                    w = tl.load(
+                        w_gate_ptr + offs_n[:, None] * K + k[None, :],
+                        mask=omask[:, None],
+                        other=0.0,
+                    ).to(x_ptr.dtype.element_ty)
+                    oacc = tl.dot(xt, tl.trans(w), oacc)
+            if kc1 > kc0:
+                tl.atomic_add(
+                    t_raw_ptr + offs_m[:, None] * (LOWRANK + GATE) + on[None, :],
+                    oacc,
+                    mask=omask[None, :],
+                    sem="relaxed",
+                    scope="gpu",
+                )
+    for tile in tl.range(  # _q38fn_mixtune
+        pid if OWNK == 0 else n_blocks * k_chunks, n_blocks * k_chunks, grid_ctas, num_stages=S1
+    ):
         nb = tile % n_blocks
         kc = tile // n_blocks
         k = kc * BLOCK_K + offs_k
@@ -310,6 +363,7 @@ def fused_hc_mix(
         S1=_tc[5] if _tc else 1,
         S2=_tc[6] if _tc else 1,
         GATE=gate,  # _q38fn_fold
+        OWNK=1 if _n53_os.environ.get("SGLANG_Q38FN_MIX_OWNK", "0") == "1" else 0,  # _q38fn_mixownk
         WFP8=1 if w_down_scale is not None else 0,  # _q38fn_mixfp8
         num_warps=_tc[4] if _tc else (4 if _q38fn_sl_hc_v2(rows_pad) else 8),  # _q38fn_mixtune
     )
