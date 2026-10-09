@@ -769,6 +769,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             return router_output, shared_output
 
         self.alt_stream.wait_stream(current_stream)
+        if getattr(self, "_q38fn_l2pf_layer", None) is not None:  # _q38fn_l2pf
+            from sglang.kernels.ops.elementwise.q38fn_l2_prefetch import q38fn_l2pf_next
+
+            q38fn_l2pf_next(self)
         shared_output = (
             self._forward_shared_experts(
                 hidden_states.clone(), apply_gate=not use_fused_gate

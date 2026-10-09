@@ -1716,6 +1716,10 @@ class Qwen4ExpLayerExtensionMixin:
             use_mix=True,
             use_combine=True,
         )
+        if __import__("os").environ.get("SGLANG_Q38FN_L2PF", "0") == "1":  # _q38fn_l2pf
+            from sglang.kernels.ops.elementwise.q38fn_l2_prefetch import q38fn_l2pf_register
+
+            q38fn_l2pf_register(self, layer_id)
 
     def _prepare_qwen4_exp_attn(
         self,
