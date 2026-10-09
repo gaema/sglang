@@ -1209,9 +1209,17 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
+                _q38fn_lg = None  # _q38fn_lmfp8
+                if __import__("os").environ.get("SGLANG_Q38FN_LMHEAD_FP8", "0") == "1":
+                    from sglang.kernels.ops.gemm.q38fn_lm_head_fp8 import q38fn_lm_head_logits
+
+                    _q38fn_lg = q38fn_lm_head_logits(hidden_states, lm_head)
+                if _q38fn_lg is not None:
+                    logits = _q38fn_lg
+                else:
+                    logits = torch.matmul(
+                        hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                    )
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models
