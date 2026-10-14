@@ -12,6 +12,14 @@ class _Q38fnSlFp8HeadMethod:  # _q38fn_sl
 
     def apply(self, layer, x, bias=None):
         m = x.shape[0]
+        if (  # _q38fn_dhead: the target head's Triton kernel (W8A16), SGLANG_Q38FN_DRAFT_HEAD_TRITON
+            __import__("os").environ.get("SGLANG_Q38FN_DRAFT_HEAD_TRITON", "0") == "1"
+            and x.dim() == 2 and 0 < m <= 64 and x.shape[1] % 256 == 0
+        ):
+            from sglang.kernels.ops.gemm.q38fn_lm_head_fp8 import q38fn_lm_head_fp8
+
+            y = q38fn_lm_head_fp8(x.to(torch.bfloat16).contiguous(), layer.weight, layer.w_scale_vec)
+            return y if bias is None else y + bias
         mp = max(16, (m + 15) // 16 * 16)
         xp = torch.nn.functional.pad(x, (0, 0, 0, mp - m)) if mp != m else x
         xs = xp.float().abs().amax(dim=1, keepdim=True).clamp(min=1e-12) / 448.0
@@ -36,6 +44,7 @@ class _Q38fnSlFp8Head(torch.nn.Module):  # _q38fn_sl
             del c, cs
         self.weight = torch.nn.Parameter(q, requires_grad=False)
         self.register_buffer("w_scale_t", s.t().contiguous(), persistent=False)
+        self.register_buffer("w_scale_vec", s.view(-1).contiguous(), persistent=False)  # _q38fn_dhead
         self.quant_method = _Q38fnSlFp8HeadMethod()
 
 from sglang.kernels.ops.speculative.topk1 import (
