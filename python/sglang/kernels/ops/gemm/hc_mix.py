@@ -37,6 +37,11 @@ def _grid_barrier(counter_ptr, num_ctas):
 
 
 @triton.jit
+def _q38fn_fx_i64(v):  # _q38fn_mixdet: fp32 -> int64 fixed point, 2^-32 resolution
+    return (tl.minimum(tl.maximum(v, -16777216.0), 16777216.0) * 4294967296.0).to(tl.int64)
+
+
+@triton.jit
 def _hc_mix_persistent_kernel(
     x_ptr,
     w_down_ptr,
@@ -48,6 +53,7 @@ def _hc_mix_persistent_kernel(
     partials_ptr,  # _q38fn_fold: [rows, SPLIT, GATE] combine partials
     sd_ptr,  # _q38fn_mixfp8: [LOWRANK] fp32 down-projection row scales
     su_ptr,  # _q38fn_mixfp8: [HC * HS] fp32 up-projection row scales
+    det_ptr,  # _q38fn_mixdet: [slots, ROWS, LOWRANK + GATE] fp32 phase-1 partials (DET 1)
     K,
     LOWRANK,
     HS,
@@ -71,6 +77,8 @@ def _hc_mix_persistent_kernel(
     S2: tl.constexpr = 1,  # _q38fn_mixtune: phase-2 pipeline stages
     OWNK: tl.constexpr = 0,  # _q38fn_mixownk: phase-1 K-range ownership
     SPLIT: tl.constexpr = 8,
+    DET: tl.constexpr = 0,  # _q38fn_mixdet: 1 slots + fixed-order sum, 2 int64 fixed point
+    SLOTS: tl.constexpr = 1,  # _q38fn_mixdet: power of two >= the slot count (DET 1)
 ):
     pid = tl.program_id(0)
     offs_m = tl.arange(0, ROWS)
@@ -78,10 +86,11 @@ def _hc_mix_persistent_kernel(
 
     zero_span = ROWS * (LOWRANK + GATE)  # _q38fn_fold
     offs_z = tl.arange(0, 256)
-    for z0 in range(pid * 256, zero_span, grid_ctas * 256):
-        idx = z0 + offs_z
-        tl.store(t_raw_ptr + idx, 0.0, mask=idx < zero_span)
-    _grid_barrier(counters_ptr + 0, grid_ctas)
+    if DET != 1:  # _q38fn_mixdet: the DET 1 slot sum writes every t_raw element
+        for z0 in range(pid * 256, zero_span, grid_ctas * 256):
+            idx = z0 + offs_z
+            tl.store(t_raw_ptr + idx, 0.0, mask=idx < zero_span)
+        _grid_barrier(counters_ptr + 0, grid_ctas)
 
     offs_k = tl.arange(0, BLOCK_K)
     offs_n = tl.arange(0, BLOCK_N)
@@ -131,13 +140,29 @@ def _hc_mix_persistent_kernel(
                     ).to(x_ptr.dtype.element_ty)
                     oacc = tl.dot(xt, tl.trans(w), oacc)
             if kc1 > kc0:
-                tl.atomic_add(
-                    t_raw_ptr + offs_m[:, None] * (LOWRANK + GATE) + on[None, :],
-                    oacc,
-                    mask=omask[None, :],
-                    sem="relaxed",
-                    scope="gpu",
-                )
+                if DET == 1:  # _q38fn_mixdet: own slot, summed in a fixed order below
+                    tl.store(
+                        det_ptr + (pid % ksplit) * zero_span
+                        + offs_m[:, None] * (LOWRANK + GATE) + on[None, :],
+                        oacc,
+                        mask=omask[None, :],
+                    )
+                elif DET == 2:  # _q38fn_mixdet: order-free integer sum
+                    tl.atomic_add(
+                        t_raw_ptr + offs_m[:, None] * (LOWRANK + GATE) + on[None, :],
+                        _q38fn_fx_i64(oacc),
+                        mask=omask[None, :],
+                        sem="relaxed",
+                        scope="gpu",
+                    )
+                else:
+                    tl.atomic_add(
+                        t_raw_ptr + offs_m[:, None] * (LOWRANK + GATE) + on[None, :],
+                        oacc,
+                        mask=omask[None, :],
+                        sem="relaxed",
+                        scope="gpu",
+                    )
     for tile in tl.range(  # _q38fn_mixtune
         pid if OWNK == 0 else n_blocks * k_chunks, n_blocks * k_chunks, grid_ctas, num_stages=S1
     ):
@@ -169,14 +194,49 @@ def _hc_mix_persistent_kernel(
         if WFP8 > 0:  # _q38fn_mixfp8: per-row scale of the down projection
             if nb < n_blocks_down:
                 acc = acc * tl.load(sd_ptr + n, mask=mask_n, other=0.0)[None, :]
-        tl.atomic_add(
-            t_raw_ptr + offs_m[:, None] * (LOWRANK + GATE) + n[None, :],
-            acc,
-            mask=mask_n[None, :],
-            sem="relaxed",
-            scope="gpu",
-        )
+        if DET == 1:  # _q38fn_mixdet: slot = k-chunk
+            tl.store(
+                det_ptr + kc * zero_span + offs_m[:, None] * (LOWRANK + GATE) + n[None, :],
+                acc,
+                mask=mask_n[None, :],
+            )
+        elif DET == 2:  # _q38fn_mixdet: order-free integer sum
+            tl.atomic_add(
+                t_raw_ptr + offs_m[:, None] * (LOWRANK + GATE) + n[None, :],
+                _q38fn_fx_i64(acc),
+                mask=mask_n[None, :],
+                sem="relaxed",
+                scope="gpu",
+            )
+        else:
+            tl.atomic_add(
+                t_raw_ptr + offs_m[:, None] * (LOWRANK + GATE) + n[None, :],
+                acc,
+                mask=mask_n[None, :],
+                sem="relaxed",
+                scope="gpu",
+            )
     _grid_barrier(counters_ptr + 1, grid_ctas)
+    if DET == 1:  # _q38fn_mixdet: t_raw = the phase-1 slots, summed in a fixed order
+        if OWNK > 0:
+            # k-runs of `per` chunks; the written slots are the prefix s * per < k_chunks
+            n_slots = tl.cdiv(k_chunks, tl.cdiv(k_chunks, grid_ctas // n_blocks))
+        else:
+            n_slots = k_chunks
+        # all slots of a 64-element chunk in one [SLOTS, 64] load, summed by tl.sum
+        # (a fixed reduction tree), so each chunk is one load round on its own CTA
+        offs_s = tl.arange(0, SLOTS)
+        offs_e = tl.arange(0, 64)
+        for z0 in range(pid * 64, zero_span, grid_ctas * 64):
+            idx = z0 + offs_e
+            zmask = idx < zero_span
+            v = tl.load(
+                det_ptr + offs_s[:, None] * zero_span + idx[None, :],
+                mask=(offs_s[:, None] < n_slots) & zmask[None, :],
+                other=0.0,
+            )
+            tl.store(t_raw_ptr + idx, tl.sum(v, axis=0), mask=zmask)
+        _grid_barrier(counters_ptr + 0, grid_ctas)
 
     offs_j = tl.arange(0, BLOCK_J)
     offs_r = tl.arange(0, BLOCK_R)
@@ -199,6 +259,8 @@ def _hc_mix_persistent_kernel(
                 mask=mask_r[None, :],
                 other=0.0,
             )
+            if DET == 2:  # _q38fn_mixdet: int64 fixed point -> fp32
+                a = a.to(tl.float32) * 2.3283064365386963e-10
             a = a * inv_hc
             t = (a * tl.sigmoid(a)).to(x_ptr.dtype.element_ty)
             w = tl.load(
@@ -232,6 +294,8 @@ def _hc_mix_persistent_kernel(
             logits = tl.load(
                 t_raw_ptr + offs_m[:, None] * (LOWRANK + GATE) + LOWRANK + offs_c[None, :]
             )
+            if DET == 2:  # _q38fn_mixdet: int64 fixed point -> fp32
+                logits = logits.to(tl.float32) * 2.3283064365386963e-10
             base = offs_m[:, None] * (SPLIT * GATE) + offs_c[None, :]
             tl.store(partials_ptr + base, logits, mask=mask_m[:, None])
             for s in tl.static_range(1, SPLIT):
@@ -327,12 +391,23 @@ def fused_hc_mix(
         print(f"[N53] fused_hc_mix first call: rows={rows} rows_pad={rows_pad} pid={_n53_os.getpid()}", flush=True)
     device = hyper_input_normed.device
     num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
-    t_raw = torch.empty((rows_pad, lowrank + gate), dtype=torch.float32, device=device)  # _q38fn_fold
+    _detm = int(_n53_os.environ.get("SGLANG_Q38FN_MIX_DET", "0") or 0)  # _q38fn_mixdet
+    t_raw = torch.empty((rows_pad, lowrank + gate), dtype=torch.int64 if _detm == 2 else torch.float32, device=device)  # _q38fn_fold
     out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
     if rows == 0:
         return out
     _tc = _n53_os.environ.get("SGLANG_Q38FN_MIX_CFG", "")  # _q38fn_mixtune
     _tc = [int(v) for v in _tc.split(",")] if _tc else None
+    _bk = _tc[0] if _tc else ((128 if _q38fn_sl_hc_v2(rows_pad) else 256) if rows_pad <= 16 else 128)
+    det_buf = t_raw  # _q38fn_mixdet
+    _slots = 1
+    if _detm == 1:
+        _bn = _tc[1] if _tc else 32
+        if _n53_os.environ.get("SGLANG_Q38FN_MIX_OWNK", "0") == "1":
+            _slots = num_ctas // (-(-lowrank // _bn) + (1 if gate > 0 else 0))
+        else:
+            _slots = -(-k // _bk)
+        det_buf = torch.empty((_slots, rows_pad, lowrank + gate), dtype=torch.float32, device=device)
     _hc_mix_persistent_kernel[(num_ctas,)](
         hyper_input_normed,
         w_down,
@@ -344,6 +419,7 @@ def fused_hc_mix(
         partials if partials is not None else t_raw,
         w_down_scale if w_down_scale is not None else t_raw,  # _q38fn_mixfp8
         w_up_scale if w_up_scale is not None else t_raw,
+        det_buf,  # _q38fn_mixdet
         k,
         lowrank,
         hs,
@@ -357,7 +433,7 @@ def fused_hc_mix(
         # CTA runs out of shared memory (BLOCK_J=32 at 128 rows: 114688 B needed
         # against 101376); BLOCK_K=128 was the best of a 7-config sweep at 128
         # rows (19.23 us vs 25.95 at 64 and 31.25 at 32). 16 rows keep upstream's.
-        BLOCK_K=_tc[0] if _tc else ((128 if _q38fn_sl_hc_v2(rows_pad) else 256) if rows_pad <= 16 else 128),  # _q38fn_mixtune
+        BLOCK_K=_bk,  # _q38fn_mixtune (_q38fn_mixdet: computed above, also sizes the slots)
         BLOCK_J=_tc[2] if _tc else ((16 if _q38fn_sl_hc_v2(rows_pad) else 32) if rows_pad <= 16 else 16),
         BLOCK_R=_tc[3] if _tc else 64,
         S1=_tc[5] if _tc else 1,
@@ -365,6 +441,8 @@ def fused_hc_mix(
         GATE=gate,  # _q38fn_fold
         OWNK=1 if _n53_os.environ.get("SGLANG_Q38FN_MIX_OWNK", "0") == "1" else 0,  # _q38fn_mixownk
         WFP8=1 if w_down_scale is not None else 0,  # _q38fn_mixfp8
+        DET=_detm,  # _q38fn_mixdet
+        SLOTS=triton.next_power_of_2(_slots),  # _q38fn_mixdet
         num_warps=_tc[4] if _tc else (4 if _q38fn_sl_hc_v2(rows_pad) else 8),  # _q38fn_mixtune
     )
     return out
