@@ -17,6 +17,24 @@ from sglang.srt.runtime_context import get_platform
 logger = logging.getLogger(__name__)
 
 
+
+def hf_ple_table_is_nvfp4(hf_config: Any) -> bool:
+    """The checkpoint stores its PLE n-gram table as NVFP4: a ModelOpt quantized_layers entry for the
+    ngram_embedding with quant_algo NVFP4, or ple_embedding_dtype "nvfp4" on the text config. The
+    pinned-host offload gathers bf16 / fp8 rows only, so its default is off for such a table."""
+    text_config = getattr(hf_config, "text_config", hf_config)
+    if getattr(text_config, "ple_embedding_dtype", None) == "nvfp4":
+        return True
+    q = getattr(hf_config, "quantization_config", None) or {}
+    if not isinstance(q, dict):
+        q = q.to_dict() if hasattr(q, "to_dict") else {}
+    layers = q.get("quantized_layers") or {}
+    return any(
+        "ngram_embedding" in name
+        and str((info or {}).get("quant_algo", "")).upper() == "NVFP4"
+        for name, info in layers.items()
+    )
+
 @_register_for("Qwen4ExpForConditionalGeneration")
 def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     """Compressed QSA must own ``page_size`` here,
@@ -45,6 +63,7 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["ple_offload_embedding"] = (
             get_platform().is_cuda
             and model_config_of(server_args).dtype == torch.bfloat16
+            and not hf_ple_table_is_nvfp4(hf_config)
         )
 
     text_config = getattr(hf_config, "text_config", hf_config)
