@@ -9,7 +9,8 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-_SUPPORTED_HEAD_TOPOLOGIES = frozenset({(12, 1), (24, 2)})
+# Query heads per rank over KV heads per rank: TP1 24Q/2KV, TP2 12Q/1KV, TP4 6Q/1KV (KV replicated).
+_SUPPORTED_HEAD_TOPOLOGIES = frozenset({(6, 1), (12, 1), (24, 2)})
 # Largest batch qualified by the extended GB10 baseline sweep.
 _MAX_BATCH = 128
 _MAX_SELECTED_KV = 2055
