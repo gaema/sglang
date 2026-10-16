@@ -2361,6 +2361,22 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
         return model_output
 
 
+
+def _modelopt_mxfp8_scale_name(name, loaded_weight, params_dict, stacked_params_mapping):
+    """ModelOpt MXFP8 stores the UE8M0 block scale as `<layer>.weight_scale` (uint8); the block-FP8
+    linear method keeps it as `weight_scale_inv`. Return the `_inv` name when the model holds that
+    parameter, directly or through a stacked (fused) mapping; any other name is returned as is
+    (NVFP4 scales are float8, not uint8, and keep `weight_scale`)."""
+    if not name.endswith(".weight_scale") or loaded_weight.dtype != torch.uint8:
+        return name
+    inv = name + "_inv"
+    targets = [inv] + [
+        inv.replace(weight_name, param_name)
+        for param_name, weight_name, _ in stacked_params_mapping
+        if weight_name in inv
+    ]
+    return inv if any(t in params_dict for t in targets) else name
+
 class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
@@ -2693,6 +2709,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(".k_proj.k_scale", ".attn.k_scale")
             elif name.endswith(".v_proj.v_scale"):
                 name = name.replace(".v_proj.v_scale", ".attn.v_scale")
+            name = _modelopt_mxfp8_scale_name(
+                name, loaded_weight, params_dict, stacked_params_mapping
+            )
 
             layer_id = get_layer_id(name)
             if layer_id is not None and (
