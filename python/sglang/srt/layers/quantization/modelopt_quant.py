@@ -54,6 +54,7 @@ from sglang.srt.layers.quantization.marlin_utils_fp4 import (
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
 )
+from sglang.srt.layers.quantization.nvfp4_csf import CSF_SCALE_ENCODING
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
@@ -881,6 +882,22 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             raise ValueError(
                 "MIXED_PRECISION quantization requires a non-empty quantized_layers map."
             )
+        # The loader decodes NVFP4 "csf" scale pairs into the standard
+        # weight_scale (nvfp4_csf.py); any other encoding would load scale
+        # bytes no method knows how to read, so refuse it here.
+        for layer_name, layer_info in quantized_layers.items():
+            encoding = layer_info.get("weight_scale_encoding")
+            if encoding is None:
+                continue
+            if (
+                encoding != CSF_SCALE_ENCODING
+                or layer_info.get("quant_algo", "").upper() != "NVFP4"
+            ):
+                raise ValueError(
+                    f"Unsupported weight_scale_encoding {encoding!r} for "
+                    f"{layer_info.get('quant_algo')} layer {layer_name}; only "
+                    f"{CSF_SCALE_ENCODING!r} on NVFP4 layers is supported."
+                )
 
         group_size = None
         for layer_info in quantized_layers.values():

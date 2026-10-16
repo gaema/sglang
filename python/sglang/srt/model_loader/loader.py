@@ -91,6 +91,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.nvfp4_csf import decode_nvfp4_csf_weights
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
@@ -708,6 +709,10 @@ class DefaultModelLoader(BaseModelLoader):
                 )
             else:
                 weights_iterator = pt_weights_iterator(hf_weights_files)
+
+        # NVFP4 "csf" scale pairs become the standard weight_scale here, so no
+        # quant method needs to know the encoding; other tensors pass through.
+        weights_iterator = decode_nvfp4_csf_weights(weights_iterator)
 
         if self.load_config.draft_model_idx is not None:
             return self._filter_mtp_weights(
