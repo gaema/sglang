@@ -477,6 +477,31 @@ class Fp8Config(QuantizationConfig):
             )
 
 
+
+#: FlashInfer's MXFP8 dense GEMMs (CUTLASS, CuTe-DSL) need n >= 128 and k >= 128.
+FLASHINFER_MXFP8_MIN_NK = 128
+
+
+def mxfp8_below_flashinfer_min(shape, backend) -> bool:
+    """True when the MXFP8 dense backend is FlashInfer CUTLASS / CuTe-DSL and the weight
+    [n, k] is below the size those GEMMs accept."""
+    if backend is None or not (
+        backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl()
+    ):
+        return False
+    n, k = shape
+    return n < FLASHINFER_MXFP8_MIN_NK or k < FLASHINFER_MXFP8_MIN_NK
+
+
+def dequantize_mxfp8_weight(
+    weight: torch.Tensor, scale_u8: torch.Tensor, dtype: torch.dtype = torch.bfloat16
+) -> torch.Tensor:
+    """MXFP8 weight (e4m3 [n, k], UE8M0 uint8 scales [n, ceil(k / 32)]) to `dtype` [n, k]."""
+    n, k = weight.shape
+    scale = torch.exp2(scale_u8[:, : (k + 31) // 32].float() - 127.0)
+    scale = scale.repeat_interleave(32, dim=1)[:, :k]
+    return (weight.float() * scale).to(dtype)
+
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
 
@@ -770,6 +795,13 @@ class Fp8LinearMethod(LinearMethodBase):
             # Keep parameter object to preserve weight_loader attrs for hot reload.
             layer.weight_scale_inv.requires_grad_(False)
             layer.weight_scale_inv.format_ue8m0 = True
+            if mxfp8_below_flashinfer_min(layer.weight.shape, self.mxfp8_dense_backend):
+                # FlashInfer's MXFP8 GEMMs refuse this shape; the layer is small, so
+                # it is served from a bf16 copy (exact: e4m3 times a power of two).
+                layer.mxfp8_dequant_weight = dequantize_mxfp8_weight(
+                    layer.weight.data, layer.weight_scale_inv.data
+                )
+                return
             self._process_mxfp8_linear_weight_scale(layer)
             return
         elif _is_npu and is_npu_arch35():
@@ -1185,6 +1217,9 @@ class Fp8LinearMethod(LinearMethodBase):
         elif self.block_fp8_as_mxfp8 and isinstance(x, tuple):
             # A legacy (q, scale) block-fp8 pair keeps the block kernel.
             mxfp8_view = False
+        dequant_weight = getattr(layer, "mxfp8_dequant_weight", None)
+        if dequant_weight is not None and not isinstance(x, (tuple, Mxfp8SwizzledInput)):
+            return F.linear(x, dequant_weight, bias)
         if mxfp8_view:
             backend = self.mxfp8_dense_backend
             extra_kwargs = {}
