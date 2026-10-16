@@ -2497,18 +2497,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
-        # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
-        # during process_weights_after_loading, so skip the expensive
-        # swizzle+allocate here to avoid GPU memory fragmentation
-        if (
-            self.enable_flashinfer_trtllm_moe
-            or get_moe_runner_backend().is_flashinfer_megamoe()
-        ):
-            layer.w13_blockscale_swizzled = None
-        else:
-            layer.w13_blockscale_swizzled = Parameter(
-                swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
-            )
+        # process_weights_after_loading derives the swizzled block scales from
+        # the loaded weight_scale and aliases them into its storage (or binds a
+        # new Parameter when the shapes differ), so a placeholder here would only
+        # double the block-scale memory at load. The Marlin and MegaMoE-a2a
+        # paths return before that step and keep the placeholder they had.
+        keep_swizzled_placeholder = (
+            get_moe_runner_backend().is_marlin() or get_moe_a2a_backend().is_megamoe()
+        )
+        layer.w13_blockscale_swizzled = (
+            Parameter(swizzle_blockscale(layer.w13_weight_scale), requires_grad=False)
+            if keep_swizzled_placeholder
+            else None
+        )
 
         w2_weight_scale = ModelWeightParameter(
             data=torch.empty(
@@ -2523,15 +2524,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        if (
-            self.enable_flashinfer_trtllm_moe
-            or get_moe_runner_backend().is_flashinfer_megamoe()
-        ):
-            layer.w2_blockscale_swizzled = None
-        else:
-            layer.w2_blockscale_swizzled = Parameter(
-                swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
-            )
+        layer.w2_blockscale_swizzled = (
+            Parameter(swizzle_blockscale(layer.w2_weight_scale), requires_grad=False)
+            if keep_swizzled_placeholder
+            else None
+        )
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
