@@ -48,6 +48,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
+    ModelOptNvFp4EmbeddingMethod,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -101,6 +102,27 @@ def _ple_table_is_fp8(
     if isinstance(quant_config, ModelOptMixedPrecisionConfig):
         return quant_config.resolve_quant_algo(prefix) == "FP8"
     return False
+
+
+def _ple_table_is_nvfp4(
+    config: Qwen4ExpTextConfig,
+    quant_config: Optional[QuantizationConfig],
+    prefix: str,
+) -> bool:
+    """NVFP4 PLE shards (packed E2M1 rows + per-16 E4M3 scales + one global
+    scale): a ModelOpt MIXED_PRECISION entry for the ngram table
+    (nvidia/Qwen3.8-Flash-Next-FP4-Local). The table is gathered through
+    ModelOptNvFp4EmbeddingMethod, which applies every scale itself."""
+    declared = config.ple_embedding_dtype == "nvfp4"
+    resolved = isinstance(
+        quant_config, ModelOptMixedPrecisionConfig
+    ) and quant_config.resolve_quant_algo(prefix) == "NVFP4"
+    if declared and not resolved:
+        raise ValueError(
+            'ple_embedding_dtype="nvfp4" needs a ModelOpt MIXED_PRECISION '
+            f"quant config with an NVFP4 entry for {prefix}"
+        )
+    return resolved
 
 
 def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -784,6 +806,32 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         ngram_prefix = f"{prefix}.ngram_embedding" if prefix else "ngram_embedding"
         offload_embedding = bool(config.ple_offload_embedding)
+        # An NVFP4 table dequantizes on gather with all of its scales, so it
+        # carries no per-tensor weight_scale for the caller to multiply in.
+        self.scale_in_gather = _ple_table_is_nvfp4(config, quant_config, ngram_prefix)
+        if self.scale_in_gather:
+            if offload_embedding:
+                raise NotImplementedError(
+                    "PLE embedding offload does not support an NVFP4 table"
+                )
+            ngram_embedding = VocabParallelEmbedding(
+                padded_vocab_size,
+                self.head_dim_per_ngram,
+                params_dtype=torch.bfloat16,
+                output_dtype=torch.bfloat16,
+                use_attn_tp_group=self.use_attn_tp_ngram,
+                quant_config=quant_config,
+                prefix=ngram_prefix,
+            )
+            if not isinstance(
+                ngram_embedding.quant_method, ModelOptNvFp4EmbeddingMethod
+            ):
+                raise ValueError(
+                    f"NVFP4 PLE table {ngram_prefix} resolved to "
+                    f"{type(ngram_embedding.quant_method).__name__}"
+                )
+            self.ngram_embedding = ngram_embedding
+            return
         # Offload only needs this embedding's metadata: build it on meta so the
         # shard is never allocated on the device.
         with torch.device("meta") if offload_embedding else nullcontext():
@@ -861,7 +909,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ngram_ids, forward_batch, physical_tokens
         )
         embeddings = self.ngram_embedding(lookup_ids)
-        embeddings = embeddings * self.ngram_embedding.weight_scale
+        if not self.scale_in_gather:
+            embeddings = embeddings * self.ngram_embedding.weight_scale
         return self._finish_embedding_lookup(
             embeddings, semantic_tokens, forward_batch, physical_tokens
         )
@@ -1558,7 +1607,8 @@ class Qwen4ExpPLELayer(nn.Module):
         else:
             torch.cuda.current_stream().wait_stream(self._prefetch_stream)
         embeddings = self.ple_embedding.ngram_embedding.reduce(embeddings)
-        embeddings = embeddings * self.ple_embedding.ngram_embedding.weight_scale
+        if not self.ple_embedding.scale_in_gather:
+            embeddings = embeddings * self.ple_embedding.ngram_embedding.weight_scale
         embeddings = self.ple_embedding._finish_embedding_lookup(
             embeddings,
             semantic_tokens,
@@ -2480,8 +2530,13 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             return True
 
         def copy_ple_rows_to_tp_embedding(
-            emb, loaded_weight: torch.Tensor, row_start: int, row_end: int
+            emb,
+            loaded_weight: torch.Tensor,
+            row_start: int,
+            row_end: int,
+            param: Optional[torch.Tensor] = None,
         ) -> None:
+            param = emb.weight if param is None else param
             tp_start = emb.shard_indices.org_vocab_start_index
             tp_end = emb.shard_indices.org_vocab_end_index
             ov_start = max(row_start, tp_start)
@@ -2490,18 +2545,53 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 local_start = ov_start - tp_start
                 src_start = ov_start - row_start
                 n_rows = ov_end - ov_start
-                emb.weight.data[local_start : local_start + n_rows].copy_(
+                param.data[local_start : local_start + n_rows].copy_(
                     loaded_weight[src_start : src_start + n_rows].to(
-                        device=emb.weight.device, dtype=emb.weight.dtype
+                        device=param.device, dtype=param.dtype
                     )
                 )
+
+        def ple_shard_rows(emb, shard_idx: int, actual_rows: int) -> Tuple[int, int]:
+            shard_size = (
+                emb.org_vocab_size + ple_num_sync_shards - 1
+            ) // ple_num_sync_shards
+            shard_start = shard_idx * shard_size
+            return shard_start, shard_start + actual_rows
+
+        def load_qwen4_exp_nvfp4_ple_shard(
+            emb, mod_prefix: str, shard_idx: int, kind: str, loaded_weight
+        ) -> bool:
+            # Packed E2M1 rows and their per-16 E4M3 scales are copied byte for
+            # byte; a dtype or width mismatch would be silently wrong values.
+            param = emb.weight if kind == "weight" else emb.weight_scale
+            if (
+                loaded_weight.dtype != param.dtype
+                or loaded_weight.dim() != 2
+                or loaded_weight.shape[1] != param.shape[1]
+            ):
+                raise ValueError(
+                    f"NVFP4 PLE shard {mod_prefix}.ngram_embedding.shard_"
+                    f"{shard_idx}.{kind}: got {loaded_weight.dtype} "
+                    f"{tuple(loaded_weight.shape)}, table holds {param.dtype} "
+                    f"[*, {param.shape[1]}]"
+                )
+            row_start, row_end = ple_shard_rows(
+                emb, shard_idx, loaded_weight.shape[0]
+            )
+            copy_ple_rows_to_tp_embedding(
+                emb, loaded_weight, row_start, row_end, param=param
+            )
+            loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.{kind}")
+            return True
 
         def load_qwen4_exp_ple_shard(name: str, loaded_weight: torch.Tensor) -> bool:
             if ".ngram_embedding.shard_" not in name:
                 return False
             import re
 
-            match = re.search(r"\.ngram_embedding\.shard_(\d+)\.weight$", name)
+            match = re.search(
+                r"\.ngram_embedding\.shard_(\d+)\.(weight|weight_scale)$", name
+            )
             if not match:
                 return False
             shard_idx = int(match.group(1))
@@ -2510,6 +2600,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if ple_mod is None:
                 return False
             emb = ple_mod.ngram_embedding
+            if ple_mod.scale_in_gather:
+                return load_qwen4_exp_nvfp4_ple_shard(
+                    emb, mod_prefix, shard_idx, match.group(2), loaded_weight
+                )
+            if match.group(2) != "weight":
+                raise ValueError(
+                    f"per-row PLE scales need an NVFP4 table, got {name}"
+                )
             if (
                 loaded_weight.dtype == torch.float8_e4m3fn
                 and emb.weight.dtype != torch.float8_e4m3fn
@@ -2551,12 +2649,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         "downcasting is lossy",
                         loaded_weight.dtype,
                     )
-            shard_size = (
-                emb.org_vocab_size + ple_num_sync_shards - 1
-            ) // ple_num_sync_shards
-            shard_start = shard_idx * shard_size
-            actual_rows = loaded_weight.shape[0]
-            shard_end = shard_start + actual_rows
+            shard_start, shard_end = ple_shard_rows(
+                emb, shard_idx, loaded_weight.shape[0]
+            )
             copy_ple_rows_to_tp_embedding(emb, loaded_weight, shard_start, shard_end)
             loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
             return True
