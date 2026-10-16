@@ -377,6 +377,21 @@ def _validate_default_loader_extra_config(
         )
 
 
+
+def indexed_safetensors_files(hf_folder: str, index_file: str, allow_patterns: List[str]) -> List[str]:
+    """The shards a local safetensors index names, when they live below the model root (a checkpoint
+    that keeps them in a subdirectory, e.g. tensors/). Only files present on disk are returned; an
+    index naming none, a missing index, or no safetensors pattern returns []."""
+    index_path = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_path) or not any(
+        p.endswith(".safetensors") for p in allow_patterns
+    ):
+        return []
+    with open(index_path) as f:
+        rel = sorted(set(json.load(f).get("weight_map", {}).values()))
+    paths = [os.path.join(hf_folder, r) for r in rel if r.endswith(".safetensors")]
+    return [p for p in paths if os.path.isfile(p)]
+
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
 
@@ -541,6 +556,9 @@ class DefaultModelLoader(BaseModelLoader):
                 if pattern.endswith(".safetensors"):
                     use_safetensors = True
                 break
+        if not hf_weights_files and is_local:
+            hf_weights_files = indexed_safetensors_files(hf_folder, index_file, allow_patterns)
+            use_safetensors = use_safetensors or bool(hf_weights_files)
 
         if use_safetensors:
             # For models like Mistral-7B-Instruct-v0.3
