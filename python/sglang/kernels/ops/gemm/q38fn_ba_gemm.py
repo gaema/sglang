@@ -27,8 +27,15 @@ def _q38fn_ba_gemm_kernel(x_ptr, w_ptr, o_ptr, M, N, K, sxm, swn, som,
              mask=mm[:, None] & mn[None, :])
 
 
+def q38fn_ba_weight(layer):
+    """The bf16 [n, k] weight the small-M GEMM reads: the layer's own weight, or the exact bf16 copy an
+    MXFP8 layer below FlashInfer's minimum shape is served from."""
+    w = getattr(layer, "mxfp8_dequant_weight", None)
+    return w if w is not None else getattr(layer, "weight", None)
+
+
 def q38fn_ba_gemm_ok(x: torch.Tensor, layer) -> bool:
-    w = getattr(layer, "weight", None)
+    w = q38fn_ba_weight(layer)
     return (
         w is not None
         and getattr(layer, "bias", None) is None
