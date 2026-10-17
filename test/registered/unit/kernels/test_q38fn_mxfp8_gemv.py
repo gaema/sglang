@@ -5,7 +5,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.gemm.q38fn_mxfp8_gemv import q38fn_mxfp8_gemv, q38fn_mxfp8_gemv_ok
+from sglang.kernels.ops.gemm.q38fn_mxfp8_gemv import MAX_M, q38fn_mxfp8_gemv, q38fn_mxfp8_gemv_ok
 from sglang.srt.layers.quantization.fp8 import dequantize_mxfp8_weight
 
 SHAPES = ((3072, 2560), (2560, 3072), (6144, 2560), (2560, 1024), (512, 2560))
@@ -24,7 +24,7 @@ class TestQ38fnMxfp8Gemv(unittest.TestCase):
         for i, (n, k) in enumerate(SHAPES):
             w, s = _layer(n, k, i)
             wd = dequantize_mxfp8_weight(w, s)
-            for m in (1, 3, 6, 9, 16, 32):
+            for m in (m for m in (1, 3, 6, 9, 12, 16, 32) if m <= MAX_M):
                 x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
                 self.assertTrue(q38fn_mxfp8_gemv_ok(x, w, s))
                 got = q38fn_mxfp8_gemv(x, w, s).float()
@@ -40,7 +40,7 @@ class TestQ38fnMxfp8Gemv(unittest.TestCase):
 
     def test_refuses(self):
         w, s = _layer(512, 2560, 3)
-        self.assertFalse(q38fn_mxfp8_gemv_ok(torch.randn(33, 2560, device="cuda", dtype=torch.bfloat16), w, s))
+        self.assertFalse(q38fn_mxfp8_gemv_ok(torch.randn(MAX_M + 1, 2560, device="cuda", dtype=torch.bfloat16), w, s))
         self.assertFalse(q38fn_mxfp8_gemv_ok(torch.randn(4, 2560, device="cuda", dtype=torch.float16), w, s))
         self.assertFalse(q38fn_mxfp8_gemv_ok(torch.randn(4, 2560, device="cuda", dtype=torch.bfloat16),
                                              w.to(torch.bfloat16), s))
