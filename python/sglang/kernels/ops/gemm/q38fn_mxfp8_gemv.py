@@ -29,11 +29,14 @@ def _q38fn_mxfp8_gemv_kernel(x_ptr, w_ptr, s_ptr, part_ptr, M, N, K, sxm, swn, s
     for k0 in range(k_lo, k_lo + k_per, BK):
         k = k0 + tl.arange(0, BK)
         mk = k < K
+        kg = k0 // 32 + tl.arange(0, BK // 32)
         x = tl.load(x_ptr + om[:, None] * sxm + k[None, :], mask=mm[:, None] & mk[None, :], other=0.0)
         w = tl.load(w_ptr + on[:, None] * swn + k[None, :], mask=mn[:, None] & mk[None, :], other=0.0)
-        e = tl.load(s_ptr + on[:, None] * ssn + (k[None, :] // 32), mask=mn[:, None] & mk[None, :], other=127)
-        scale = tl.exp2(e.to(tl.float32) - 127.0)
-        wd = (w.to(tl.float32) * scale).to(tl.bfloat16)
+        # one UE8M0 scale per 32 values: 2^(e - 127) built from its exponent bits, applied in bf16 (exact for a
+        # power of two) after a direct e4m3 -> bf16 convert
+        e = tl.load(s_ptr + on[:, None] * ssn + kg[None, :], mask=mn[:, None] & (kg[None, :] * 32 < K), other=127)
+        scale = (e.to(tl.int32) << 23).to(tl.float32, bitcast=True).to(tl.bfloat16)
+        wd = tl.reshape(tl.reshape(w.to(tl.bfloat16), (BN, BK // 32, 32)) * scale[:, :, None], (BN, BK))
         acc = tl.dot(x, tl.trans(wd), acc)
     tl.store(part_ptr + pk * spk + om[:, None] * spm + on[None, :], acc, mask=mm[:, None] & mn[None, :])
 
@@ -61,9 +64,11 @@ def q38fn_mxfp8_gemv_ok(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
 
 
 def _split_k(n: int, k: int, bn: int, bk: int, sms: int) -> int:
-    tiles = triton.cdiv(n, bn)
+    """About two waves of programs: the largest power of two <= ceil(2 * SMs / N-tiles) and <= 8 that leaves each
+    split at least one K tile."""
+    want = triton.cdiv(2 * sms, triton.cdiv(n, bn))
     sk = 1
-    while sk < 8 and tiles * sk * 2 <= 2 * sms and triton.cdiv(triton.cdiv(k, bk), sk * 2) >= 1:
+    while sk * 2 <= min(want, 8) and triton.cdiv(k, bk) >= sk * 2:
         sk *= 2
     return sk
 
@@ -72,7 +77,7 @@ _SMS = {}
 
 
 def q38fn_mxfp8_gemv(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor,
-                     bias=None, bn: int = 64, bk: int = 128) -> torch.Tensor:
+                     bias=None, bn: int = 32, bk: int = 128) -> torch.Tensor:
     lead = x.shape[:-1]
     x2 = x.reshape(-1, x.shape[-1])
     if not x2.is_contiguous():
