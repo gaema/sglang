@@ -1347,6 +1347,10 @@ class ModelRunner:
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
+        # _q38fn_prebuild: the FP8 lm_head / HC-mix copies exist before graph capture.
+        from sglang.kernels.ops.gemm.q38fn_prebuild import q38fn_prebuild_fp8_copies
+
+        q38fn_prebuild_fp8_copies(self.model)
 
     def maybe_init_dwdp(self):
         if self.is_draft_worker:
