@@ -380,8 +380,9 @@ def _validate_default_loader_extra_config(
 
 def indexed_safetensors_files(hf_folder: str, index_file: str, allow_patterns: List[str]) -> List[str]:
     """The shards a local safetensors index names, when they live below the model root (a checkpoint
-    that keeps them in a subdirectory, e.g. tensors/). Only files present on disk are returned; an
-    index naming none, a missing index, or no safetensors pattern returns []."""
+    that keeps them in a subdirectory, e.g. tensors/). An index naming none present, a missing index, or no
+    safetensors pattern returns []; an index whose shards are only partly present raises (a partial copy would
+    otherwise load with the missing shards' parameters uninitialized)."""
     index_path = os.path.join(hf_folder, index_file)
     if not os.path.isfile(index_path) or not any(
         p.endswith(".safetensors") for p in allow_patterns
@@ -390,7 +391,13 @@ def indexed_safetensors_files(hf_folder: str, index_file: str, allow_patterns: L
     with open(index_path) as f:
         rel = sorted(set(json.load(f).get("weight_map", {}).values()))
     paths = [os.path.join(hf_folder, r) for r in rel if r.endswith(".safetensors")]
-    return [p for p in paths if os.path.isfile(p)]
+    present = [p for p in paths if os.path.isfile(p)]
+    if present and len(present) != len(paths):
+        missing = sorted(set(paths) - set(present))
+        raise FileNotFoundError(
+            f"{index_path} names {len(paths)} shards but {len(missing)} are missing, e.g. {missing[:3]}"
+        )
+    return present
 
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""

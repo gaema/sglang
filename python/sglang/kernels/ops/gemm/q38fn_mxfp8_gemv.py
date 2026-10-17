@@ -16,7 +16,9 @@ import triton.language as tl
 # Row cap (SGLANG_Q38FN_MXFP8_GEMV_MAX_M, default 12). The served arm at a 32-row cap ran its MTP draft steps
 # (32 rows at 32 running) on this kernel and decoded c32 slower than the CUTLASS tile (median ITL 34.85-37.53 vs
 # 32.66-34.11 ms); 12 keeps verify up to 4 running and drafts up to 12 running.
-MAX_M = int(os.environ.get("SGLANG_Q38FN_MXFP8_GEMV_MAX_M", "12"))
+# The kernel tiles at most 32 rows (BM <= 32, no M-tile program axis), so the cap is clamped to 32.
+KERNEL_MAX_M = 32
+MAX_M = min(int(os.environ.get("SGLANG_Q38FN_MXFP8_GEMV_MAX_M", "12")), KERNEL_MAX_M)
 
 
 @triton.jit

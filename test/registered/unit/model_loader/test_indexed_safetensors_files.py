@@ -39,6 +39,12 @@ class TestIndexedSafetensorsFiles(CustomTestCase):
             got = indexed_safetensors_files(d, INDEX, ["*.safetensors"])
             self.assertEqual(got, [os.path.join(d, n) for n in names])
 
+    def test_partial_copy_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            _layout(d, ["tensors/a.safetensors"], ["tensors/a.safetensors", "tensors/b.safetensors"])
+            with self.assertRaises(FileNotFoundError):
+                indexed_safetensors_files(d, INDEX, ["*.safetensors"])
+
     def test_nothing_without_an_index_a_present_shard_or_a_safetensors_pattern(self):
         with tempfile.TemporaryDirectory() as d:
             _layout(d, ["tensors/a.safetensors"], None)

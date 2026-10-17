@@ -1335,6 +1335,10 @@ class Qwen4ExpPinnedHostNvFp4Embedding(Qwen4ExpPinnedHostEmbedding):
             param = nn.Parameter(host, requires_grad=False)
             for key, value in vars(src).items():
                 setattr(param, key, value)
+            # ModelWeightParameter keeps these behind properties, which vars() does not copy
+            param.weight_loader = self.weight_loader
+            param.output_dim = getattr(src, "output_dim", 0)
+            param.input_dim = getattr(src, "input_dim", 1)
             self.register_parameter(pname, param)
         self._file_prefetcher = None
         self._file_rss_trimmer = None

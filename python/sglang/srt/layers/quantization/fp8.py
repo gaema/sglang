@@ -1224,6 +1224,11 @@ class Fp8LinearMethod(LinearMethodBase):
             self.use_mxfp8
             and isinstance(x, torch.Tensor)
             and __import__("os").environ.get("SGLANG_Q38FN_MXFP8_GEMV", "0") == "1"
+            # row-major weight and unswizzled scales only: trtllm shuffles layer.weight in place
+            and (
+                self.mxfp8_dense_backend.is_flashinfer_cutlass()
+                or self.mxfp8_dense_backend.is_flashinfer_cutedsl()
+            )
         ):
             from sglang.kernels.ops.gemm.q38fn_mxfp8_gemv import (
                 q38fn_mxfp8_gemv,

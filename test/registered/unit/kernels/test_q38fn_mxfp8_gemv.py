@@ -8,7 +8,10 @@ import torch
 from sglang.kernels.ops.gemm.q38fn_mxfp8_gemv import MAX_M, q38fn_mxfp8_gemv, q38fn_mxfp8_gemv_ok
 from sglang.srt.layers.quantization.fp8 import dequantize_mxfp8_weight
 
-SHAPES = ((3072, 2560), (2560, 3072), (6144, 2560), (2560, 1024), (512, 2560))
+# (2560, 320), (512, 96), (160, 4064): K not a multiple of BK = 128, so K tails, the scale-tail mask and
+# all-padding split-K parts run
+SHAPES = ((3072, 2560), (2560, 3072), (6144, 2560), (2560, 1024), (512, 2560), (2560, 320), (512, 96),
+          (160, 4064))
 
 
 def _layer(n, k, seed):
@@ -44,6 +47,11 @@ class TestQ38fnMxfp8Gemv(unittest.TestCase):
         self.assertFalse(q38fn_mxfp8_gemv_ok(torch.randn(4, 2560, device="cuda", dtype=torch.float16), w, s))
         self.assertFalse(q38fn_mxfp8_gemv_ok(torch.randn(4, 2560, device="cuda", dtype=torch.bfloat16),
                                              w.to(torch.bfloat16), s))
+
+    def test_cap_is_clamped_to_the_kernel(self):
+        from sglang.kernels.ops.gemm import q38fn_mxfp8_gemv as mod
+
+        self.assertLessEqual(mod.MAX_M, mod.KERNEL_MAX_M)
 
     def test_cuda_graph_replay(self):
         w, s = _layer(2560, 3072, 5)
