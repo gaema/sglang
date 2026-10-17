@@ -7,11 +7,16 @@
 # and are summed in a fixed order, so the output is run-to-run repeatable and matches F.linear on the dequantized
 # weight up to fp32 summation order. The activation is never quantized, so it differs from the W8A8 CUTLASS path by
 # that quantization error.
+import os
+
 import torch
 import triton
 import triton.language as tl
 
-MAX_M = 32
+# Row cap (SGLANG_Q38FN_MXFP8_GEMV_MAX_M, default 12). The served arm at a 32-row cap ran its MTP draft steps
+# (32 rows at 32 running) on this kernel and decoded c32 slower than the CUTLASS tile (median ITL 34.85-37.53 vs
+# 32.66-34.11 ms); 12 keeps verify up to 4 running and drafts up to 12 running.
+MAX_M = int(os.environ.get("SGLANG_Q38FN_MXFP8_GEMV_MAX_M", "12"))
 
 
 @triton.jit
