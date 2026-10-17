@@ -285,6 +285,15 @@ def _matmul_persistent_deepgemm(
     return out
 
 
+import logging as _logging
+
+logger = _logging.getLogger(__name__)
+
+# (N, K) shapes DeepGEMM could not build a kernel for. Keyed by the weight shape only, so a shape takes the same
+# kernel at every batch size and the result stays batch-invariant.
+_DEEPGEMM_UNSUPPORTED_NK: set[tuple[int, int]] = set()
+
+
 def matmul_persistent(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -308,6 +317,7 @@ def matmul_persistent(
         and b.transpose(0, 1).is_contiguous()
         and N >= MIN_DEEPGEMM_DIM
         and deepgemm_tma_aligned
+        and (N, K) not in _DEEPGEMM_UNSUPPORTED_NK
     ):
         if _ENABLE_MM_COMPARISON_TEST:
             out_triton = _matmul_persistent_triton(
@@ -328,7 +338,13 @@ def matmul_persistent(
             # print(f"{a=} {b=} {bias=} {out_triton=} {out_deepgemm=}")
             return out_deepgemm
 
-        return _matmul_persistent_deepgemm(a=a, b=b, bias=bias, out_dtype=out_dtype)
+        try:
+            return _matmul_persistent_deepgemm(a=a, b=b, bias=bias, out_dtype=out_dtype)
+        except RuntimeError as e:
+            # e.g. SM120 bf16: "kNTilesPerWarp must be even" for N=24. The Triton persistent kernel below is
+            # batch-invariant too; remember the shape so every batch size takes it.
+            _DEEPGEMM_UNSUPPORTED_NK.add((N, K))
+            logger.warning(f"matmul_persistent: DeepGEMM cannot build N={N} K={K}; using the Triton kernel for this shape ({e})")
 
     if _ENABLE_MM_FALLBACK_VARIANT and out_dtype == a.dtype:
         out = torch.einsum("ik,kj->ij", a, b)
