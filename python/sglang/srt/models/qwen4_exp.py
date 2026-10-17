@@ -47,6 +47,7 @@ from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scat
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
+    _E2M1_LUT,
     ModelOptMixedPrecisionConfig,
     ModelOptNvFp4EmbeddingMethod,
 )
@@ -810,25 +811,29 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         # carries no per-tensor weight_scale for the caller to multiply in.
         self.scale_in_gather = _ple_table_is_nvfp4(config, quant_config, ngram_prefix)
         if self.scale_in_gather:
-            if offload_embedding:
-                raise NotImplementedError(
-                    "PLE embedding offload does not support an NVFP4 table"
+            # Offload builds the device module on meta: only its metadata is used,
+            # and the packed rows + scales go to pinned host tables.
+            with torch.device("meta") if offload_embedding else nullcontext():
+                ngram_embedding = VocabParallelEmbedding(
+                    padded_vocab_size,
+                    self.head_dim_per_ngram,
+                    params_dtype=torch.bfloat16,
+                    output_dtype=torch.bfloat16,
+                    use_attn_tp_group=self.use_attn_tp_ngram,
+                    quant_config=quant_config,
+                    prefix=ngram_prefix,
                 )
-            ngram_embedding = VocabParallelEmbedding(
-                padded_vocab_size,
-                self.head_dim_per_ngram,
-                params_dtype=torch.bfloat16,
-                output_dtype=torch.bfloat16,
-                use_attn_tp_group=self.use_attn_tp_ngram,
-                quant_config=quant_config,
-                prefix=ngram_prefix,
-            )
             if not isinstance(
                 ngram_embedding.quant_method, ModelOptNvFp4EmbeddingMethod
             ):
                 raise ValueError(
                     f"NVFP4 PLE table {ngram_prefix} resolved to "
                     f"{type(ngram_embedding.quant_method).__name__}"
+                )
+            if offload_embedding:
+                ngram_embedding = Qwen4ExpPinnedHostNvFp4Embedding(
+                    ngram_embedding,
+                    backend=getattr(config, "ple_offload_backend", "pinned"),
                 )
             self.ngram_embedding = ngram_embedding
             return
@@ -1254,6 +1259,124 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.reduce(self.gather(input_ids))
+
+
+@triton.jit
+def _gather_ple_nvfp4_from_pinned_kernel(
+    packed_ptr,
+    scale_ptr,
+    scale_2_ptr,
+    lut_ptr,
+    ids_ptr,
+    output_ptr,
+    embedding_dim,
+    tp_vocab_start,
+    tp_vocab_end,
+    GROUP: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """One NVFP4 PLE row from host memory: packed E2M1 bytes (low nibble first) and per-GROUP E4M3 scales.
+    Same fp32 arithmetic as ModelOptNvFp4EmbeddingMethod.embedding: (+/-lut[code]) * (scale * scale_2) -> bf16."""
+    row_id = tl.program_id(0)
+    global_idx = tl.load(ids_ptr + row_id)
+    in_range = (global_idx >= tp_vocab_start) & (global_idx < tp_vocab_end)
+    local_idx = tl.where(in_range, global_idx - tp_vocab_start, 0).to(tl.int64)
+    d = tl.arange(0, BLOCK_D)
+    mask = d < embedding_dim
+    packed_ptr = packed_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
+    scale_ptr = scale_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+    byte = tl.load(packed_ptr + local_idx * (embedding_dim // 2) + d // 2, mask=mask, other=0)
+    code = (byte.to(tl.int32) >> ((d % 2) * 4)) & 0xF
+    mag = tl.load(lut_ptr + (code & 0x7), mask=mask, other=0.0)
+    # times -1.0, not unary minus: it keeps the sign of a negative-zero code (-0.0), as torch's `-mag` does
+    vals = tl.where((code & 0x8) != 0, mag * -1.0, mag)
+    scale = tl.load(
+        scale_ptr + local_idx * (embedding_dim // GROUP) + d // GROUP, mask=mask, other=0.0
+    ).to(tl.float32)
+    eff = scale * tl.load(scale_2_ptr)
+    out = (vals * eff).to(tl.bfloat16)
+    tl.store(
+        output_ptr + row_id * embedding_dim + d,
+        tl.where(in_range, out, 0.0),
+        mask=mask,
+    )
+
+
+class Qwen4ExpPinnedHostNvFp4Embedding(Qwen4ExpPinnedHostEmbedding):
+    """NVFP4 PLE table read from pinned host memory.
+
+    The packed E2M1 rows and their per-16 E4M3 scales live on the host; the global scale and the E2M1 value
+    table stay on the device. Gathers dequantize to bf16 with the same arithmetic as the on-device
+    ModelOptNvFp4EmbeddingMethod, so the rows are bit-identical. The source embedding is built on the meta
+    device; only its metadata is used.
+    """
+
+    def __init__(self, embedding: VocabParallelEmbedding, *, backend: str = "pinned") -> None:
+        nn.Module.__init__(self)
+        if backend != "pinned":
+            raise NotImplementedError("NVFP4 PLE offload supports the pinned backend only")
+        if not isinstance(embedding.quant_method, ModelOptNvFp4EmbeddingMethod):
+            raise TypeError(
+                "NVFP4 PLE offload needs a ModelOpt NVFP4 embedding, got "
+                f"{type(embedding.quant_method).__name__}"
+            )
+        if embedding.num_added_embeddings:
+            raise NotImplementedError("PLE embedding offload does not support added vocabulary rows")
+        for name in self._COPIED_ATTRIBUTES:
+            setattr(self, name, getattr(embedding, name))
+        self.quant_method = None
+        self.group_size = embedding.quant_method.quant_config.group_size
+        tag = f"rows{self.shard_indices.org_vocab_start_index}-{self.shard_indices.org_vocab_end_index}"
+        for pname in ("weight", "weight_scale"):
+            src = getattr(embedding, pname)
+            host = allocate_ple_host_table(
+                shape=src.shape, dtype=src.dtype, backend=backend, tag=f"{tag}-{pname}"
+            )
+            param = nn.Parameter(host, requires_grad=False)
+            for key, value in vars(src).items():
+                setattr(param, key, value)
+            self.register_parameter(pname, param)
+        self._file_prefetcher = None
+        self._file_rss_trimmer = None
+        scale_2 = nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
+        scale_2.weight_loader = lambda p, w: p.data.copy_(w.reshape(p.shape).float())
+        self.register_parameter("weight_scale_2", scale_2)
+        self.register_buffer("e2m1_lut", torch.tensor(_E2M1_LUT, dtype=torch.float32), persistent=False)
+        self._block_d = triton.next_power_of_2(self.embedding_dim)
+        self.refresh_weight_ptr()
+
+    def refresh_weight_ptr(self) -> None:
+        self._weight_ptr = int(self.weight.data_ptr())
+        self._scale_ptr = int(self.weight_scale.data_ptr())
+
+    def gather(self, input_ids: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+        expected_shape = (*input_ids.shape, self.embedding_dim)
+        if out is None:
+            output = self.allocate_output(expected_shape, input_ids.device)
+        else:
+            if tuple(out.shape) != expected_shape:
+                raise ValueError(
+                    f"invalid PLE prefetch output shape: {tuple(out.shape)} != {expected_shape}"
+                )
+            if out.dtype != torch.bfloat16 or out.device != input_ids.device:
+                raise ValueError("PLE prefetch output must be bfloat16 on the id device")
+            output = out
+        flat_ids = input_ids.reshape(-1).long()
+        if flat_ids.numel():
+            _gather_ple_nvfp4_from_pinned_kernel[(flat_ids.numel(),)](
+                self._weight_ptr if _QSA_SPLIT_OP_GATE else self.weight.data_ptr(),
+                self._scale_ptr if _QSA_SPLIT_OP_GATE else self.weight_scale.data_ptr(),
+                self.weight_scale_2,
+                self.e2m1_lut,
+                flat_ids,
+                output,
+                embedding_dim=self.embedding_dim,
+                tp_vocab_start=self.shard_indices.org_vocab_start_index,
+                tp_vocab_end=self.shard_indices.org_vocab_end_index,
+                GROUP=self.group_size,
+                BLOCK_D=self._block_d,
+            )
+        return output
 
 
 class Qwen4ExpPLELayer(nn.Module):

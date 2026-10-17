@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 
 def hf_ple_table_is_nvfp4(hf_config: Any) -> bool:
     """The checkpoint stores its PLE n-gram table as NVFP4: a ModelOpt quantized_layers entry for the
-    ngram_embedding with quant_algo NVFP4, or ple_embedding_dtype "nvfp4" on the text config. The
-    pinned-host offload gathers bf16 / fp8 rows only, so its default is off for such a table."""
+    ngram_embedding with quant_algo NVFP4, or ple_embedding_dtype "nvfp4" on the text config. Its
+    pinned-host offload (Qwen4ExpPinnedHostNvFp4Embedding) is opt-in: --ple-offload-embedding."""
     text_config = getattr(hf_config, "text_config", hf_config)
     if getattr(text_config, "ple_embedding_dtype", None) == "nvfp4":
         return True
