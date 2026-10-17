@@ -601,8 +601,19 @@ def handle_deterministic_inference(server_args: Any):
                 # (each GPU reads all data from all GPUs, reduces locally in fixed order)
                 logger.info("AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)")
             else:
-                # CUDA: use NCCL tree algorithm
-                os.environ["NCCL_ALGO"] = "allreduce:tree"
+                # CUDA: use NCCL tree algorithm -- unless the caller already chose a
+                # non-tree algorithm. A tree needs transports between non-neighbour ranks,
+                # which a ring topology (the four-Spark CX7 4-cycle) does not have: NCCL
+                # fails at the first all-reduce ("no transport for recv peer"). A ring
+                # all-reduce with the channel count pinned below is order-fixed too.
+                _algo = os.environ.get("NCCL_ALGO", "")
+                if _algo and "tree" not in _algo.lower():
+                    logger.warning(
+                        f"Deterministic inference keeps the caller's NCCL_ALGO={_algo!r} "
+                        "(no tree): a ring all-reduce with pinned channels is order-fixed."
+                    )
+                else:
+                    os.environ["NCCL_ALGO"] = "allreduce:tree"
                 # Not declared: set_default_server_args() writes this field
                 # too, through its `args` parameter, so a declaration here
                 # would be a second source for one field.
