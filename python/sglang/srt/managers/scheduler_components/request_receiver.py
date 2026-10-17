@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -55,6 +56,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# N21: SGLANG_RDMA_RING_ALLREDUCE=1 -- the TP decode all-reduces run on the relay
+# one-shot RDMA ring (device_communicators/rdma_ring_allreduce.py, hooked in
+# pynccl.py); its failure model is fail-stop, read here once per step.
+_RDMA_RING_ALLREDUCE = os.environ.get("SGLANG_RDMA_RING_ALLREDUCE", "0") == "1"
+if _RDMA_RING_ALLREDUCE:
+    from sglang.srt.distributed.device_communicators.rdma_ring_allreduce import (
+        check_health_all as _rdma_ring_check_health_all,
+    )
+
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
@@ -93,6 +103,12 @@ class SchedulerRequestReceiver:
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.step()
+
+        if _RDMA_RING_ALLREDUCE:
+            # N21: fail-stop health of the relay RDMA all-reduce, once per
+            # scheduler step on every rank (a poisoned runtime no-ops its later
+            # launches inside the decode graph; this is the host's read of it).
+            _rdma_ring_check_health_all()
 
         if self.recv_skipper is not None:
             if not self.recv_skipper.handle(self.get_last_batch()):

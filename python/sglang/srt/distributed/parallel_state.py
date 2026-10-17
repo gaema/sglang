@@ -474,6 +474,11 @@ class GroupCoordinator:
                 device=self.device,
                 is_symmetric_memory_enabled=self.is_symmetric_memory_enabled(),
             )
+            # N21: relay one-shot RDMA all-reduce on the CX7 ring for the TP
+            # group's decode-graph all-reduces (SGLANG_RDMA_RING_ALLREDUCE=1;
+            # no-op otherwise). Collective over cpu_group -- every TP rank
+            # constructs its GroupCoordinator, so every rank arrives here.
+            self.pynccl_comm.attach_rdma_ring(group_name)
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
         if use_mscclpp and self.world_size > 1:
@@ -671,10 +676,13 @@ class GroupCoordinator:
             #  their usage conditions.
             pynccl_comm = self.pynccl_comm
             maybe_pynccl_context: Any
+            maybe_ring_context: Any = nullcontext()
             if not pynccl_comm:
                 maybe_pynccl_context = nullcontext()
             else:
                 maybe_pynccl_context = pynccl_comm.change_state(enable=True)
+                # N21: the ring runtime's per-capture stream bookkeeping
+                maybe_ring_context = pynccl_comm.rdma_ring_capture(stream)
 
             pymscclpp_comm = self.pymscclpp_comm
             maybe_pymscclpp_context: Any
@@ -682,7 +690,7 @@ class GroupCoordinator:
                 maybe_pymscclpp_context = nullcontext()
             else:
                 maybe_pymscclpp_context = pymscclpp_comm.change_state(enable=True)
-            with maybe_pynccl_context, maybe_pymscclpp_context:
+            with maybe_pynccl_context, maybe_ring_context, maybe_pymscclpp_context:
                 yield graph_capture_context
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
@@ -2096,6 +2104,10 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        # N21: stop the ring's proxy thread and deregister its MRs before the
+        # process groups (and NCCL) go away.
+        if self.pynccl_comm is not None:
+            self.pynccl_comm.close_rdma_ring()
         # Must precede destroy_process_group(): FlashInfer's workspace
         # teardown collectives on the group it was built with.
         if self.pcie_ipc_comm is not None:
