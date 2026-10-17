@@ -1220,6 +1220,19 @@ class Fp8LinearMethod(LinearMethodBase):
         dequant_weight = getattr(layer, "mxfp8_dequant_weight", None)
         if dequant_weight is not None and not isinstance(x, (tuple, Mxfp8SwizzledInput)):
             return F.linear(x, dequant_weight, bias)
+        if (  # _q38fn_mxgemv: small-M native MXFP8 as a weight-streaming W8A16 GEMM
+            self.use_mxfp8
+            and isinstance(x, torch.Tensor)
+            and __import__("os").environ.get("SGLANG_Q38FN_MXFP8_GEMV", "0") == "1"
+        ):
+            from sglang.kernels.ops.gemm.q38fn_mxfp8_gemv import (
+                q38fn_mxfp8_gemv,
+                q38fn_mxfp8_gemv_ok,
+            )
+
+            scale_u8 = getattr(layer, "weight_scale_inv", None)
+            if scale_u8 is not None and q38fn_mxfp8_gemv_ok(x, layer.weight, scale_u8):
+                return q38fn_mxfp8_gemv(x, layer.weight, scale_u8, bias)
         if mxfp8_view:
             backend = self.mxfp8_dense_backend
             extra_kwargs = {}
