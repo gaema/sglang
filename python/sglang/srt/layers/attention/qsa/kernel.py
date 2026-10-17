@@ -20,6 +20,22 @@ def average_pool_qsa_keys(key_groups: torch.Tensor) -> torch.Tensor:
     return key_groups.float().mean(dim=1).to(key_groups.dtype)
 
 
+def qsa_fixed_order(block_indices: torch.Tensor) -> torch.Tensor:
+    """Under --enable-deterministic-inference, sort each row's selected blocks ascending, -1 padding last.
+
+    fast_topk returns its selection in atomic collection order, which changes run to run; the sparse attention
+    sums the selected keys in that order, so the result changed with it. A no-op otherwise.
+    """
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+        return block_indices
+    big = torch.iinfo(block_indices.dtype).max
+    keyed = torch.where(block_indices < 0, torch.full_like(block_indices, big), block_indices)
+    keyed = torch.sort(keyed, dim=-1).values
+    return torch.where(keyed == big, torch.full_like(keyed, -1), keyed)
+
+
 def qsa_fast_topk(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
@@ -327,6 +343,7 @@ __all__ = [
     "torch_expand_qsa_block_indices",
     "triton_expand_qsa_block_indices",
     "qsa_fast_topk",
+    "qsa_fixed_order",
     "qsa_sparse_attention",
     "qsa_sparse_attention_reference",
 ]

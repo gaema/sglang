@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
     qsa_fast_topk,
+    qsa_fixed_order,
 )
 from sglang.srt.layers.attention.qsa.metadata import (
     build_group_ring_slots,
@@ -542,6 +543,7 @@ class QSAIndexer(MultiPlatformOp):
                     row_ends[chunk_slice],
                     topk=self.block_topk,
                 )
+                block_indices = qsa_fixed_order(block_indices)
             selected = expand_qsa_block_indices(
                 block_indices,
                 query_positions[chunk_slice],
@@ -587,6 +589,7 @@ class QSAIndexer(MultiPlatformOp):
             block_indices = qsa_fast_topk(
                 logits, row_starts, compressed_lengths, topk=self.block_topk
             )
+        block_indices = qsa_fixed_order(block_indices)
         if defer_expansion:
             return block_indices
         return expand_qsa_block_indices(
