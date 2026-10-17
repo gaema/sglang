@@ -3,7 +3,8 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/pynccl.py
 
 import logging
-from contextlib import contextmanager
+import os
+from contextlib import contextmanager, nullcontext
 from typing import Optional, Union
 
 # ===================== import region =====================
@@ -25,6 +26,17 @@ from sglang.srt.distributed.utils import StatelessProcessGroup
 from sglang.srt.utils.common import get_current_device_stream_fast
 
 logger = logging.getLogger(__name__)
+
+# N21 (2026-09-19): SGLANG_RDMA_RING_ALLREDUCE=1 routes the TP group's eligible
+# all-reduces (SUM, bf16/fp32, contiguous, nbytes <= SGLANG_RDMA_RING_MAX_SIZE, default
+# 2 MiB -- i.e. every decode-graph all-reduce, 10 KB at B=1 to 320 KB at c=32) through
+# the relay one-shot RDMA all-reduce on the 4-cycle CX7 ring
+# (rdma_ring_allreduce.py: one kernel per op, pinned-host slots the NICs write and the
+# GB10 reads in place, a host proxy thread posting RDMA writes + the relay hop for the
+# diagonal). Attached by GroupCoordinator to the "tp" group only; anything ineligible
+# stays on NCCL and is counted. Default off = pristine NCCL path. Design:
+# infra/tools/provision/dgx-spark/design/rdma-allreduce-ring.md.
+_RDMA_RING_ALLREDUCE = os.environ.get("SGLANG_RDMA_RING_ALLREDUCE", "0") == "1"
 
 
 class PyNcclCommunicator:
@@ -60,6 +72,7 @@ class PyNcclCommunicator:
             self.world_size = group.world_size
 
         self.group = group
+        self.ring = None  # RingAllReduce once attach_rdma_ring() ran (TP group, flag on)
 
         # if world_size == 1, no need to create communicator
         if self.world_size == 1:
@@ -140,6 +153,37 @@ class PyNcclCommunicator:
         """Return the current device stream used for NCCL calls."""
         return get_current_device_stream_fast()
 
+    # -- N21 relay one-shot RDMA all-reduce -------------------------------------
+    def attach_rdma_ring(self, group_name: str) -> None:
+        """Build the ring runtime over this communicator's Gloo group (collective
+        across the 4 TP ranks). No-op unless SGLANG_RDMA_RING_ALLREDUCE=1, the group
+        is "tp", world size is 4 and the group is a torch ProcessGroup."""
+        if (
+            not _RDMA_RING_ALLREDUCE
+            or group_name != "tp"
+            or not self.available
+            or self.world_size != 4
+            or isinstance(self.group, StatelessProcessGroup)
+        ):
+            return
+        from sglang.srt.distributed.device_communicators.rdma_ring_allreduce import (
+            RingAllReduce,
+        )
+
+        self.ring = RingAllReduce.from_group(
+            self.group, self.device, log=logger.info
+        )
+
+    def rdma_ring_capture(self, stream=None):
+        """Context for GroupCoordinator.graph_capture: resets the ring's stream
+        bookkeeping; the captured op records only frozen pointers + nbytes."""
+        return self.ring.capture(stream) if self.ring is not None else nullcontext()
+
+    def close_rdma_ring(self) -> None:
+        ring, self.ring = self.ring, None
+        if ring is not None:
+            ring.close()
+
     def all_reduce(self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM):
         if self.disabled:
             return
@@ -151,6 +195,9 @@ class PyNcclCommunicator:
             f"but the input tensor is on {tensor.device}"
         )
         stream = self._resolve_stream()
+        if self.ring is not None and self.ring.route(tensor, op == ReduceOp.SUM) is None:
+            self.ring.all_reduce(tensor, out=tensor, stream=stream)
+            return
         self.nccl.ncclAllReduce(
             buffer_type(tensor.data_ptr()),
             buffer_type(tensor.data_ptr()),
