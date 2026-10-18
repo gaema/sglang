@@ -342,8 +342,10 @@ def fused_hc_mix_supported(
     hyper_input_normed: torch.Tensor, w_down: torch.Tensor, w_up: torch.Tensor
 ) -> bool:
     # The persistent kernel accumulates the down projection with
-    # device-scope atomics, so summation order varies across replays.
-    if _deterministic_inference():
+    # device-scope atomics, so summation order varies across replays --
+    # unless SGLANG_Q38FN_MIX_DET picks an order-fixed reduction (1: per-CTA
+    # slots reduced in order, 2: int64 fixed point).
+    if _deterministic_inference() and _n53_os.environ.get("SGLANG_Q38FN_MIX_DET", "0") not in ("1", "2"):
         return False
     if _n53_rows and tuple(hyper_input_normed.shape) not in _n53_seen_shapes:
         _n53_seen_shapes.add(tuple(hyper_input_normed.shape))
