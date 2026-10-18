@@ -36,6 +36,29 @@ def qsa_fixed_order(block_indices: torch.Tensor) -> torch.Tensor:
     return torch.where(keyed == big, torch.full_like(keyed, -1), keyed)
 
 
+def qsa_tiebroken_topk(
+    logits: torch.Tensor, starts: torch.Tensor, lengths: torch.Tensor, topk: int
+) -> torch.Tensor:
+    """Top-k over each row's [start, start + length) with ties broken by the lower column; -1 padded."""
+    rows, width = logits.shape
+    cols = torch.arange(width, device=logits.device, dtype=torch.int64)
+    bits = logits.float().contiguous().view(torch.int32).to(torch.int64)
+    # order-preserving signed key of the fp32 bits
+    ordered = torch.where(bits >= 0, bits, bits ^ 0x7FFFFFFF)
+    key = (ordered << 32) | (0xFFFFFFFF - cols)
+    rel = cols.unsqueeze(0) - starts.to(torch.int64).unsqueeze(1)
+    valid = (rel >= 0) & (rel < lengths.to(torch.int64).unsqueeze(1))
+    key = torch.where(valid, key, torch.full_like(key, torch.iinfo(torch.int64).min))
+    k = min(topk, width)
+    picked = torch.topk(key, k, dim=-1).indices
+    ok = torch.gather(valid, 1, picked)
+    out_rel = picked - starts.to(torch.int64).unsqueeze(1)
+    out = torch.where(ok, out_rel, torch.full_like(out_rel, -1)).to(torch.int32)
+    if k < topk:
+        out = torch.cat([out, out.new_full((rows, topk - k), -1)], dim=1)
+    return out
+
+
 def qsa_fast_topk(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
@@ -46,6 +69,10 @@ def qsa_fast_topk(
 
     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
     starts = row_starts.to(device=logits.device, dtype=torch.int32)
+    from sglang.srt.environ import envs
+
+    if logits.is_cuda and envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+        return qsa_tiebroken_topk(logits, starts, lengths, topk)
     if logits.is_cuda:
         if topk == 512:
             # Prefer the JIT kernel: it ships with the sglang python package,
@@ -344,6 +371,7 @@ __all__ = [
     "triton_expand_qsa_block_indices",
     "qsa_fast_topk",
     "qsa_fixed_order",
+    "qsa_tiebroken_topk",
     "qsa_sparse_attention",
     "qsa_sparse_attention_reference",
 ]

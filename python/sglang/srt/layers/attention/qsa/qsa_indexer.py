@@ -573,7 +573,13 @@ class QSAIndexer(MultiPlatformOp):
             compressed_lengths,
             max_model_len,
         )
-        if logits.is_cuda and self.block_topk == 512:
+        from sglang.srt.environ import envs as _envs
+
+        if (
+            logits.is_cuda
+            and self.block_topk == 512
+            and not _envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        ):
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
             from sglang.kernels.ops.attention.fast_topk import fast_topk
