@@ -580,10 +580,15 @@ class QSAIndexer(MultiPlatformOp):
     ) -> torch.Tensor:
         # fast_topk (k = 512) writes 0..length-1 for rows that fit k without reading
         # their scores, and never reads past a row's length.
+        from sglang.srt.environ import envs as _envs
+
         use_fast_topk = (
             q.is_cuda
             and self.block_topk == 512
             and not is_batch_invariant_mode_enabled()
+            # Deterministic inference routes decode through qsa_fast_topk, whose
+            # tie-broken top-k fixes the selected set (qsa_tiebroken_topk).
+            and not _envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
         )
         logits = qsa_mqa_decode(
             q,
