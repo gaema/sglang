@@ -637,5 +637,5 @@ def handle_deterministic_inference(server_args: Any):
                 os.environ["NCCL_MIN_NCHANNELS"] = nchannels
                 os.environ["NCCL_MAX_NCHANNELS"] = nchannels
                 logger.warning(
-                    "NCCL_ALGO is set to 'allreduce:tree', the NCCL channel count is pinned, and custom and symmetric-memory all reduce are disabled for deterministic inference when TP size > 1."
+                    f"NCCL_ALGO is {os.environ['NCCL_ALGO']!r}, the NCCL channel count is pinned, and custom and symmetric-memory all reduce are disabled for deterministic inference when TP size > 1."
                 )
