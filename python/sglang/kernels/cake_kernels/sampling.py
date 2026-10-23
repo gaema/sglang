@@ -24,8 +24,10 @@ def supports_softmax(logits: torch.Tensor) -> bool:
     """The large-vocabulary domain qualified against the eager Torch caller."""
     import torch
 
+    # The cached device test goes first: off sm_103 it is always False, and this runs once per verify step.
     return (
         logits.is_cuda
+        and _device_supported(logits.device.index)
         and torch.version.cuda is not None
         and logits.dtype == torch.float32
         and logits.ndim == 2
@@ -33,7 +35,6 @@ def supports_softmax(logits: torch.Tensor) -> bool:
         and 128256 <= logits.shape[1] <= 262144
         and logits.shape[1] % 8 == 0
         and logits.is_contiguous()
-        and _device_supported(logits.device.index)
     )
 
 
