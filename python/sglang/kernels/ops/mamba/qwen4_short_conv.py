@@ -317,3 +317,191 @@ def fused_qwen4_verify_conv(
         enable_fp_fusion=False,
     )
     return output
+
+
+# --- Extend (prefill) without padding: _q38fn_plevar ------------------------------
+# The padded extend path (Qwen4ExpPLELayer._short_conv) builds [requests, channels,
+# state_len + row_width] with row_width the batch's LONGEST chunk, so a mixed batch
+# allocates requests x longest x 10240 x 2 B several times over (2026-10-17: a 630 MiB
+# allocation there OOM-crashed production). These kernels read the packed tokens
+# directly: output token t (request r, offset p) is sum_k w[k] * v(p - (K - 1 - k) * D),
+# v(j) = x[t - (p - j)] for j >= 0, else the request's incoming state column
+# state_len + j (cast to x's dtype first, as the padded path's index_select + .to does).
+
+
+@triton.jit
+def _qwen4_extend_conv_kernel(
+    x_ptr,
+    w_ptr,
+    state_ptr,
+    state_indices_ptr,
+    req_ptr,
+    off_ptr,
+    out_ptr,
+    num_tokens,
+    state_stride0,
+    state_stride1,
+    state_stride2,
+    CHANNELS: tl.constexpr,
+    KSIZE: tl.constexpr,
+    DIL: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    tok = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    ch = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+    tmask = tok < num_tokens
+    cmask = ch < CHANNELS
+    m = tmask[:, None] & cmask[None, :]
+    req = tl.load(req_ptr + tok, mask=tmask, other=0)
+    p = tl.load(off_ptr + tok, mask=tmask, other=0)
+    slot = tl.load(state_indices_ptr + req, mask=tmask, other=0)
+    state_len: tl.constexpr = (KSIZE - 1) * DIL
+    acc = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32)
+    for k in tl.static_range(KSIZE):
+        d = (KSIZE - 1 - k) * DIL
+        j = p - d
+        in_x = j >= 0
+        xv = tl.load(
+            x_ptr + (tok - d)[:, None] * CHANNELS + ch[None, :],
+            mask=m & in_x[:, None],
+            other=0.0,
+        )
+        sv = tl.load(
+            state_ptr
+            + slot[:, None] * state_stride0
+            + ch[None, :] * state_stride1
+            + (state_len + j)[:, None] * state_stride2,
+            mask=m & (~in_x)[:, None],
+            other=0.0,
+        ).to(x_ptr.dtype.element_ty)
+        v = tl.where(in_x[:, None], xv, sv).to(tl.float32)
+        wk = tl.load(w_ptr + ch * KSIZE + k, mask=cmask, other=0.0).to(tl.float32)
+        acc = acc + v * wk[None, :]
+    tl.store(
+        out_ptr + tok[:, None] * CHANNELS + ch[None, :],
+        acc.to(out_ptr.dtype.element_ty),
+        mask=m,
+    )
+
+
+@triton.jit
+def _qwen4_extend_tail_kernel(
+    x_ptr,
+    state_ptr,
+    state_indices_ptr,
+    starts_ptr,
+    ends_ptr,
+    out_ptr,
+    state_stride0,
+    state_stride1,
+    state_stride2,
+    CHANNELS: tl.constexpr,
+    STATE_LEN: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    # out[r, c, s] = v_r(end_r - STATE_LEN + s): the state after the request's
+    # first end_r tokens (the padded path's conv_input[:, :, end_r + s]).
+    r = tl.program_id(0)
+    ch = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+    s = tl.arange(0, BLOCK_S)
+    cmask = ch < CHANNELS
+    smask = s < STATE_LEN
+    m = smask[:, None] & cmask[None, :]
+    start = tl.load(starts_ptr + r)
+    end = tl.load(ends_ptr + r)
+    slot = tl.load(state_indices_ptr + r)
+    j = end - STATE_LEN + s
+    in_x = j >= 0
+    xv = tl.load(
+        x_ptr + (start + j)[:, None] * CHANNELS + ch[None, :],
+        mask=m & in_x[:, None],
+        other=0.0,
+    )
+    sv = tl.load(
+        state_ptr
+        + slot * state_stride0
+        + ch[None, :] * state_stride1
+        + (STATE_LEN + j)[:, None] * state_stride2,
+        mask=m & (~in_x)[:, None],
+        other=0.0,
+    ).to(x_ptr.dtype.element_ty)
+    v = tl.where(in_x[:, None], xv, sv)
+    tl.store(
+        out_ptr + r * CHANNELS * STATE_LEN + ch[None, :] * STATE_LEN + s[:, None],
+        v,
+        mask=m,
+    )
+
+
+def can_qwen4_extend_conv(x, weight, state, dilation):
+    return (
+        x.is_cuda
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and x.ndim == 2
+        and x.is_contiguous()
+        and weight.ndim == 3
+        and weight.shape[:2] == (x.shape[1], 1)
+        and weight.is_contiguous()
+        and state.ndim == 3
+        and state.shape[1] == x.shape[1]
+        and dilation > 0
+        and state.shape[2] == (weight.shape[2] - 1) * dilation
+        and 0 < state.shape[2] <= _QWEN4_MAX_SHORT_CONV_STATE_LEN
+    )
+
+
+def qwen4_extend_conv(x, weight, state, state_indices, req_indices, token_offsets, dilation):
+    """The pre-activation short conv of an extend batch, [tokens, channels] in x's dtype
+    (the padded path's conv_output[req_indices, token_offsets]); reads the incoming
+    state and does not modify it."""
+    t, c = x.shape
+    out = torch.empty_like(x)
+    if t == 0:
+        return out
+    w = weight.to(dtype=x.dtype).reshape(c, -1).contiguous()
+    bt, bc = 16, 128
+    _qwen4_extend_conv_kernel[(triton.cdiv(t, bt), triton.cdiv(c, bc))](
+        x,
+        w,
+        state,
+        state_indices,
+        req_indices,
+        token_offsets,
+        out,
+        t,
+        *state.stride(),
+        CHANNELS=c,
+        KSIZE=w.shape[1],
+        DIL=dilation,
+        BLOCK_T=bt,
+        BLOCK_C=bc,
+        enable_fp_fusion=False,
+    )
+    return out
+
+
+def qwen4_extend_tail(x, state, state_indices, starts, ends):
+    """[requests, channels, state_len] in x's dtype: each request's state after its first
+    `ends` tokens (starts = the request's first token index in x)."""
+    r = state_indices.shape[0]
+    c, sl = state.shape[1], state.shape[2]
+    out = torch.empty((r, c, sl), dtype=x.dtype, device=x.device)
+    if r == 0:
+        return out
+    bc = 128
+    _qwen4_extend_tail_kernel[(r, triton.cdiv(c, bc))](
+        x,
+        state,
+        state_indices,
+        starts,
+        ends,
+        out,
+        *state.stride(),
+        CHANNELS=c,
+        STATE_LEN=sl,
+        BLOCK_S=triton.next_power_of_2(sl),
+        BLOCK_C=bc,
+    )
+    return out

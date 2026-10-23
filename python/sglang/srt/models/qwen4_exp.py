@@ -1520,6 +1520,46 @@ class Qwen4ExpPLELayer(nn.Module):
                 conv_state[track_indices] = next_state.to(dtype=conv_state.dtype)
             return F.silu(conv_output)
 
+        if (
+            not batch.mode.is_target_verify()
+            and __import__("os").environ.get("SGLANG_Q38FN_PLE_VARLEN", "0") == "1"
+        ):  # _q38fn_plevar: the extend conv on the packed tokens, no [requests, longest] padding
+            from sglang.kernels.ops.mamba.qwen4_short_conv import (
+                can_qwen4_extend_conv,
+                qwen4_extend_conv,
+                qwen4_extend_tail,
+            )
+
+            if can_qwen4_extend_conv(
+                x, self.conv1d.weight, conv_state, self.short_conv_dilation
+            ):
+                conv_tokens = qwen4_extend_conv(
+                    x,
+                    self.conv1d.weight,
+                    conv_state,
+                    batch.state_indices,
+                    batch.req_indices,
+                    batch.token_offsets,
+                    self.short_conv_dilation,
+                )
+                starts = torch.cumsum(batch.lengths, dim=0) - batch.lengths
+                next_state = qwen4_extend_tail(
+                    x, conv_state, batch.state_indices, starts, batch.lengths
+                )
+                track = _ple_track_targets(forward_batch, batch)
+                track_state = (
+                    qwen4_extend_tail(
+                        x, conv_state, batch.state_indices, starts, track[1]
+                    )
+                    if track is not None
+                    else None
+                )
+                # (both tails read the incoming state, so they are taken before either write)
+                conv_state[batch.state_indices] = next_state.to(dtype=conv_state.dtype)
+                if track is not None:
+                    conv_state[track[0]] = track_state.to(dtype=conv_state.dtype)
+                return F.silu(conv_tokens)
+
         state = conv_state.index_select(0, batch.state_indices).to(dtype=x.dtype)
         padded_seq = x.new_zeros(
             (batch.lengths.shape[0], batch.row_width, self.conv_channels)
