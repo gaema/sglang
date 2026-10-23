@@ -412,7 +412,9 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(mr.model_config.hf_config.__class__.__name__),
     ]
     # Retune caches created before FlashInfer's default tactic joined the race.
-    model_key_parts.append("candidate_selection=v2_default")
+    # q38fn: tuned without autotune_v2, so the default tactic is not in the race; a separate key keeps
+    # caches tuned with it from being reused.
+    model_key_parts.append("candidate_selection=legacy_q38fn")
     # A different skip policy must not reuse previously tuned tactics.
     skip_ops = get_flashinfer_autotune_skip_ops(mr)
     model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))
@@ -576,8 +578,6 @@ def _drop_diverged_autotune_cache(
 
 @contextlib.contextmanager
 def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
-    from flashinfer import autotune_v2
-
     # The gate below decides on the same inputs load_configs does.
     from flashinfer.autotuner import AutoTuner, _collect_metadata, autotune
 
@@ -646,7 +646,6 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
                 cache=None if reuse_cache else str(autotune_cache),
                 skip_ops=skip_ops,
             ),
-            autotune_v2(mode="tune", persistent_cache=False),
             mega_context,
             autotune_dummy_run_mode(run_lm_head=run_lm_head),
         ):
