@@ -231,6 +231,37 @@ class GatedResidual(HyperConnectionBase):
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
 
+    def q38fn_fp8_mix_weights(self):  # _q38fn_mixfp8
+        """The per-row e4m3 mix weights (down q, down scale, up q, up scale), built once. With
+        SGLANG_Q38FN_MIX_UP_I=1 the up rows (and scales) are stored branch-interleaved (row
+        j * hc + g = row g * hs + j): the layout the decode megakernel reads, so its hook
+        shares this copy instead of keeping its own (_q38fn_mkshare)."""
+        w = getattr(self, "_q38fn_fp8w", None)
+        if w is not None:
+            return w
+        from sglang.kernels.ops.gemm.hc_mix import q38fn_quant_rows_fp8
+
+        w = (
+            *q38fn_quant_rows_fp8(self.input_mix_weight_down.weight),
+            *q38fn_quant_rows_fp8(self.input_mix_weight_up.weight),
+        )
+        if __import__("os").environ.get("SGLANG_Q38FN_MIX_UP_I", "0") == "1":  # _q38fn_mkshare
+            perm = torch.arange(
+                self.hc_count * self.hidden_size, device=w[2].device
+            ).view(self.hc_count, self.hidden_size).t().reshape(-1)
+            w = (w[0], w[1], w[2][perm].contiguous(), w[3][perm].contiguous())
+            self._q38fn_fp8w_upi = True
+        self._q38fn_fp8w = w
+        GatedResidual._q38fn_fp8_count = getattr(GatedResidual, "_q38fn_fp8_count", 0) + 1
+        if GatedResidual._q38fn_fp8_count in (1, 96):
+            print(
+                f"[q38fn-mixfp8] fp8 HC mix weights built for "
+                f"{GatedResidual._q38fn_fp8_count} mixes"
+                f"{' (up rows interleaved)' if getattr(self, '_q38fn_fp8w_upi', False) else ''}",
+                flush=True,
+            )
+        return w
+
     def mix(self, hyper_input: torch.Tensor):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
@@ -290,22 +321,7 @@ class GatedResidual(HyperConnectionBase):
             if __import__("os").environ.get("SGLANG_Q38FN_MIX_FP8", "0") == "1":
                 _q38fn_w = getattr(self, "_q38fn_fp8w", None)
                 if _q38fn_w is None and not torch.cuda.is_current_stream_capturing():
-                    from sglang.kernels.ops.gemm.hc_mix import q38fn_quant_rows_fp8
-
-                    _q38fn_w = (
-                        *q38fn_quant_rows_fp8(self.input_mix_weight_down.weight),
-                        *q38fn_quant_rows_fp8(self.input_mix_weight_up.weight),
-                    )
-                    self._q38fn_fp8w = _q38fn_w
-                    GatedResidual._q38fn_fp8_count = getattr(
-                        GatedResidual, "_q38fn_fp8_count", 0
-                    ) + 1
-                    if GatedResidual._q38fn_fp8_count in (1, 96):
-                        print(
-                            f"[q38fn-mixfp8] fp8 HC mix weights built for "
-                            f"{GatedResidual._q38fn_fp8_count} mixes",
-                            flush=True,
-                        )
+                    _q38fn_w = self.q38fn_fp8_mix_weights()
             mixed_input = fused_hc_mix(
                 hyper_input_normed,
                 _q38fn_w[0] if _q38fn_w else self.input_mix_weight_down.weight,
@@ -316,6 +332,7 @@ class GatedResidual(HyperConnectionBase):
                 partials=_q38fn_parts,
                 w_down_scale=_q38fn_w[1] if _q38fn_w else None,
                 w_up_scale=_q38fn_w[3] if _q38fn_w else None,
+                up_interleaved=bool(_q38fn_w) and getattr(self, "_q38fn_fp8w_upi", False),  # _q38fn_mkshare
             ).to(self.params_dtype)
             self._q38fn_partials = _q38fn_parts
         else:

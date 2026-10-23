@@ -405,6 +405,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     f"pid={__import__('os').getpid()}",
                     flush=True,
                 )
+                _dh = self.draft_runner.model.lm_head
+                if (  # _q38fn_mkshare: the target's LMHEAD_FP8 cache is this same quantization of
+                    # the same bf16 shard (per-row amax / 448, q38fn_quant_rows_e4m3), so hand it
+                    # the draft's tensors instead of building a second copy at the first logits call
+                    __import__("os").environ.get("SGLANG_Q38FN_LMHEAD_SHARE", "0") == "1"
+                    and target_lm_head is not None
+                    and getattr(target_lm_head, "weight", None) is not None
+                    and target_lm_head.weight.data_ptr() == _src.weight.data_ptr()
+                    and tuple(target_lm_head.weight.shape) == tuple(_dh.weight.shape)
+                    and getattr(target_lm_head, "_q38fn_fp8", None) is None
+                ):
+                    target_lm_head._q38fn_fp8 = (_dh.weight.data, _dh.w_scale_vec)
+                    print(
+                        f"[q38fn-mkshare] target fp8 lm_head shares the draft head's "
+                        f"{tuple(_dh.weight.shape)} e4m3 copy pid={__import__('os').getpid()}",
+                        flush=True,
+                    )
 
     def _resolve_shared_embed_and_head(self):
         target_runner = self.target_worker.model_runner
