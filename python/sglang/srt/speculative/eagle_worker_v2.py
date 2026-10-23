@@ -422,6 +422,31 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         f"{tuple(_dh.weight.shape)} e4m3 copy pid={__import__('os').getpid()}",
                         flush=True,
                     )
+        # _q38fn_dshard: the draft model's logits are only ever argmaxed (topk=1 chain:
+        # draft_topk1_postprocess returns topk_p = 1.0 and the argmax index), so its
+        # vocab-parallel logits gather can be fn:N89's exact shard-top-k gather -- each
+        # rank's top-k with values, scattered into a -1e30 floor -- instead of the full
+        # [rows, vocab] all-gather. The target's processor is untouched (its rows may be
+        # sampled). k >= 2 keeps a within-shard tie for the lowest-index argmax.
+        _dk = int(__import__("os").environ.get("SGLANG_Q38FN_DRAFT_SHARD_TOPK", "0") or 0)
+        _lp = getattr(self.draft_runner.model, "logits_processor", None)
+        if (
+            _dk > 0
+            and self.speculative_algorithm is not None
+            and get_spec().speculative_eagle_topk == 1
+            and _lp is not None
+            and getattr(_lp, "do_tensor_parallel_all_gather", False)
+            and not getattr(_lp, "use_attn_tp_group", True)
+            and not getattr(_lp, "do_tensor_parallel_all_gather_dp_attn", True)
+            and getattr(_lp, "final_logit_softcapping", None) is None
+        ):
+            _lp.shard_topk_k = _dk
+            _lp.use_shard_topk_gather = True
+            print(
+                f"[q38fn-dshard] draft logits gather: shard top-{_dk} "
+                f"pid={__import__('os').getpid()}",
+                flush=True,
+            )
 
     def _resolve_shared_embed_and_head(self):
         target_runner = self.target_worker.model_runner
