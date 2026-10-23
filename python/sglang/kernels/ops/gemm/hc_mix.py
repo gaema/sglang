@@ -79,6 +79,7 @@ def _hc_mix_persistent_kernel(
     SPLIT: tl.constexpr = 8,
     DET: tl.constexpr = 0,  # _q38fn_mixdet: 1 slots + fixed-order sum, 2 int64 fixed point
     SLOTS: tl.constexpr = 1,  # _q38fn_mixdet: power of two >= the slot count (DET 1)
+    UPI: tl.constexpr = 0,  # _q38fn_mkshare: up rows (and su) stored branch-interleaved, row j * HC + g
 ):
     pid = tl.program_id(0)
     offs_m = tl.arange(0, ROWS)
@@ -247,6 +248,10 @@ def _hc_mix_persistent_kernel(
         mask_j = j < HS
         gj = offs_g[:, None] * HS + j[None, :]
         gj_flat = tl.reshape(gj, (HC * BLOCK_J,))
+        if UPI:  # _q38fn_mkshare: the same rows in the same order, read from the interleaved copy
+            wj_flat = tl.reshape(j[None, :] * HC + offs_g[:, None], (HC * BLOCK_J,))
+        else:
+            wj_flat = gj_flat
         mask_gj = tl.reshape(
             tl.broadcast_to(mask_j[None, :], (HC, BLOCK_J)), (HC * BLOCK_J,)
         )
@@ -264,13 +269,13 @@ def _hc_mix_persistent_kernel(
             a = a * inv_hc
             t = (a * tl.sigmoid(a)).to(x_ptr.dtype.element_ty)
             w = tl.load(
-                w_up_ptr + gj_flat[:, None] * LOWRANK + r[None, :],
+                w_up_ptr + wj_flat[:, None] * LOWRANK + r[None, :],
                 mask=mask_gj[:, None] & mask_r[None, :],
                 other=0.0,
             ).to(x_ptr.dtype.element_ty)  # _q38fn_mixfp8
             acc = tl.dot(t, tl.trans(w), acc)
         if WFP8 > 0:  # _q38fn_mixfp8: per-row scale of the up projection
-            acc = acc * tl.load(su_ptr + gj_flat, mask=mask_gj, other=0.0)[None, :]
+            acc = acc * tl.load(su_ptr + wj_flat, mask=mask_gj, other=0.0)[None, :]
         gate = tl.sigmoid(tl.reshape(acc, (ROWS, HC, BLOCK_J)))
         xg = tl.load(
             x_ptr
@@ -379,6 +384,7 @@ def fused_hc_mix(
     partials: torch.Tensor = None,
     w_down_scale: torch.Tensor = None,  # _q38fn_mixfp8: w_down/w_up are e4m3 when set
     w_up_scale: torch.Tensor = None,
+    up_interleaved: bool = False,  # _q38fn_mkshare: w_up / w_up_scale rows are j * hc + g
 ) -> torch.Tensor:
     rows, k = hyper_input_normed.shape
     lowrank = w_down.shape[0]
@@ -445,6 +451,7 @@ def fused_hc_mix(
         WFP8=1 if w_down_scale is not None else 0,  # _q38fn_mixfp8
         DET=_detm,  # _q38fn_mixdet
         SLOTS=triton.next_power_of_2(_slots),  # _q38fn_mixdet
+        UPI=1 if up_interleaved else 0,  # _q38fn_mkshare
         num_warps=_tc[4] if _tc else (4 if _q38fn_sl_hc_v2(rows_pad) else 8),  # _q38fn_mixtune
     )
     return out
