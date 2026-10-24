@@ -1921,7 +1921,8 @@ def _set_envs_and_config(server_args: ServerArgs):
         ):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.7.2",
+                # gaema: the fork 0.7.0.post1 (0624c834); its 0.7.2 rebase slows the routed-MoE GEMM.
+                "0.7.0.post1",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
