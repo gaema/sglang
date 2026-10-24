@@ -123,6 +123,31 @@ class SamplingBatchInfo:
     # filter_batch keeps it unchanged.
     max_top_k: Optional[int] = None
 
+    @staticmethod
+    def batch_flags_from_reqs(reqs) -> Dict[str, Any]:
+        """Batch-wide sampling flags, from the requests' (host-side) sampling params.
+
+        The one definition for both construction and filtering: merge_batch only
+        AND/ORs these, so filter_batch must recompute them from the kept requests,
+        or a finished sampling request leaves is_all_greedy False (and the need_*
+        flags True) for every greedy request still in the batch.
+        """
+        return dict(
+            is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
+            is_any_greedy=any(r.sampling_params.top_k <= 1 for r in reqs),
+            need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
+            need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
+            need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
+            npu_top_k_top_p_eligible=all(
+                1 <= r.sampling_params.top_k <= 1024 for r in reqs
+            ),
+            max_top_k=(
+                max(r.sampling_params.top_k for r in reqs)
+                if reqs and all(1 <= r.sampling_params.top_k < TOP_K_ALL for r in reqs)
+                else None
+            ),
+        )
+
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         enable_deterministic = get_exec().deterministic.enable_deterministic_inference
@@ -290,19 +315,7 @@ class SamplingBatchInfo:
             top_ks=top_ks,
             min_ps=min_ps,
             sampling_seed=sampling_seed,
-            is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
-            is_any_greedy=any(r.sampling_params.top_k <= 1 for r in reqs),
-            need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
-            need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
-            need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
-            npu_top_k_top_p_eligible=all(
-                1 <= r.sampling_params.top_k <= 1024 for r in reqs
-            ),
-            max_top_k=(
-                max(r.sampling_params.top_k for r in reqs)
-                if reqs and all(1 <= r.sampling_params.top_k < TOP_K_ALL for r in reqs)
-                else None
-            ),
+            **cls.batch_flags_from_reqs(reqs),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
@@ -463,7 +476,14 @@ class SamplingBatchInfo:
 
         return observer_state
 
-    def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
+    def filter_batch(
+        self,
+        keep_indices: List[int],
+        keep_indices_device: torch.Tensor,
+        reqs: Optional[List] = None,
+    ):
+        """Keep the rows in keep_indices. reqs, when given, are the kept requests
+        (in kept order), and the batch-wide flags are recomputed from them."""
         self.penalizer_orchestrator.filter(keep_indices_device)
 
         if self.has_custom_logit_processor:
@@ -518,6 +538,10 @@ class SamplingBatchInfo:
                 )
 
         self.adjusted_filter_batch(keep_indices, keep_indices_device)
+
+        if reqs is not None:
+            for name, value in self.batch_flags_from_reqs(reqs).items():
+                setattr(self, name, value)
 
     def _filter_batch_custom_logit_processor(self, keep_indices: List[int]):
         """Filter the custom logit processor and custom params"""

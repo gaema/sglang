@@ -888,5 +888,68 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertEqual(len(info.custom_params), 2)
 
 
+def _req(temperature=1.0, top_p=1.0, top_k=TOP_K_ALL, min_p=0.0):
+    return SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p
+        )
+    )
+
+
+class TestFilterBatchRefreshesFlags(CustomTestCase):
+    """merge_batch AND/ORs the batch flags; filter_batch must recompute them from the
+    kept requests, or a finished sampling request leaves the greedy rows on the
+    stochastic path."""
+
+    def _batch(self, reqs):
+        flags = SamplingBatchInfo.batch_flags_from_reqs(reqs)
+        return _make_info(batch_size=len(reqs), **flags)
+
+    def test_greedy_after_sampling_request_leaves(self):
+        greedy, sampling = _req(top_k=1), _req(temperature=0.7, top_p=0.8, top_k=20)
+        info = self._batch([greedy])
+        info.merge_batch(self._batch([sampling]))
+        self.assertFalse(info.is_all_greedy)
+        self.assertTrue(info.need_top_p_sampling)
+        info.filter_batch([0], torch.tensor([0]), reqs=[greedy])
+        self.assertTrue(info.is_all_greedy)
+        self.assertTrue(info.is_any_greedy)
+        self.assertFalse(info.need_top_p_sampling)
+        self.assertTrue(info.need_top_k_sampling)  # top_k=1 is not TOP_K_ALL
+        self.assertFalse(info.need_min_p_sampling)
+        self.assertEqual(info.max_top_k, 1)
+
+    def test_filter_keeping_a_sampling_request_stays_stochastic(self):
+        greedy, sampling = _req(top_k=1), _req(temperature=0.7, min_p=0.1)
+        info = self._batch([greedy, sampling])
+        info.filter_batch([1], torch.tensor([1]), reqs=[sampling])
+        self.assertFalse(info.is_all_greedy)
+        self.assertFalse(info.is_any_greedy)
+        self.assertTrue(info.need_min_p_sampling)
+        self.assertIsNone(info.max_top_k)
+
+    def test_filter_without_reqs_keeps_flags(self):
+        info = self._batch([_req(top_k=1), _req(top_p=0.9)])
+        info.filter_batch([0], torch.tensor([0]))
+        self.assertFalse(info.is_all_greedy)
+        self.assertTrue(info.need_top_p_sampling)
+
+    def test_flags_match_construction_expressions(self):
+        reqs = [_req(top_k=1), _req(top_k=50, top_p=0.95)]
+        flags = SamplingBatchInfo.batch_flags_from_reqs(reqs)
+        self.assertEqual(
+            flags,
+            dict(
+                is_all_greedy=False,
+                is_any_greedy=True,
+                need_top_p_sampling=True,
+                need_top_k_sampling=True,
+                need_min_p_sampling=False,
+                npu_top_k_top_p_eligible=True,
+                max_top_k=50,
+            ),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
