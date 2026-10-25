@@ -77,6 +77,7 @@ def _qsa_graph_row_metadata_kernel(
     page_table_ptr,
     logical_positions_ptr,
     state_slots_ptr,
+    store_slots_ptr,
     ring_locs_ptr,
     # Pool state.
     req_to_token_ptr,
@@ -113,6 +114,7 @@ def _qsa_graph_row_metadata_kernel(
     else:
         seq_len = tl.load(row_seq_lens_ptr + row).to(tl.int32)
         req = tl.load(row_req_pool_ptr + row).to(tl.int64)
+        prefix = tl.load(row_prefix_lens_ptr + row).to(tl.int32)
     token_row = req * req_to_token_row_stride
     if tl.program_id(1) == 0:
         current = tl.maximum(seq_len - 1, 0)
@@ -128,7 +130,14 @@ def _qsa_graph_row_metadata_kernel(
         tl.store(write_locs_ptr + row, write_loc)
 
         tl.store(logical_positions_ptr + row, current)
-        tl.store(state_slots_ptr + row, req * RATIO + (current % RATIO).to(tl.int64))
+        own_slot = req * RATIO + (current % RATIO).to(tl.int64)
+        tl.store(state_slots_ptr + row, own_slot)
+        # Multi-row decode: a row past a group close in this step shares a ring slot with that group, so its
+        # key waits in request slot 0's inert rows until the compress has read the group (the indexer
+        # re-stores it at own_slot); prefix is the request's first position this step
+        # (metadata.build_pending_store_slots is the same rule on the host)
+        past_close = (current // RATIO) > (prefix // RATIO)
+        tl.store(store_slots_ptr + row, tl.where(past_close, (current % RATIO).to(tl.int64), own_slot))
         ring_base = row.to(tl.int64) * RATIO
         for k in tl.static_range(RATIO):
             member = tl.maximum(current - (RATIO - 1 - k), 0)
@@ -202,6 +211,11 @@ def launch_graph_metadata(
         indexer.graph_compressed_page_table,
         indexer.decode_logical_positions,
         indexer.pending_ring_slots,
+        (
+            getattr(indexer, "pending_store_slots", None)
+            if getattr(indexer, "pending_store_slots", None) is not None
+            else torch.empty_like(indexer.pending_ring_slots)
+        ),
         indexer.graph_ring_group_locs,
         req_to_token,
         req_to_token.stride(0),
@@ -245,6 +259,7 @@ def _qsa_draft_graph_metadata_kernel(
                 buf[4],
                 buf[5],
                 buf[6],
+                buf[6],  # store slots: a draft decode step is one row a request, stored at its own ring slot
                 buf[7],
                 req_to_token,
                 row_stride,

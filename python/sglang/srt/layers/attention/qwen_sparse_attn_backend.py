@@ -64,6 +64,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
     build_group_ring_slots,
     build_pending_ring_slots,
+    build_pending_store_slots,
     build_rope_position_matrix,
     compressed_decode_view,
 )
@@ -785,6 +786,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         decode_lengths = None
         decode_logical_positions = None
         pending_ring_slots = None
+        pending_store_slots = None
         compress_group_ring_locs = None
         extend_rope_matrix = None
         write_locs, group_positions, group_sequence_ids, group_member_rows = (
@@ -843,6 +845,15 @@ class QwenSparseAttnBackend(AttentionBackend):
                     ring_logical_positions,
                     self.compress_ratio,
                 )
+            if speculative_paged and group_member_rows is None:
+                # multi-row decode: rows past a group close wait in the inert ring rows (N298)
+                pending_store_slots = build_pending_store_slots(
+                    pending_ring_slots=pending_ring_slots,
+                    token_to_batch_idx=token_to_batch_idx,
+                    req_pool_indices=row_req_pool_indices,
+                    logical_positions=ring_logical_positions,
+                    compress_ratio=self.compress_ratio,
+                )
             if write_locs.numel():
                 if group_member_rows is not None:
                     rope_source = (
@@ -877,6 +888,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             decode_lengths=decode_lengths,
             decode_logical_positions=decode_logical_positions,
             pending_ring_slots=pending_ring_slots,
+            pending_store_slots=pending_store_slots,
             compress_group_ring_locs=compress_group_ring_locs,
             extend_rope_matrix=extend_rope_matrix,
             defer_block_expansion=(
@@ -1003,6 +1015,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._graph_state_slots = torch.zeros(
             max_num_tokens, dtype=torch.int64, device=self.device
         )
+        self._graph_store_slots = torch.zeros(
+            max_num_tokens, dtype=torch.int64, device=self.device
+        )
         self._graph_ring_group_locs = torch.zeros(
             (max_num_tokens, self.compress_ratio),
             dtype=torch.int32,
@@ -1090,6 +1105,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             graph_prefix_lengths=self._graph_prefix_lengths[:metadata_rows],
             decode_logical_positions=self._graph_logical_positions[:metadata_rows],
             pending_ring_slots=self._graph_state_slots[:metadata_rows],
+            pending_store_slots=self._graph_store_slots[:metadata_rows],
             graph_ring_group_locs=self._graph_ring_group_locs[:metadata_rows],
             defer_block_expansion=self._can_defer_block_expansion(forward_mode),
         )
@@ -1291,6 +1307,16 @@ class QwenSparseAttnBackend(AttentionBackend):
                 is_extend=False,
             )
         )
+        if getattr(metadata, "pending_store_slots", None) is not None:
+            metadata.pending_store_slots.copy_(
+                build_pending_store_slots(
+                    pending_ring_slots=metadata.pending_ring_slots,
+                    token_to_batch_idx=metadata.token_to_batch_idx,
+                    req_pool_indices=req_pool_indices,
+                    logical_positions=current_positions,
+                    compress_ratio=ratio,
+                )
+            )
         metadata.graph_ring_group_locs.copy_(
             build_group_ring_slots(
                 req_pool_indices=req_pool_indices,

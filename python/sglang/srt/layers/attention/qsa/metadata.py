@@ -87,6 +87,10 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     decode_lengths: Optional[torch.Tensor] = None
     decode_logical_positions: Optional[torch.Tensor] = None
     pending_ring_slots: Optional[torch.Tensor] = None
+    # Multi-row decode (target verify, draft-extend): where each row's raw index key is stored BEFORE the
+    # compress -- its ring slot, or for a row past a group close in this step, request slot 0's inert rows
+    # (build_pending_store_slots); the indexer re-stores every row at pending_ring_slots after the compress.
+    pending_store_slots: Optional[torch.Tensor] = None
     compress_group_ring_locs: Optional[torch.Tensor] = None
     extend_rope_matrix: Optional[torch.Tensor] = None
     graph_ring_group_locs: Optional[torch.Tensor] = None
@@ -267,6 +271,33 @@ def build_pending_ring_slots(
     return slots
 
 
+def build_pending_store_slots(
+    *,
+    pending_ring_slots: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    logical_positions: torch.Tensor,
+    compress_ratio: int,
+) -> torch.Tensor:
+    """Multi-row decode: the slot each row's raw index key is stored at BEFORE the compress.
+
+    A request's rows are consecutive positions, and a row past a group close inside this step lands on a ring
+    slot of that group (position 4b + 4 + k shares 4b + k's slot): stored first, it would replace the group's
+    own key before the compress reads it. Such a row is parked in rows [0, ratio) of request slot 0 (never
+    allocated: the inert dump) and re-stored at its ring slot after the compress. A row is past a close when its
+    group index exceeds that of its request's first row in this forward. CUDA-graph safe (no host sync)."""
+    n = logical_positions.numel()
+    positions = logical_positions.long()[:n]
+    requests = req_pool_indices.long()[token_to_batch_idx.long()[:n]]
+    idx = torch.arange(n, device=positions.device)
+    start = torch.ones(n, dtype=torch.bool, device=positions.device)
+    if n > 1:
+        start[1:] = requests[1:] != requests[:-1]
+    first = positions[torch.cummax(torch.where(start, idx, 0), 0).values]
+    past_close = positions // compress_ratio > first // compress_ratio
+    return torch.where(past_close, positions % compress_ratio, pending_ring_slots.long()[:n])
+
+
 def build_group_ring_slots(
     *,
     req_pool_indices: torch.Tensor,
@@ -332,6 +363,7 @@ __all__ = [
     "QSAIndexerMetadata",
     "build_qsa_row_ranges",
     "build_pending_ring_slots",
+    "build_pending_store_slots",
     "build_group_ring_slots",
     "build_rope_position_matrix",
     "compressed_decode_view",

@@ -436,6 +436,126 @@ def test_expand_block_indices_int_inputs(dtype):
     assert torch.equal(out.cpu(), ref)
 
 
+def test_build_pending_store_slots_parks_rows_past_a_close():
+    """N298: a multi-row decode row past a group close in this forward is stored in request slot 0's inert
+    rows [0, ratio) before the compress; every other row at its own ring slot."""
+    from sglang.srt.layers.attention.qsa.metadata import (
+        build_pending_ring_slots,
+        build_pending_store_slots,
+    )
+
+    device = torch.device("cuda")
+    # request 2: positions 10..13 (11 closes group 8..11; 12, 13 follow it); request 3: 20..23 (the close is
+    # its last row); request 5: one decode row at 7
+    positions = torch.tensor([10, 11, 12, 13, 20, 21, 22, 23, 7], device=device)
+    batch = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1, 2], device=device, dtype=torch.int32)
+    reqs = torch.tensor([2, 3, 5], device=device, dtype=torch.int32)
+    ring = build_pending_ring_slots(
+        token_to_batch_idx=batch,
+        req_pool_indices=reqs,
+        sequence_lengths=positions + 1,
+        logical_positions=positions,
+        compress_ratio=RATIO,
+        is_extend=False,
+    )
+    store = build_pending_store_slots(
+        pending_ring_slots=ring,
+        token_to_batch_idx=batch,
+        req_pool_indices=reqs,
+        logical_positions=positions,
+        compress_ratio=RATIO,
+    )
+    assert ring.tolist() == [10, 11, 8, 9, 12, 13, 14, 15, 23]
+    assert store.tolist() == [10, 11, 0, 1, 12, 13, 14, 15, 23]
+
+
+@pytest.mark.parametrize("start", [40, 41, 42, 43])
+@pytest.mark.parametrize("prestored", [False, True])
+def test_multirow_compress_reads_the_closing_groups_own_keys(start, prestored):
+    """N298: four verify rows from `start`; the row at a position = 3 (mod 4) closes a group whose earlier
+    members are in the ring from earlier steps. The compressed key must equal the safe order's (rows through
+    the close stored, the group compressed, the rest stored), and the ring must end with every row's key at its
+    own slot. Must-fire: the old order (every row stored first) differs whenever a row follows the close."""
+    from sglang.srt.layers.attention.qsa.metadata import build_pending_store_slots
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    rotary = _make_rotary([24, 20, 20], True, device, dtype)
+    indexer = _make_indexer(rotary, device, dtype)
+    req, rows, write_loc = 2, 4, 37
+    pos = torch.arange(start, start + rows, device=device)
+    rope = pos.unsqueeze(0).expand(3, -1).contiguous()
+    torch.manual_seed(start)
+    token_k = torch.randn(rows, 1, HEAD_DIM, device=device, dtype=dtype)
+    prior = torch.randn(32, 1, HEAD_DIM, device=device, dtype=dtype)
+
+    def fresh_pool():
+        pool = FakePool(32, 64, device, dtype)
+        pool.key_state.copy_(prior)
+        for p in range(start - RATIO, start):  # the earlier steps' keys and positions at their ring slots
+            pool.qsa_rope_position_buffer[req * RATIO + p % RATIO] = p
+        return pool
+
+    ring_slots = req * RATIO + pos % RATIO
+    close = int((pos % RATIO == RATIO - 1).nonzero()[0])
+    members = pos[:, None] - torch.arange(RATIO - 1, -1, -1, device=device)[None, :]
+    group_locs = (req * RATIO + members % RATIO).to(torch.int32)
+    write_locs = torch.where(
+        pos % RATIO == RATIO - 1, torch.full_like(pos, write_loc), torch.zeros_like(pos)
+    ).to(torch.int32)
+
+    ref = fresh_pool()
+    ref.set_qsa_key_state_buffer(0, ring_slots[: close + 1], token_k[: close + 1])
+    ref.set_qsa_rope_position_buffer(ring_slots[: close + 1], pos[: close + 1])
+    _eager_compress_reference(
+        indexer, ref, group_locs[close : close + 1], write_locs[close : close + 1]
+    )
+    store = build_pending_store_slots(
+        pending_ring_slots=ring_slots,
+        token_to_batch_idx=torch.zeros(rows, dtype=torch.int32, device=device),
+        req_pool_indices=torch.tensor([req], dtype=torch.int32, device=device),
+        logical_positions=pos,
+        compress_ratio=RATIO,
+    )
+
+    def run(store_slots):
+        pool = fresh_pool()
+        meta = SimpleNamespace(
+            token_to_kv_pool=pool,
+            compress_member_rows=None,
+            is_cuda_graph=True,
+            graph_write_locs=write_locs,
+            graph_ring_group_locs=group_locs,
+        )
+        if prestored:  # as project_qk's fused store leaves it
+            first = ring_slots if store_slots is None else store_slots
+            pool.set_qsa_key_state_buffer(0, first, token_k)
+            pool.set_qsa_rope_position_buffer(first, pos)
+        indexer.update_key_state_and_compress(
+            token_k,
+            pos,
+            rope,
+            meta,
+            state_slots=ring_slots,
+            state_stored=prestored,
+            store_slots=store_slots,
+        )
+        return pool
+
+    new, old = run(store), run(None)
+    assert_bit_comparable(new.compressed[write_loc], ref.compressed[write_loc])
+    assert torch.equal(new.key_state[ring_slots.long()], token_k)
+    assert torch.equal(
+        new.qsa_rope_position_buffer[ring_slots.long()],
+        pos.unsqueeze(1).expand(-1, 3),
+    )
+    gap = (old.compressed[write_loc].float() - ref.compressed[write_loc].float()).abs().max().item()
+    if close < rows - 1:
+        assert gap > 0.05, gap
+    else:
+        assert_bit_comparable(old.compressed[write_loc], ref.compressed[write_loc])
+
+
 def test_decode_selection_equivalent():
     """Last-ulp norm flips must not change the selected blocks:
     scores are fp32 sums of 128-dim dots, so a 1-ulp flip only matters on exact ties."""

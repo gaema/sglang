@@ -557,7 +557,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
             _pending_ring_slots=lambda metadata, logical_positions, is_extend: (
                 torch.zeros(logical_positions.numel(), dtype=torch.long)
             ),
-            update_key_state_and_compress=lambda token_k, logical, rope, meta, state_slots=None, state_stored=False: (
+            update_key_state_and_compress=lambda token_k, logical, rope, meta, state_slots=None, state_stored=False, store_slots=None: (
                 calls.update(
                     token_rows=token_k.shape[0],
                     logical_rows=logical.numel(),
@@ -1262,7 +1262,7 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path(max_pages):
         qsa_compressed_page_size = full_page // ratio
         qsa_block_topk = 512
 
-    def run_case(mode, bs, num_rows, seq_lens_list, extend_len, extend_lens=None):
+    def run_case(mode, bs, num_rows, seq_lens_list, extend_len, extend_lens=None, expect_store=None):
         pool = _Pool()
         backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
         # A page-aligned token table: request r's token i lives in full page
@@ -1314,6 +1314,9 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path(max_pages):
                 pending_ring_slots=torch.zeros(
                     num_rows, dtype=torch.int64, device=device
                 ),
+                pending_store_slots=torch.zeros(
+                    num_rows, dtype=torch.int64, device=device
+                ),
                 graph_ring_group_locs=torch.zeros(
                     (num_rows, ratio), dtype=torch.int32, device=device
                 ),
@@ -1361,16 +1364,30 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path(max_pages):
             "graph_compressed_lengths",
             "decode_logical_positions",
             "pending_ring_slots",
+            "pending_store_slots",
             "graph_ring_group_locs",
         ):
             kernel_buf = getattr(kernel_metadata.indexer_metadata, field)
             host_buf = getattr(host_metadata.indexer_metadata, field)
             assert torch.equal(kernel_buf, host_buf), (mode, field)
+        if expect_store is not None:
+            got = kernel_metadata.indexer_metadata.pending_store_slots.tolist()
+            assert got == expect_store, (got, expect_store)
 
     # Decode: lengths straddling boundaries (256 is a boundary, others not).
     run_case(mode=0, bs=4, num_rows=4, seq_lens_list=[255, 256, 257, 512], extend_len=0)
     # Target verify: 2 requests x 3 draft rows, one request crossing a boundary.
     run_case(mode=1, bs=2, num_rows=6, seq_lens_list=[254, 300], extend_len=3)
+    # N298: 4 verify rows; request 1's rows 304, 305 follow the close at 303 and wait in the inert rows 0, 1
+    # (request 0's rows 256, 257 park at 0, 1 too, which are also its own slots)
+    run_case(
+        mode=1,
+        bs=2,
+        num_rows=8,
+        seq_lens_list=[254, 302],
+        extend_len=4,
+        expect_store=[2, 3, 0, 1, 6, 7, 0, 1],
+    )
     # Draft extend: ragged per-request rows plus a dummy-tail row.
     run_case(
         mode=2,

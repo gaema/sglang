@@ -343,23 +343,31 @@ class QSAIndexer(MultiPlatformOp):
         metadata,
         state_slots: torch.Tensor | None = None,
         state_stored: bool = False,
+        store_slots: torch.Tensor | None = None,
     ) -> None:
-        """Store the pending-group ring and compress each completed group."""
+        """Store the pending-group ring and compress each completed group.
+
+        store_slots (multi-row decode, metadata.pending_store_slots): where the rows were (state_stored) or are
+        stored before the compress -- rows past a group close in this step wait in the inert ring rows, so the
+        compress reads the closing group's own members -- then every row is re-stored at state_slots."""
 
         pool = metadata.token_to_kv_pool
         is_extend = metadata.compress_member_rows is not None
+        n = token_k.shape[0]
+        if state_slots is None and (not state_stored or store_slots is not None):
+            state_slots = self._pending_ring_slots(metadata, logical_positions, is_extend)
         if not state_stored:
-            if state_slots is None:
-                state_slots = self._pending_ring_slots(
-                    metadata, logical_positions, is_extend
-                )
-            pool.set_qsa_key_state_buffer(
-                self.layer_id, state_slots[: token_k.shape[0]], token_k
-            )
-            pool.set_qsa_rope_position_buffer(
-                state_slots[: token_k.shape[0]], rope_positions
-            )
+            first = store_slots if store_slots is not None else state_slots
+            pool.set_qsa_key_state_buffer(self.layer_id, first[:n], token_k)
+            pool.set_qsa_rope_position_buffer(first[:n], rope_positions)
+        self._compress_completed_groups(token_k, rope_positions, metadata, is_extend)
+        if store_slots is not None:
+            pool.set_qsa_key_state_buffer(self.layer_id, state_slots[:n], token_k)
+            pool.set_qsa_rope_position_buffer(state_slots[:n], rope_positions)
 
+    def _compress_completed_groups(self, token_k, rope_positions, metadata, is_extend) -> None:
+        """Compress each group completed in this forward: from the pending ring, or the extend chunk."""
+        pool = metadata.token_to_kv_pool
         if metadata.is_cuda_graph:
             self._compress_decode_cuda_graph(metadata)
             return
@@ -787,11 +795,18 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.compress_member_rows is not None,
             )
+        # Multi-row decode (N298): rows past a group close in this step store their keys in the inert ring rows
+        # until the compress has read the group; update_key_state_and_compress re-stores them.
+        store_slots = (
+            getattr(indexer_metadata, "pending_store_slots", None)
+            if (is_target_verify or is_draft_extend) and indexer_metadata.compress_member_rows is None
+            else None
+        )
         q, token_k, state_stored = self.project_qk(
             hidden_states,
             positions,
             pool=indexer_metadata.token_to_kv_pool,
-            cache_loc=state_slots,
+            cache_loc=state_slots if store_slots is None else store_slots,
             q_heads_padded=(
                 # The tilelang decode MQA kernel needs query heads in multiples of 8.
                 ((self.index_n_heads + 7) // 8) * 8
@@ -808,6 +823,7 @@ class QSAIndexer(MultiPlatformOp):
             indexer_metadata,
             state_slots=state_slots,
             state_stored=state_stored,
+            store_slots=store_slots,
         )
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             compressed_cache, page_table, compressed_lengths, max_model_len = (
