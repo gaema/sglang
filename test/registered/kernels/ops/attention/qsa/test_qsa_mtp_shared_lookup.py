@@ -6,6 +6,7 @@ Two-sided: the must-fire arm checks the old layout (tail after the -1 padding) w
 """
 
 import unittest
+import unittest.mock
 
 import torch
 
@@ -39,6 +40,16 @@ class TestMTPSharedLookup(unittest.TestCase):
         st.capture(cap, torch.tensor([1]), torch.tensor([10]), 0)
         out = st.lookup(torch.tensor([1]), torch.tensor([10]), 0)[0]
         self.assertEqual(out.tolist(), [9, 3, 7, 1, 10, -1])
+
+    def test_no_tail_mode(self):
+        # SGLANG_QSA_MTP_DRAFT_TAIL=0: the captured selection only, compacted, no drafted positions
+        with unittest.mock.patch.dict("os.environ", {"SGLANG_QSA_MTP_DRAFT_TAIL": "0"}):
+            st = self._state()
+        cap = torch.tensor([[0, 1, 2, 3, -1, -1, -1, -1, 4, 5]], dtype=torch.int32)
+        st.capture(cap, torch.tensor([1]), torch.tensor([6]), 0)
+        out = st.lookup(torch.tensor([1]), torch.tensor([7]), 0)[0]
+        self.assertEqual(_prefix_read(out), [0, 1, 2, 3, 4, 5])
+        self.assertTrue(bool((out[6:] == -1).all()))
 
     def test_must_fire_old_layout_loses_tail(self):
         # the layout before the fix: the tail at the row's end, after the padding

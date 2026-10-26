@@ -214,6 +214,9 @@ class QSAMTPSharedSparseIndices:
             device=device,
         )
         self._tail_offsets = torch.arange(tail_width, device=device)
+        # SGLANG_QSA_MTP_DRAFT_TAIL=0: the draft decode steps attend the captured
+        # selection only, without the positions drafted since (vLLM's step-0 reuse).
+        self.draft_tail = _n63_os.environ.get("SGLANG_QSA_MTP_DRAFT_TAIL", "1") != "0"
 
     def capture(
         self,
@@ -242,7 +245,7 @@ class QSAMTPSharedSparseIndices:
         out = self.indices[slot, rows]
         base = self.captured_len[slot, rows].to(torch.int64)
         tail = base.unsqueeze(1) + self._tail_offsets.unsqueeze(0)
-        valid = tail <= current_positions.to(torch.int64).unsqueeze(1)
+        valid = (tail <= current_positions.to(torch.int64).unsqueeze(1)) & self.draft_tail
         out[:, out.shape[1] - self.tail_width :] = torch.where(valid, tail, -1).to(
             out.dtype
         )
