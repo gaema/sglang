@@ -246,7 +246,15 @@ class QSAMTPSharedSparseIndices:
         out[:, out.shape[1] - self.tail_width :] = torch.where(valid, tail, -1).to(
             out.dtype
         )
-        return out
+        # Valid entries first (stable): the non-expanded consumer
+        # (_qsa_fused_kv_prepare + trtllm decode) packs columns positionally and
+        # reads each row's first COUNTS columns, COUNTS = the valid entries. The
+        # captured selection keeps -1 holes ahead of the tail, so without this
+        # the draft steps attend zero K / V in place of their newest positions.
+        width = out.shape[1]
+        order = torch.arange(width, device=out.device).unsqueeze(0)
+        key = torch.where(out >= 0, order, order + width)
+        return out.gather(1, torch.argsort(key, dim=1, stable=True))
 
 
 class QwenSparseAttnBackend(AttentionBackend):
