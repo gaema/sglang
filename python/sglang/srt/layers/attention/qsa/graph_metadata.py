@@ -86,6 +86,7 @@ def _qsa_graph_row_metadata_kernel(
     RATIO: tl.constexpr,
     FULL_PAGE: tl.constexpr,  # full-KV tokens per page
     PAGE_BLOCK: tl.constexpr,
+    SPAN: tl.constexpr,  # pending-ring positions a request (qsa.metadata.qsa_ring_span: RATIO, or 2 RATIO)
     seq_lens_ptr,
     req_pool_ptr,
     row_prefix_lens_ptr,
@@ -130,18 +131,19 @@ def _qsa_graph_row_metadata_kernel(
         tl.store(write_locs_ptr + row, write_loc)
 
         tl.store(logical_positions_ptr + row, current)
-        own_slot = req * RATIO + (current % RATIO).to(tl.int64)
+        own_slot = req * SPAN + (current % SPAN).to(tl.int64)
         tl.store(state_slots_ptr + row, own_slot)
         # Multi-row decode: a row past a group close in this step shares a ring slot with that group, so its
         # key waits in request slot 0's inert rows until the compress has read the group (the indexer
         # re-stores it at own_slot); prefix is the request's first position this step
-        # (metadata.build_pending_store_slots is the same rule on the host)
-        past_close = (current // RATIO) > (prefix // RATIO)
+        # (metadata.build_pending_store_slots is the same rule on the host). A two-group ring (SPAN > RATIO)
+        # has no such sharing inside an admitted window: every row is stored at its own slot.
+        past_close = (SPAN == RATIO) & ((current // RATIO) > (prefix // RATIO))
         tl.store(store_slots_ptr + row, tl.where(past_close, (current % RATIO).to(tl.int64), own_slot))
         ring_base = row.to(tl.int64) * RATIO
         for k in tl.static_range(RATIO):
             member = tl.maximum(current - (RATIO - 1 - k), 0)
-            slot = req * RATIO + (member % RATIO).to(tl.int64)
+            slot = req * SPAN + (member % SPAN).to(tl.int64)
             tl.store(ring_locs_ptr + ring_base + k, slot.to(tl.int32))
 
     # Page-table entries are the request's FULL-KV page ids, read from the
@@ -223,6 +225,7 @@ def launch_graph_metadata(
         RATIO=indexer.compress_ratio,
         FULL_PAGE=pool.qsa_compressed_page_size * indexer.compress_ratio,
         PAGE_BLOCK=128,
+        SPAN=pool.qsa_ring_span,
         seq_lens_ptr=seq_lens,
         req_pool_ptr=req_pool_indices,
         row_prefix_lens_ptr=row_prefix_lens,
@@ -247,6 +250,7 @@ def _qsa_draft_graph_metadata_kernel(
     MAX_PAGES: tl.constexpr,
     RATIO: tl.constexpr,
     FULL_PAGE: tl.constexpr,
+    SPAN: tl.constexpr,
 ):
     for step in tl.static_range(len(buffers)):
         if tl.program_id(2) == step:
@@ -267,6 +271,7 @@ def _qsa_draft_graph_metadata_kernel(
                 RATIO,
                 FULL_PAGE,
                 128,
+                SPAN,
                 seq_lens,
                 req_pool,
                 buf[8],
@@ -300,11 +305,12 @@ def prepare_draft_graph_metadata(metadata, req_to_token, pool):
         metadata[0].indexer_metadata.graph_compressed_page_table.shape[1],
         pool.qsa_compress_ratio,
         pool.qsa_compressed_page_size * pool.qsa_compress_ratio,
+        pool.qsa_ring_span,
     )
 
 
 def launch_draft_graph_metadata(args, seq_lens, req_pool_indices, bs, num_padding):
-    buffers, req_to_token, row_stride, max_pages, ratio, full_page = args
+    buffers, req_to_token, row_stride, max_pages, ratio, full_page, span = args
     if bs == 0:
         return
     _qsa_draft_graph_metadata_kernel[(bs, triton.cdiv(max_pages, 128), len(buffers))](
@@ -318,5 +324,6 @@ def launch_draft_graph_metadata(args, seq_lens, req_pool_indices, bs, num_paddin
         max_pages,
         ratio,
         full_page,
+        span,
         num_warps=1,
     )

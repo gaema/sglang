@@ -35,8 +35,10 @@ def _n63_tail_ring_slots(slots, token_to_batch_idx, req_pool_indices,
     import torch
     n = logical_positions.numel()
     rows = token_to_batch_idx.long()[:n]
+    from sglang.srt.layers.attention.qsa.metadata import qsa_ring_span
+    span = qsa_ring_span(ratio)
     tail = _n63_tail_rows(sequence_lengths, extend_seq_lens, ratio)[rows]
-    decode_slots = req_pool_indices.long()[rows] * ratio + logical_positions.long() % ratio
+    decode_slots = req_pool_indices.long()[rows] * span + logical_positions.long() % span
     return torch.where(tail, decode_slots, slots)
 from copy import copy
 from functools import lru_cache
@@ -373,17 +375,17 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "Qwen QSA target verification supports only speculative_eagle_topk=1"
             )
         draft_tokens = int(getattr(spec_info, "draft_token_num", 0) or 0)
-        # SGLANG_QSA_WIDE_VERIFY=1: a window of up to ratio + 1 tokens crosses at most one group close wherever it
-        # starts, and build_pending_store_slots parks the rows past that close in the inert dump until the compress
-        # has read the group (the multi-row decode rule, N298); wider windows can cross two closes and stay refused.
-        limit = self.compress_ratio + (1 if _n63_os.environ.get("SGLANG_QSA_WIDE_VERIFY", "0") == "1" else 0)
+        # The pending-group ring keys state by position % span (qsa.metadata.qsa_ring_span): with one group a
+        # verify window wider than the ratio would collide within one forward; SGLANG_QSA_RING2=1 (two groups)
+        # admits span - ratio + 1 rows, every slot a forward writes distinct from every member a compress reads.
+        from sglang.srt.layers.attention.qsa.metadata import qsa_max_verify_rows
+
+        limit = qsa_max_verify_rows(self.compress_ratio)
         if draft_tokens > limit:
-            # The pending-group ring keys state by position % ratio; a verify
-            # window wider than the ratio would collide within one forward.
             raise NotImplementedError(
-                "Qwen QSA requires speculative_num_draft_tokens <= the QSA "
-                f"compress ratio ({self.compress_ratio}): the pending "
-                f"index-key ring holds one group; got {draft_tokens}"
+                f"Qwen QSA requires speculative_num_draft_tokens <= {limit} with this pending index-key ring "
+                f"(compress ratio {self.compress_ratio}; SGLANG_QSA_RING2=1 holds two groups and admits "
+                f"{2 * self.compress_ratio - self.compress_ratio + 1}); got {draft_tokens}"
             )
 
     @staticmethod

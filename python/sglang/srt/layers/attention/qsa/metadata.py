@@ -6,12 +6,31 @@ contains only fields and transforms consumed by the indexer.
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import msgspec
 import torch
 
 from sglang.srt.layers.attention.qsa.kernel import qsa_fast_topk
+
+
+def qsa_ring_span(compress_ratio: int) -> int:
+    """Pending index-key ring positions a request: one group (the default) or, with SGLANG_QSA_RING2=1, two.
+
+    The ring holds a request's not-yet-compressed index keys at slot req * span + position % span. One group (span =
+    ratio) admits a verify window of at most `ratio` rows: a wider window completes two groups in one forward, and
+    the second group's members would share ring slots with the first's. Two groups (span = 2 ratio) admit a window
+    of span - ratio + 1 rows (5 at ratio 4): the open group's members are at most ratio - 1 positions before the
+    window, so every slot the forward writes is distinct from every member a compress in it still reads, and no row
+    has to be parked."""
+    return compress_ratio * (2 if os.environ.get("SGLANG_QSA_RING2", "0") == "1" else 1)
+
+
+def qsa_max_verify_rows(compress_ratio: int) -> int:
+    """The widest verify window (draft tokens a request) the pending ring admits."""
+    return qsa_ring_span(compress_ratio) - compress_ratio + 1 if qsa_ring_span(compress_ratio) > compress_ratio \
+        else compress_ratio
 
 
 def build_qsa_row_ranges(
@@ -257,17 +276,18 @@ def build_pending_ring_slots(
     compress_ratio: int,
     is_extend: bool,
 ) -> torch.Tensor:
-    """Pending-ring slot ``req_pool_idx * ratio + position % ratio`` per token.
-    On extend, tokens before the pending tail dump into rows [0, ratio),
+    """Pending-ring slot ``req_pool_idx * span + position % span`` per token (span: qsa_ring_span).
+    On extend, tokens before the pending tail dump into rows [0, span),
     which no request owns (request slot 0 is never allocated); CUDA-graph safe."""
+    span = qsa_ring_span(compress_ratio)
     rows = token_to_batch_idx.long()[: logical_positions.numel()]
     requests = req_pool_indices.long()[rows]
     positions = logical_positions.long()
-    slots = requests * compress_ratio + positions % compress_ratio
+    slots = requests * span + positions % span
     if is_extend:
         lengths = sequence_lengths.long()[rows]
         pending = positions >= (lengths // compress_ratio) * compress_ratio
-        slots = torch.where(pending, slots, positions % compress_ratio)
+        slots = torch.where(pending, slots, positions % span)
     return slots
 
 
@@ -285,7 +305,12 @@ def build_pending_store_slots(
     slot of that group (position 4b + 4 + k shares 4b + k's slot): stored first, it would replace the group's
     own key before the compress reads it. Such a row is parked in rows [0, ratio) of request slot 0 (never
     allocated: the inert dump) and re-stored at its ring slot after the compress. A row is past a close when its
-    group index exceeds that of its request's first row in this forward. CUDA-graph safe (no host sync)."""
+    group index exceeds that of its request's first row in this forward. CUDA-graph safe (no host sync).
+
+    With a two-group ring (qsa_ring_span > ratio) no row of an admitted window shares a slot with a member a
+    compress still reads, so every row is stored at its ring slot directly."""
+    if qsa_ring_span(compress_ratio) > compress_ratio:
+        return pending_ring_slots.long()[: logical_positions.numel()]
     n = logical_positions.numel()
     positions = logical_positions.long()[:n]
     requests = req_pool_indices.long()[token_to_batch_idx.long()[:n]]
@@ -306,6 +331,7 @@ def build_group_ring_slots(
     compress_ratio: int,
 ) -> torch.Tensor:
     """Ring slots of a planned group's members, oldest first."""
+    span = qsa_ring_span(compress_ratio)
     requests = req_pool_indices.long()[sequence_ids]
     offsets = torch.arange(
         compress_ratio - 1,
@@ -315,7 +341,7 @@ def build_group_ring_slots(
         dtype=torch.long,
     )
     positions = (group_end_positions[:, None] - offsets[None, :]).clamp_min(0)
-    return requests[:, None] * compress_ratio + positions % compress_ratio
+    return requests[:, None] * span + positions % span
 
 
 def build_rope_position_matrix(
@@ -367,4 +393,6 @@ __all__ = [
     "build_group_ring_slots",
     "build_rope_position_matrix",
     "compressed_decode_view",
+    "qsa_max_verify_rows",
+    "qsa_ring_span",
 ]
