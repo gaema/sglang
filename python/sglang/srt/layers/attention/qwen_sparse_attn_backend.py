@@ -48,6 +48,44 @@ from sglang.srt.mem_cache import q38fn_pp_mirror as _q38fn_pp  # _q38fn_schednos
 
 _Q38FN_NOSYNC = __import__("os").environ.get("SGLANG_Q38FN_QSA_NOSYNC", "0") == "1"  # _q38fn_nosync
 import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+# SGLANG_QSA_VALID_FIRST_TRITON=1: QSAMTPSharedSparseIndices.lookup compacts each row valid-first with one Triton
+# program a row (two prefix counts) instead of a stable torch.argsort, which runs a radix sort over the row
+# (qwen3-8-flash-next: 23.53 us a call at one request). The same permutation: valid entries in their order, then
+# the -1 entries.
+_QSA_VALID_FIRST_TRITON = _n63_os.environ.get("SGLANG_QSA_VALID_FIRST_TRITON", "0") == "1"
+
+
+@triton.jit
+def _qsa_valid_first_kernel(src, dst, width, stride_src, stride_dst, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    inb = offs < width
+    v = tl.load(src + row * stride_src + offs, mask=inb, other=-1)
+    valid = ((v >= 0) & inb).to(tl.int32)
+    hole = ((v < 0) & inb).to(tl.int32)
+    n_valid = tl.sum(valid, axis=0)
+    pos = tl.where(valid == 1, tl.cumsum(valid, axis=0) - 1, n_valid + tl.cumsum(hole, axis=0) - 1)
+    tl.store(dst + row * stride_dst + pos, v, mask=inb)
+
+
+def qsa_valid_first(rows: torch.Tensor) -> torch.Tensor:
+    """Each row's entries >= 0 first, in their order, then its -1 entries (stable valid-first)."""
+    if not (_QSA_VALID_FIRST_TRITON and rows.is_cuda and rows.dim() == 2):
+        width = rows.shape[1]
+        order = torch.arange(width, device=rows.device).unsqueeze(0)
+        key = torch.where(rows >= 0, order, order + width)
+        return rows.gather(1, torch.argsort(key, dim=1, stable=True))
+    src = rows.contiguous()
+    out = torch.empty_like(src)
+    if src.shape[0]:
+        _qsa_valid_first_kernel[(src.shape[0],)](
+            src, out, src.shape[1], src.stride(0), out.stride(0),
+            BLOCK=triton.next_power_of_2(src.shape[1]),
+        )
+    return out
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -254,10 +292,7 @@ class QSAMTPSharedSparseIndices:
         # reads each row's first COUNTS columns, COUNTS = the valid entries. The
         # captured selection keeps -1 holes ahead of the tail, so without this
         # the draft steps attend zero K / V in place of their newest positions.
-        width = out.shape[1]
-        order = torch.arange(width, device=out.device).unsqueeze(0)
-        key = torch.where(out >= 0, order, order + width)
-        return out.gather(1, torch.argsort(key, dim=1, stable=True))
+        return qsa_valid_first(out)
 
 
 class QwenSparseAttnBackend(AttentionBackend):

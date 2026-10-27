@@ -51,6 +51,36 @@ class TestMTPSharedLookup(unittest.TestCase):
         self.assertEqual(_prefix_read(out), [0, 1, 2, 3, 4, 5])
         self.assertTrue(bool((out[6:] == -1).all()))
 
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_triton_valid_first_equals_stable_argsort(self):
+        # SGLANG_QSA_VALID_FIRST_TRITON: the Triton compaction against the stable-argsort path, byte-equal, on the
+        # served width (512 + 3 + 4) and odd widths, rows 1..9, hole rates 0..100 %.
+        import sglang.srt.layers.attention.qwen_sparse_attn_backend as be
+
+        g = torch.Generator(device="cpu").manual_seed(0)
+        for width in (519, 10, 513, 1024, 1):
+            for rows in (1, 2, 4, 9):
+                for p_hole in (0.0, 0.3, 0.9, 1.0):
+                    x = torch.randint(0, 1 << 20, (rows, width), generator=g, dtype=torch.int32)
+                    x[torch.rand((rows, width), generator=g) < p_hole] = -1
+                    x = x.cuda()
+                    with unittest.mock.patch.object(be, "_QSA_VALID_FIRST_TRITON", False):
+                        ref = be.qsa_valid_first(x)
+                    with unittest.mock.patch.object(be, "_QSA_VALID_FIRST_TRITON", True):
+                        got = be.qsa_valid_first(x)
+                    self.assertTrue(torch.equal(ref, got), f"width {width} rows {rows} p_hole {p_hole}")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_must_fire_triton_compare_sees_order(self):
+        # the equality above can fail: an order-scrambled compaction (valid entries reversed) differs from it
+        import sglang.srt.layers.attention.qwen_sparse_attn_backend as be
+
+        x = torch.tensor([[5, -1, 7, 9, -1, 2]], dtype=torch.int32, device="cuda")
+        with unittest.mock.patch.object(be, "_QSA_VALID_FIRST_TRITON", True):
+            got = be.qsa_valid_first(x)
+        self.assertEqual(got.tolist(), [[5, 7, 9, 2, -1, -1]])
+        self.assertFalse(torch.equal(got, torch.tensor([[2, 9, 7, 5, -1, -1]], dtype=torch.int32, device="cuda")))
+
     def test_must_fire_old_layout_loses_tail(self):
         # the layout before the fix: the tail at the row's end, after the padding
         old = torch.tensor([0, 1, 2, 3, -1, -1, -1, -1, 4, 5, 6, 7, -1, -1])
