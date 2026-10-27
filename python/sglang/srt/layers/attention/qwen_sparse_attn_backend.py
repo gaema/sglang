@@ -373,7 +373,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "Qwen QSA target verification supports only speculative_eagle_topk=1"
             )
         draft_tokens = int(getattr(spec_info, "draft_token_num", 0) or 0)
-        if draft_tokens > self.compress_ratio:
+        # SGLANG_QSA_WIDE_VERIFY=1: a window of up to ratio + 1 tokens crosses at most one group close wherever it
+        # starts, and build_pending_store_slots parks the rows past that close in the inert dump until the compress
+        # has read the group (the multi-row decode rule, N298); wider windows can cross two closes and stay refused.
+        limit = self.compress_ratio + (1 if _n63_os.environ.get("SGLANG_QSA_WIDE_VERIFY", "0") == "1" else 0)
+        if draft_tokens > limit:
             # The pending-group ring keys state by position % ratio; a verify
             # window wider than the ratio would collide within one forward.
             raise NotImplementedError(
