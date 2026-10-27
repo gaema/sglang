@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -81,6 +82,30 @@ if TYPE_CHECKING:
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 
 logger = logging.getLogger(__name__)
+
+# _q38fn_ahist: SGLANG_Q38FN_ACCEPT_HIST=1 counts each request's correct drafts per verify, keyed by the
+# batch's request count (4 = four or more), and logs the cumulative histogram every
+# SGLANG_Q38FN_ACCEPT_HIST_EVERY verifies (qwen3-8-flash-next: draft acceptance by position). Default off.
+_Q38FN_ACCEPT_HIST = os.environ.get("SGLANG_Q38FN_ACCEPT_HIST", "0") == "1"
+_Q38FN_ACCEPT_HIST_EVERY = int(os.environ.get("SGLANG_Q38FN_ACCEPT_HIST_EVERY", "500"))
+_q38fn_ahist: dict = {}
+_q38fn_ahist_n = [0]
+
+
+def _q38fn_accept_hist(num_reqs: int, per_req: List[int]) -> None:
+    h = _q38fn_ahist.setdefault(min(num_reqs, 4), [0] * 8)
+    for c in per_req:
+        h[min(max(int(c), 0), 7)] += 1
+    _q38fn_ahist_n[0] += 1
+    if _q38fn_ahist_n[0] % _Q38FN_ACCEPT_HIST_EVERY == 0:
+        logger.info(
+            "[accept-hist] verifies=%d %s",
+            _q38fn_ahist_n[0],
+            " ".join(
+                f"bs{k}:" + ",".join(str(x) for x in v[:5])
+                for k, v in sorted(_q38fn_ahist.items())
+            ),
+        )
 
 
 def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
@@ -782,6 +807,8 @@ class SchedulerBatchResultProcessor:
             length - num_non_draft for length in accept_lens
         ]
         result.num_correct_drafts = sum(result.num_correct_drafts_per_req_cpu)
+        if _Q38FN_ACCEPT_HIST:
+            _q38fn_accept_hist(len(batch.reqs), result.num_correct_drafts_per_req_cpu)
 
         block_accept_lens = (
             result.block_accept_lens.tolist()
