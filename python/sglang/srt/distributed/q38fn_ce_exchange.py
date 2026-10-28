@@ -28,7 +28,6 @@ import os
 
 import torch
 import torch.distributed as dist
-from torch.multiprocessing.reductions import reduce_tensor
 
 _G = 128
 _PAGE = 4096
@@ -36,11 +35,13 @@ _FULL = (0, 8)  # uint64 slot index per rank, 64 bytes apart
 _states: dict = {}
 
 
-def _chk(r, what):
+def _chk(r, what, runtime=False):
     from cuda.bindings import driver as cu
+    from cuda.bindings import runtime as rt
 
     err = r[0] if isinstance(r, tuple) else r
-    if err != cu.CUresult.CUDA_SUCCESS:
+    ok = rt.cudaError_t.cudaSuccess if runtime else cu.CUresult.CUDA_SUCCESS
+    if err != ok:
         raise RuntimeError(f"q38fn ce exchange: {what} failed: {err}")
     return r
 
@@ -71,13 +72,23 @@ class _State:
         if self.me == 0:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
             os.ftruncate(fd, _PAGE)
+        from cuda.bindings import runtime as rt
+
+        self.rt = rt
+        self.dev = dev.index
         got = [None, None]
-        dist.all_gather_object(got, (reduce_tensor(self.q), reduce_tensor(self.s), path), group=group.cpu_group)
-        (fq, aq), (fs, as_), _ = got[self.peer]
-        self.peer_q = fq(*aq)
-        self.peer_s = fs(*as_)
+        dist.all_gather_object(got, (self._ipc(self.q), self._ipc(self.s), dev.index, path), group=group.cpu_group)
+        hq, hs, self.pdev, _ = got[self.peer]
+        # The peer's send buffers are opened here, with this rank's device current and lazy peer access, so the
+        # mapping is a P2P mapping in this rank's context and a copy from it is one copy-engine transfer over PCIe.
+        # Opened through torch's IPC rebuild instead (in the peer device's context) every copy was bounced through
+        # host memory, a DtoH and an HtoD a transfer, with or without peer access on: served, the GPU sat idle 122 ms
+        # of a 286.6 ms prefill step (rule-ce-ar3).
+        self.p2p = torch.cuda.can_device_access_peer(dev.index, self.pdev)
+        self.peer_q_ptr = self._open(hq)
+        self.peer_s_ptr = self._open(hs)
         if self.me == 1:
-            path = got[0][2]
+            path = got[0][3]
             fd = os.open(path, os.O_RDWR)
         self.mm = mmap.mmap(fd, _PAGE)
         os.close(fd)
@@ -90,7 +101,23 @@ class _State:
         if self.me == 0:
             os.unlink(path)
         print(f"[q38fn-tparce] copy-engine exchange on: group={group.unique_name} hidden={hidden} "
-              f"rows_cap={rows_cap} me={self.me} pid={os.getpid()}", flush=True)
+              f"rows_cap={rows_cap} me={self.me} p2p={int(self.p2p)} pid={os.getpid()}", flush=True)
+
+    def _ipc(self, t):
+        """(IPC handle bytes, offset) of a tensor's allocation: the handle names the allocation's base."""
+        cu, rt = self.cu, self.rt
+        base = int(_chk(cu.cuMemGetAddressRange(cu.CUdeviceptr(t.data_ptr())), "cuMemGetAddressRange")[1])
+        h = _chk(rt.cudaIpcGetMemHandle(base), "cudaIpcGetMemHandle", runtime=True)[1]
+        return bytes(h.reserved), t.data_ptr() - base
+
+    def _open(self, handle):
+        rt = self.rt
+        raw, off = handle
+        h = rt.cudaIpcMemHandle_t()
+        h.reserved = raw
+        flags = rt.cudaIpcMemLazyEnablePeerAccess
+        base = _chk(rt.cudaIpcOpenMemHandle(h, flags), "cudaIpcOpenMemHandle", runtime=True)[1]
+        return int(base) + off
 
     def _ptr(self, slot):
         return self.cu.CUdeviceptr(self.flag_base + 8 * slot)
@@ -116,13 +143,14 @@ class _State:
         _chk(cu.cuStreamWaitValue64(c, self._ptr(_FULL[self.peer]), 1,
                                     cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ), "wait FULL[peer] == 1")
         nq, ns = rows * self.hidden, rows * self.groups
-        # cuMemcpyDtoDAsync on C straight from the peer's unified address: a torch cross-device copy_ would also
-        # order the peer device's legacy stream, which a CUDA-graph capture in progress elsewhere in the process
-        # forbids (CUDA_ERROR_STREAM_CAPTURE_IMPLICIT during prefill graph capture).
-        _chk(cu.cuMemcpyDtoDAsync(cu.CUdeviceptr(self.rq.data_ptr()), cu.CUdeviceptr(self.peer_q.data_ptr()), nq, c),
-             "copy q")
-        _chk(cu.cuMemcpyDtoDAsync(cu.CUdeviceptr(self.rs.data_ptr()), cu.CUdeviceptr(self.peer_s.data_ptr()), 4 * ns, c),
-             "copy s")
+        # cudaMemcpyAsync on C from the P2P mapping (capturable; cudaMemcpyPeerAsync is not). Not a torch
+        # cross-device copy_, which also orders the peer device's legacy stream -- forbidden while a CUDA-graph
+        # capture is open elsewhere in the process (CUDA_ERROR_STREAM_CAPTURE_IMPLICIT during prefill graph capture).
+        rt = self.rt
+        kind = rt.cudaMemcpyKind.cudaMemcpyDefault
+        _chk(rt.cudaMemcpyAsync(self.rq.data_ptr(), self.peer_q_ptr, nq, kind, C.cuda_stream), "copy q", runtime=True)
+        _chk(rt.cudaMemcpyAsync(self.rs.data_ptr(), self.peer_s_ptr, 4 * ns, kind, C.cuda_stream), "copy s",
+             runtime=True)
         _chk(cu.cuStreamWriteValue64(c, self._ptr(_FULL[self.peer]), 0, 0), "write FULL[peer] = 0")
         S.wait_stream(C)
         rq = self.rq[:nq].view(torch.float8_e4m3fn).view(rows, self.hidden)
