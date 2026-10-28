@@ -1189,6 +1189,16 @@ class ModelRunner:
         )
         if is_scale_joiner:
             self._validate_elastic_cuda_graph_recapture()
+        if __import__("os").environ.get("SGLANG_TP_AR_FP8_CE", "0") == "1":  # _q38fn_tparce
+            # Build the copy-engine all-reduce exchange now: building it synchronizes the device and registers
+            # host memory, which the prefill graph capture below forbids. Rows: the largest prefill batch.
+            from sglang.srt.distributed import q38fn_ce_exchange as _q38fn_ce
+
+            _q38fn_ce.preinit(
+                get_parallel().tp_group,
+                self.model_config.hidden_size,
+                int(__import__("os").environ.get("SGLANG_TP_AR_FP8_CE_ROWS", "16384")),
+            )
         capture = capture_cuda_graphs(
             model_runner=self,
             capture_decode_cuda_graph=(

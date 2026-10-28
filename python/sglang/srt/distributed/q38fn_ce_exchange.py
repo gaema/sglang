@@ -19,8 +19,8 @@ Per call k (S = the caller's stream, C = this rank's copy stream):
 from __future__ import annotations
 
 import ctypes
+import mmap
 import os
-from multiprocessing import shared_memory
 
 import torch
 import torch.distributed as dist
@@ -63,35 +63,30 @@ class _State:
         self.k = 0
         torch.cuda.synchronize()
 
-        name = f"q38fn-tparce-{os.getpid()}-{hidden}-{rows_cap}" if self.me == 0 else None
+        # The flag page: a /dev/shm file opened directly (not multiprocessing.SharedMemory, whose resource tracker is
+        # shared by sglang's scheduler processes and double-counts a name both ranks touch).
+        path = f"/dev/shm/q38fn-tparce-{os.getpid()}-{hidden}-{rows_cap}" if self.me == 0 else None
         if self.me == 0:
-            shm = shared_memory.SharedMemory(name=name, create=True, size=_PAGE)
-            shm.buf[:_PAGE] = bytes(_PAGE)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            os.ftruncate(fd, _PAGE)
         got = [None, None]
-        dist.all_gather_object(got, (reduce_tensor(self.q), reduce_tensor(self.s), name), group=group.cpu_group)
+        dist.all_gather_object(got, (reduce_tensor(self.q), reduce_tensor(self.s), path), group=group.cpu_group)
         (fq, aq), (fs, as_), _ = got[self.peer]
         self.peer_q = fq(*aq)
         self.peer_s = fs(*as_)
         if self.me == 1:
-            name = got[0][2]
-            shm = shared_memory.SharedMemory(name=name)
-            # Rank 0 unlinks the name below (unlink unregisters it there); the attaching rank's resource tracker
-            # would try to unlink it again at exit.
-            try:
-                from multiprocessing import resource_tracker
-
-                resource_tracker.unregister(shm._name, "shared_memory")
-            except Exception:
-                pass
-        self.shm = shm
-        self.host_addr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf))
+            path = got[0][2]
+            fd = os.open(path, os.O_RDWR)
+        self.mm = mmap.mmap(fd, _PAGE)
+        os.close(fd)
+        self.host_addr = ctypes.addressof(ctypes.c_char.from_buffer(self.mm))
         _chk(cu.cuMemHostRegister(self.host_addr, _PAGE,
                                   cu.CU_MEMHOSTREGISTER_DEVICEMAP | cu.CU_MEMHOSTREGISTER_PORTABLE), "cuMemHostRegister")
         self.flag_base = int(_chk(cu.cuMemHostGetDevicePointer(self.host_addr, 0), "cuMemHostGetDevicePointer")[1])
         # Both ranks have attached: the name can go now, so a crash leaves nothing in /dev/shm.
         dist.barrier(group=group.cpu_group)
         if self.me == 0:
-            shm.unlink()
+            os.unlink(path)
         print(f"[q38fn-tparce] copy-engine exchange on: group={group.unique_name} hidden={hidden} "
               f"rows_cap={rows_cap} me={self.me} pid={os.getpid()}", flush=True)
 
@@ -131,7 +126,11 @@ class _State:
 
 
 def get_state(group, hidden: int, rows: int) -> _State:
-    """The exchange state for (group, hidden) with room for `rows`; rebuilt (in lockstep) when rows outgrow it."""
+    """The exchange state for (group, hidden) with room for `rows`; rebuilt (in lockstep) when rows outgrow it.
+
+    Building synchronizes the device and registers host memory, which a CUDA-graph capture in progress anywhere in
+    the process forbids, so production builds it in preinit() before capture; a build here is the fallback for an
+    unforeseen shape at serving time, outside capture."""
     key = (group.unique_name, hidden)
     st = _states.get(key)
     if st is None or rows > st.rows_cap:
@@ -139,3 +138,10 @@ def get_state(group, hidden: int, rows: int) -> _State:
         st = _State(group, hidden, cap)
         _states[key] = st
     return st
+
+
+def preinit(group, hidden: int, rows: int) -> None:
+    """Build the exchange state before any CUDA-graph capture (model_runner.init_cuda_graphs)."""
+    if group.world_size != 2:
+        return
+    get_state(group, hidden, rows)
