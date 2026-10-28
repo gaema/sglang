@@ -227,6 +227,9 @@ class UnifiedLRUList:
         self.head.lru_next[self._pt] = self.tail
         self.tail.lru_prev[self._pt] = self.head
         self.cache: dict[int, UnifiedTreeNode] = {}
+        # demote_lru's region sentinel, created on the first demotion.
+        self._tree_components = tree_components
+        self._demoted: Optional[UnifiedTreeNode] = None
         # Session partition: [head .. mid) holds session-referenced nodes and
         # (mid .. tail] unreferenced ones, so evictions directly walks (tail -> head).
         self._is_referenced = is_referenced
@@ -282,6 +285,31 @@ class UnifiedLRUList:
         assert node.id in self.cache
         self._remove_node(node)
         self._add_node(node)
+
+    def demote_lru(self, node: UnifiedTreeNode):
+        """Move a node into the demoted region at the least-recently-used end.
+
+        A locked sentinel (skipped by every walk, like mid and cursor) opens
+        the region just ahead of tail; a demotion enters right behind the
+        sentinel, so demoted nodes stay in LRU order among themselves and the
+        oldest is evicted first. A later match moves a node back to the MRU
+        end through reset_node_mru as usual. Session-referenced nodes keep the
+        partition order: they move to the end of the referenced partition."""
+        assert node.id in self.cache
+        pt = self._pt
+        self._remove_node(node)
+        if self._is_referenced is not None and self._is_referenced(node):
+            self._add_node_after(self.mid.lru_prev[pt], node)
+            return
+        sentinel = self._demoted
+        if sentinel is None:
+            sentinel = UnifiedTreeNode(self._tree_components)
+            for ct in self._tree_components:
+                sentinel.component_data[ct].lock_ref = 1
+                sentinel.component_data[ct].host_lock_ref = 1
+            self._add_node_after(self.tail.lru_prev[pt], sentinel)
+            self._demoted = sentinel
+        self._add_node_after(sentinel, node)
 
     def cursor_begin(self):
         if self.cursor.lru_prev[self._pt] is not None:

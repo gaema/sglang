@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
+
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -290,6 +292,26 @@ class MambaComponent(TreeComponent):
 
         excess = len(holders) - cap
         if excess <= 0:
+            return
+
+        if envs.SGLANG_MAMBA_PATH_CAP_DEMOTE.get():
+            # Same eligibility as the eager walk below; demote instead of free.
+            # Each demotion enters the demoted region's MRU end, so demoting
+            # shallow-to-deep leaves the shallowest nearest the LRU end: it is
+            # evicted first, as the eager cap would have freed it first.
+            lru = self.tree_core.lru_lists[ct]
+            picked = []
+            for node in reversed(holders):
+                if len(picked) >= excess or node is tail:
+                    break
+                if node.component_data[ct].lock_ref > 0 or len(node.children) != 1:
+                    continue
+                if node in self.tree_core.evictable_device_leaves:
+                    continue
+                picked.append(node)
+            for node in picked:
+                if lru.in_list(node):
+                    lru.demote_lru(node)
             return
 
         tracker = {component: 0 for component in self.cache.tree_components}

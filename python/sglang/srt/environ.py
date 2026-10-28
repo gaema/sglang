@@ -1685,6 +1685,11 @@ class Envs:
     # affordable there. Pick a threshold that selects the tail you care about
     # (e.g. 100000), never 1.
     SGLANG_DP_PREFIX_AFFINITY_OBSERVE_TOKENS = EnvInt(0)
+    # --mamba-max-states-per-path as an eviction PRIORITY instead of an eager free: a path's
+    # interior states beyond the cap move to the least-recently-used end of the Mamba LRU, so
+    # they stay matchable (a later request diverging inside the path resumes from the deepest
+    # one below its branch point) until the pool needs slots, and are then the first evicted.
+    SGLANG_MAMBA_PATH_CAP_DEMOTE = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers
