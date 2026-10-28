@@ -49,7 +49,7 @@ def _chk(r, what, runtime=False):
 class _State:
     """Buffers for one (group, hidden) at a row capacity; both ranks build it in lockstep (same rows, same calls)."""
 
-    def __init__(self, group, hidden: int, rows_cap: int):
+    def __init__(self, group, hidden: int, rows_cap: int, slot: int = 0):
         from cuda.bindings import driver as cu
 
         self.cu = cu
@@ -68,7 +68,7 @@ class _State:
 
         # The flag page: a /dev/shm file opened directly (not multiprocessing.SharedMemory, whose resource tracker is
         # shared by sglang's scheduler processes and double-counts a name both ranks touch).
-        path = f"/dev/shm/q38fn-tparce-{os.getpid()}-{hidden}-{rows_cap}" if self.me == 0 else None
+        path = f"/dev/shm/q38fn-tparce-{os.getpid()}-{hidden}-{rows_cap}-{slot}" if self.me == 0 else None
         if self.me == 0:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
             os.ftruncate(fd, _PAGE)
@@ -101,7 +101,7 @@ class _State:
         if self.me == 0:
             os.unlink(path)
         print(f"[q38fn-tparce] copy-engine exchange on: group={group.unique_name} hidden={hidden} "
-              f"rows_cap={rows_cap} me={self.me} p2p={int(self.p2p)} pid={os.getpid()}", flush=True)
+              f"rows_cap={rows_cap} slot={slot} me={self.me} p2p={int(self.p2p)} pid={os.getpid()}", flush=True)
 
     def _ipc(self, t):
         """(IPC handle bytes, offset) of a tensor's allocation: the handle names the allocation's base."""
@@ -134,6 +134,13 @@ class _State:
 
     def exchange(self, rows):
         """Signal my payload ready, pull the peer's into the receive buffers; returns (rq, rs) views."""
+        self.start(rows)
+        return self.finish(rows)
+
+    def start(self, rows):
+        """Signal my payload ready and enqueue the pull of the peer's on the copy stream; the caller's stream does not
+        wait. finish() joins it. Both must sit in the same captured segment when recorded into a CUDA graph (the copy
+        stream joins the caller's capture here and rejoins it there)."""
         cu = self.cu
         S = torch.cuda.current_stream()
         C = self.copy_stream
@@ -152,29 +159,37 @@ class _State:
         _chk(rt.cudaMemcpyAsync(self.rs.data_ptr(), self.peer_s_ptr, 4 * ns, kind, C.cuda_stream), "copy s",
              runtime=True)
         _chk(cu.cuStreamWriteValue64(c, self._ptr(_FULL[self.peer]), 0, 0), "write FULL[peer] = 0")
-        S.wait_stream(C)
+
+    def finish(self, rows):
+        """Make the caller's stream wait for start()'s pull; returns the received (rq, rs) views."""
+        torch.cuda.current_stream().wait_stream(self.copy_stream)
+        nq, ns = rows * self.hidden, rows * self.groups
         rq = self.rq[:nq].view(torch.float8_e4m3fn).view(rows, self.hidden)
         rs = self.rs[:ns].view(rows, self.groups)
         return rq, rs
 
 
-def get_state(group, hidden: int, rows: int) -> _State:
-    """The exchange state for (group, hidden) with room for `rows`; rebuilt (in lockstep) when rows outgrow it.
+def get_state(group, hidden: int, rows: int, slot: int = 0) -> _State:
+    """The exchange state for (group, hidden, slot) with room for `rows`; rebuilt (in lockstep) when rows outgrow it.
+
+    A slot is one exchange that may be in flight at a time: two micro-batches each take their own slot (own buffers,
+    flags and copy stream), so one's start() can precede the other's finish().
 
     Building synchronizes the device and registers host memory, which a CUDA-graph capture in progress anywhere in
     the process forbids, so production builds it in preinit() before capture; a build here is the fallback for an
     unforeseen shape at serving time, outside capture."""
-    key = (group.unique_name, hidden)
+    key = (group.unique_name, hidden, slot)
     st = _states.get(key)
     if st is None or rows > st.rows_cap:
         cap = max(rows, 4096 if st is None else 2 * st.rows_cap)
-        st = _State(group, hidden, cap)
+        st = _State(group, hidden, cap, slot)
         _states[key] = st
     return st
 
 
-def preinit(group, hidden: int, rows: int) -> None:
-    """Build the exchange state before any CUDA-graph capture (model_runner.init_cuda_graphs)."""
+def preinit(group, hidden: int, rows: int, slots: int = 1) -> None:
+    """Build the exchange state for each slot before any CUDA-graph capture (model_runner.init_cuda_graphs)."""
     if group.world_size != 2:
         return
-    get_state(group, hidden, rows)
+    for slot in range(slots):
+        get_state(group, hidden, rows, slot)
