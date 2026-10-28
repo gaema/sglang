@@ -1690,6 +1690,10 @@ class Envs:
     # they stay matchable (a later request diverging inside the path resumes from the deepest
     # one below its branch point) until the pool needs slots, and are then the first evicted.
     SGLANG_MAMBA_PATH_CAP_DEMOTE = EnvBool(False)
+    # The prefill chunk while requests are decoding: a running decoder waits out each chunk
+    # (one decode round between chunks at --prefill-decode-interval 1), so a smaller chunk
+    # bounds its gap; a prefill with nothing decoding keeps --chunked-prefill-size. 0 = off.
+    SGLANG_PREFILL_CONTENDED_CHUNK_SIZE = EnvInt(0)
 
     # ===================================================================
     # CUDA graphs and execution buffers

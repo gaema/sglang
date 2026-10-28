@@ -4097,6 +4097,14 @@ class Scheduler(
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        contended_chunk = envs.SGLANG_PREFILL_CONTENDED_CHUNK_SIZE.get()
+        if (
+            contended_chunk > 0
+            and running_bs > 0
+            and chunked_prefill_size is not None
+            and chunked_prefill_size > contended_chunk
+        ):
+            chunked_prefill_size = contended_chunk
 
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic
