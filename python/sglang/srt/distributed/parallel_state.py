@@ -3609,18 +3609,31 @@ def _q38fn_tparfp8(group, inp):  # _q38fn_tparfp8
     hidden = inp.shape[-1]
     x = inp.view(-1, hidden)
     rows = x.shape[0]
-    q, s = sglang_per_token_group_quant_fp8(x, G)
-    q = q.view(torch.uint8).contiguous()
-    s = s.contiguous()
-    rq = torch.empty_like(q)
-    rs = torch.empty_like(s)
-    with comm.change_state(enable=True):
-        comm.group_start()
-        comm.send(q, peer)
-        comm.send(s, peer)
-        comm.recv(rq, peer)
-        comm.recv(rs, peer)
-        comm.group_end()
+    import os as _os_ce
+
+    if _os_ce.environ.get("SGLANG_TP_AR_FP8_CE", "0") == "1":  # _q38fn_tparce
+        # The same payload, quantized straight into an IPC buffer the peer pulls on its copy engine
+        # (q38fn_ce_exchange.py): no SM-driven NCCL kernel, so compute beside it is not slowed.
+        from sglang.srt.distributed import q38fn_ce_exchange as _ce
+
+        st = _ce.get_state(group, hidden, rows)
+        q, s = st.views(rows)
+        sglang_per_token_group_quant_fp8(x, G, output_q=q, output_s=s)
+        rq, rs = st.exchange(rows)
+        q, rq = q.view(torch.uint8), rq.view(torch.uint8)
+    else:
+        q, s = sglang_per_token_group_quant_fp8(x, G)
+        q = q.view(torch.uint8).contiguous()
+        s = s.contiguous()
+        rq = torch.empty_like(q)
+        rs = torch.empty_like(s)
+        with comm.change_state(enable=True):
+            comm.group_start()
+            comm.send(q, peer)
+            comm.send(s, peer)
+            comm.recv(rq, peer)
+            comm.recv(rs, peer)
+            comm.group_end()
     first, second = ((q, s), (rq, rs)) if me == 0 else ((rq, rs), (q, s))
     tmp = torch.empty((rows, hidden), dtype=inp.dtype, device=inp.device)
     _dequant_per_token_group_fp8_kernel[(rows,)](

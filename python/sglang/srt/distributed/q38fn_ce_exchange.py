@@ -1,0 +1,141 @@
+"""Copy-engine payload exchange for the two-rank FP8 TP all-reduce (SGLANG_TP_AR_FP8_CE=1).
+
+Production's _q38fn_tparfp8 sends each rank's FP8 partial (and its scales) to the peer with NCCL send/recv, an
+SM-driven kernel that slows any compute running beside it. Here each rank quantizes straight into a buffer the peer
+has opened through CUDA IPC, and the peer pulls it with a device-to-device copy on its copy engine. Readiness is
+signalled on the GPU timeline with 64-bit stream memory operations (cuStreamWaitValue64 / cuStreamWriteValue64, run
+by the GPU front-end, no kernel) on counters in one page of POSIX shared memory, host-registered and device-mapped in
+both processes (a stream write into a peer's IPC-mapped device memory is refused). Same bytes and the same
+dequantize-and-add order as the NCCL path: the all-reduce result is bit-identical.
+
+Per call k (S = the caller's stream, C = this rank's copy stream):
+  S: wait DONE[peer] >= k-1      the peer finished reading my previous payload
+  S: quantize into my send buffer (the caller, with output_q / output_s)
+  S: write READY[me] = k
+  C: wait S; wait READY[peer] >= k; recv <- the peer's send rows; write DONE[me] = k
+  S: wait C
+"""
+
+from __future__ import annotations
+
+import ctypes
+import os
+from multiprocessing import shared_memory
+
+import torch
+import torch.distributed as dist
+from torch.multiprocessing.reductions import reduce_tensor
+
+_G = 128
+_PAGE = 4096
+_READY = (0, 8)  # uint64 slot index per rank, 64 bytes apart
+_DONE = (16, 24)
+_states: dict = {}
+
+
+def _chk(r, what):
+    from cuda.bindings import driver as cu
+
+    err = r[0] if isinstance(r, tuple) else r
+    if err != cu.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"q38fn ce exchange: {what} failed: {err}")
+    return r
+
+
+class _State:
+    """Buffers for one (group, hidden) at a row capacity; both ranks build it in lockstep (same rows, same calls)."""
+
+    def __init__(self, group, hidden: int, rows_cap: int):
+        from cuda.bindings import driver as cu
+
+        self.cu = cu
+        self.me = group.rank_in_group
+        self.peer = 1 - self.me
+        self.hidden = hidden
+        self.groups = hidden // _G
+        self.rows_cap = rows_cap
+        dev = torch.device("cuda", torch.cuda.current_device())
+        self.q = torch.empty(rows_cap * hidden, dtype=torch.uint8, device=dev)
+        self.s = torch.empty(rows_cap * self.groups, dtype=torch.float32, device=dev)
+        self.rq = torch.empty_like(self.q)
+        self.rs = torch.empty_like(self.s)
+        self.copy_stream = torch.cuda.Stream(device=dev)
+        self.k = 0
+        torch.cuda.synchronize()
+
+        name = f"q38fn-tparce-{os.getpid()}-{hidden}-{rows_cap}" if self.me == 0 else None
+        if self.me == 0:
+            shm = shared_memory.SharedMemory(name=name, create=True, size=_PAGE)
+            shm.buf[:_PAGE] = bytes(_PAGE)
+        got = [None, None]
+        dist.all_gather_object(got, (reduce_tensor(self.q), reduce_tensor(self.s), name), group=group.cpu_group)
+        (fq, aq), (fs, as_), _ = got[self.peer]
+        self.peer_q = fq(*aq)
+        self.peer_s = fs(*as_)
+        if self.me == 1:
+            name = got[0][2]
+            shm = shared_memory.SharedMemory(name=name)
+            # Rank 0 unlinks the name below (unlink unregisters it there); the attaching rank's resource tracker
+            # would try to unlink it again at exit.
+            try:
+                from multiprocessing import resource_tracker
+
+                resource_tracker.unregister(shm._name, "shared_memory")
+            except Exception:
+                pass
+        self.shm = shm
+        self.host_addr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf))
+        _chk(cu.cuMemHostRegister(self.host_addr, _PAGE,
+                                  cu.CU_MEMHOSTREGISTER_DEVICEMAP | cu.CU_MEMHOSTREGISTER_PORTABLE), "cuMemHostRegister")
+        self.flag_base = int(_chk(cu.cuMemHostGetDevicePointer(self.host_addr, 0), "cuMemHostGetDevicePointer")[1])
+        # Both ranks have attached: the name can go now, so a crash leaves nothing in /dev/shm.
+        dist.barrier(group=group.cpu_group)
+        if self.me == 0:
+            shm.unlink()
+        print(f"[q38fn-tparce] copy-engine exchange on: group={group.unique_name} hidden={hidden} "
+              f"rows_cap={rows_cap} me={self.me} pid={os.getpid()}", flush=True)
+
+    def _ptr(self, slot):
+        return self.cu.CUdeviceptr(self.flag_base + 8 * slot)
+
+    def views(self, rows):
+        """(q, s) send views to quantize into, after waiting until the peer has read the previous payload."""
+        cu = self.cu
+        s = cu.CUstream(torch.cuda.current_stream().cuda_stream)
+        _chk(cu.cuStreamWaitValue64(s, self._ptr(_DONE[self.peer]), self.k,
+                                    cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ), "wait DONE")
+        q = self.q[: rows * self.hidden].view(torch.float8_e4m3fn).view(rows, self.hidden)
+        sc = self.s[: rows * self.groups].view(rows, self.groups)
+        return q, sc
+
+    def exchange(self, rows):
+        """Signal my payload ready, pull the peer's into the receive buffers; returns (rq, rs) views."""
+        cu = self.cu
+        self.k += 1
+        S = torch.cuda.current_stream()
+        C = self.copy_stream
+        _chk(cu.cuStreamWriteValue64(cu.CUstream(S.cuda_stream), self._ptr(_READY[self.me]), self.k, 0), "write READY")
+        C.wait_stream(S)
+        c = cu.CUstream(C.cuda_stream)
+        _chk(cu.cuStreamWaitValue64(c, self._ptr(_READY[self.peer]), self.k,
+                                    cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ), "wait READY")
+        nq, ns = rows * self.hidden, rows * self.groups
+        with torch.cuda.stream(C):
+            self.rq[:nq].copy_(self.peer_q[:nq], non_blocking=True)
+            self.rs[:ns].copy_(self.peer_s[:ns], non_blocking=True)
+        _chk(cu.cuStreamWriteValue64(c, self._ptr(_DONE[self.me]), self.k, 0), "write DONE")
+        S.wait_stream(C)
+        rq = self.rq[:nq].view(torch.float8_e4m3fn).view(rows, self.hidden)
+        rs = self.rs[:ns].view(rows, self.groups)
+        return rq, rs
+
+
+def get_state(group, hidden: int, rows: int) -> _State:
+    """The exchange state for (group, hidden) with room for `rows`; rebuilt (in lockstep) when rows outgrow it."""
+    key = (group.unique_name, hidden)
+    st = _states.get(key)
+    if st is None or rows > st.rows_cap:
+        cap = max(rows, 4096 if st is None else 2 * st.rows_cap)
+        st = _State(group, hidden, cap)
+        _states[key] = st
+    return st
