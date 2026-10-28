@@ -8,12 +8,16 @@ by the GPU front-end, no kernel) on counters in one page of POSIX shared memory,
 both processes (a stream write into a peer's IPC-mapped device memory is refused). Same bytes and the same
 dequantize-and-add order as the NCCL path: the all-reduce result is bit-identical.
 
-Per call k (S = the caller's stream, C = this rank's copy stream):
-  S: wait DONE[peer] >= k-1      the peer finished reading my previous payload
+Per call (S = the caller's stream, C = this rank's copy stream; FULL[r] = rank r's send buffer holds an unread payload):
+  S: wait FULL[me] == 0          the peer has read my previous payload
   S: quantize into my send buffer (the caller, with output_q / output_s)
-  S: write READY[me] = k
-  C: wait S; wait READY[peer] >= k; recv <- the peer's send rows; write DONE[me] = k
+  S: write FULL[me] = 1
+  C: wait S; wait FULL[peer] == 1; recv <- the peer's send rows; write FULL[peer] = 0
   S: wait C
+Every value is a constant, so the sequence means the same thing run eagerly or recorded into a CUDA graph and replayed
+any number of times (sglang's prefill capture records it: C joins S's capture through wait_stream). A counter would
+bake the capture-time count into the graph. Each flag alternates between its two writers: the owner sets it only while
+it reads 0, the peer clears it only while it reads 1.
 """
 
 from __future__ import annotations
@@ -28,8 +32,7 @@ from torch.multiprocessing.reductions import reduce_tensor
 
 _G = 128
 _PAGE = 4096
-_READY = (0, 8)  # uint64 slot index per rank, 64 bytes apart
-_DONE = (16, 24)
+_FULL = (0, 8)  # uint64 slot index per rank, 64 bytes apart
 _states: dict = {}
 
 
@@ -60,7 +63,6 @@ class _State:
         self.rq = torch.empty_like(self.q)
         self.rs = torch.empty_like(self.s)
         self.copy_stream = torch.cuda.Stream(device=dev)
-        self.k = 0
         torch.cuda.synchronize()
 
         # The flag page: a /dev/shm file opened directly (not multiprocessing.SharedMemory, whose resource tracker is
@@ -97,8 +99,8 @@ class _State:
         """(q, s) send views to quantize into, after waiting until the peer has read the previous payload."""
         cu = self.cu
         s = cu.CUstream(torch.cuda.current_stream().cuda_stream)
-        _chk(cu.cuStreamWaitValue64(s, self._ptr(_DONE[self.peer]), self.k,
-                                    cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ), "wait DONE")
+        _chk(cu.cuStreamWaitValue64(s, self._ptr(_FULL[self.me]), 0,
+                                    cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ), "wait FULL[me] == 0")
         q = self.q[: rows * self.hidden].view(torch.float8_e4m3fn).view(rows, self.hidden)
         sc = self.s[: rows * self.groups].view(rows, self.groups)
         return q, sc
@@ -106,14 +108,13 @@ class _State:
     def exchange(self, rows):
         """Signal my payload ready, pull the peer's into the receive buffers; returns (rq, rs) views."""
         cu = self.cu
-        self.k += 1
         S = torch.cuda.current_stream()
         C = self.copy_stream
-        _chk(cu.cuStreamWriteValue64(cu.CUstream(S.cuda_stream), self._ptr(_READY[self.me]), self.k, 0), "write READY")
+        _chk(cu.cuStreamWriteValue64(cu.CUstream(S.cuda_stream), self._ptr(_FULL[self.me]), 1, 0), "write FULL[me] = 1")
         C.wait_stream(S)
         c = cu.CUstream(C.cuda_stream)
-        _chk(cu.cuStreamWaitValue64(c, self._ptr(_READY[self.peer]), self.k,
-                                    cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ), "wait READY")
+        _chk(cu.cuStreamWaitValue64(c, self._ptr(_FULL[self.peer]), 1,
+                                    cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ), "wait FULL[peer] == 1")
         nq, ns = rows * self.hidden, rows * self.groups
         # cuMemcpyDtoDAsync on C straight from the peer's unified address: a torch cross-device copy_ would also
         # order the peer device's legacy stream, which a CUDA-graph capture in progress elsewhere in the process
@@ -122,7 +123,7 @@ class _State:
              "copy q")
         _chk(cu.cuMemcpyDtoDAsync(cu.CUdeviceptr(self.rs.data_ptr()), cu.CUdeviceptr(self.peer_s.data_ptr()), 4 * ns, c),
              "copy s")
-        _chk(cu.cuStreamWriteValue64(c, self._ptr(_DONE[self.me]), self.k, 0), "write DONE")
+        _chk(cu.cuStreamWriteValue64(c, self._ptr(_FULL[self.peer]), 0, 0), "write FULL[peer] = 0")
         S.wait_stream(C)
         rq = self.rq[:nq].view(torch.float8_e4m3fn).view(rows, self.hidden)
         rs = self.rs[:ns].view(rows, self.groups)
