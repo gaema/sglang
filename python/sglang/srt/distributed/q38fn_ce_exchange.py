@@ -115,9 +115,13 @@ class _State:
         _chk(cu.cuStreamWaitValue64(c, self._ptr(_READY[self.peer]), self.k,
                                     cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ), "wait READY")
         nq, ns = rows * self.hidden, rows * self.groups
-        with torch.cuda.stream(C):
-            self.rq[:nq].copy_(self.peer_q[:nq], non_blocking=True)
-            self.rs[:ns].copy_(self.peer_s[:ns], non_blocking=True)
+        # cuMemcpyDtoDAsync on C straight from the peer's unified address: a torch cross-device copy_ would also
+        # order the peer device's legacy stream, which a CUDA-graph capture in progress elsewhere in the process
+        # forbids (CUDA_ERROR_STREAM_CAPTURE_IMPLICIT during prefill graph capture).
+        _chk(cu.cuMemcpyDtoDAsync(cu.CUdeviceptr(self.rq.data_ptr()), cu.CUdeviceptr(self.peer_q.data_ptr()), nq, c),
+             "copy q")
+        _chk(cu.cuMemcpyDtoDAsync(cu.CUdeviceptr(self.rs.data_ptr()), cu.CUdeviceptr(self.peer_s.data_ptr()), 4 * ns, c),
+             "copy s")
         _chk(cu.cuStreamWriteValue64(c, self._ptr(_DONE[self.me]), self.k, 0), "write DONE")
         S.wait_stream(C)
         rq = self.rq[:nq].view(torch.float8_e4m3fn).view(rows, self.hidden)
