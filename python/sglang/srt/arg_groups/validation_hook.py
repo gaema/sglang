@@ -697,10 +697,14 @@ def check_two_batch_overlap(server_args: Any):
     # there needs no extra opt-in env flag.
     cfg = resolving_view(server_args)
 
+    # SGLANG_TBO_TP_ALLREDUCE=1 (qwen38fn prefill overlap, in development): the
+    # plain-TP path, overlapping each TP all-reduce of one micro-batch with the
+    # other's compute.
     if (
         cfg.enable_two_batch_overlap
         and cfg.moe_a2a_backend == "none"
         and not attn_dp_enabled_of(cfg)
+        and os.environ.get("SGLANG_TBO_TP_ALLREDUCE") != "1"
     ):
         raise ValueError(
             "When enabling two batch overlap without an EP a2a backend "

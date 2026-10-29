@@ -1740,6 +1740,16 @@ class ModelRunner:
             forward_batch.prepare_mlp_sync_batch(self)
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
+            if get_exec().overlap.enable_two_batch_overlap:
+                # Plain TP has no MLP sync to run the split from (it lives in
+                # prepare_mlp_sync_batch); SGLANG_TBO_TP_ALLREDUCE decides inside.
+                from sglang.srt.batch_overlap.two_batch_overlap import (
+                    TboForwardBatchPreparer,
+                )
+
+                TboForwardBatchPreparer.prepare(
+                    batch=forward_batch, is_draft_worker=self.is_draft_worker
+                )
         if self.lora_manager is not None and self.lora_manager.attn_dp_enabled:
             self.lora_manager.prepare_lora_batch(forward_batch)
 

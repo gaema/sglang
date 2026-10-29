@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import logging
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
@@ -130,6 +131,52 @@ def _is_two_chunk_split_enabled(extend_lens: Sequence[int]) -> bool:
         return False
 
     return True
+
+
+def _tp_allreduce_split_seq_index(batch) -> Optional[int]:
+    """Plain-TP prefill overlap (SGLANG_TBO_TP_ALLREDUCE=1): no DP sync sets the
+    split, so the forward batch computes it. Every TP rank holds the same batch,
+    so the ranks agree without a collective. Only an EXTEND batch whose two-chunk
+    cut leaves both halves page-aligned (child B's prefix is the cut, and the QSA
+    compressed-KV write asserts page-granular prefixes) is split."""
+    if os.environ.get("SGLANG_TBO_TP_ALLREDUCE") != "1":
+        return None
+    if batch.forward_mode != ForwardMode.EXTEND:
+        return None
+    lens = batch.extend_seq_lens_cpu
+    if not lens or not _is_two_chunk_split_enabled(lens):
+        return None
+    if sum(lens) % (2 * _TBO_TP_SPLIT_ALIGN) != 0:
+        return None
+    return compute_split_seq_index(batch.forward_mode, sum(lens), lens, None)
+
+
+_TBO_TP_SPLIT_ALIGN = 64  # the served --page-size
+
+
+def _restrict_mamba_track(child) -> None:
+    """Keep a child's tracking row only where the tracked absolute length lies in
+    (prefix, prefix + extend] of THAT child: the GDN backend snapshots at
+    mamba_track_seqlens - extend_prefix_lens, so the other child's rows would
+    index outside its own chunk."""
+    if child.mamba_track_mask is None:
+        return
+    seqlens = child.mamba_track_seqlens_cpu
+    if seqlens is None:
+        seqlens = child.mamba_track_seqlens.tolist()
+    keep = [
+        p < s <= p + e
+        for p, e, s in zip(
+            child.extend_prefix_lens_cpu, child.extend_seq_lens_cpu, seqlens
+        )
+    ]
+    child.mamba_track_mask = child.mamba_track_mask & torch.tensor(
+        keep, dtype=torch.bool, device=child.mamba_track_mask.device
+    )
+    if child.mamba_prefill_track_mask_cpu is not None:
+        child.mamba_prefill_track_mask_cpu = [
+            m and k for m, k in zip(child.mamba_prefill_track_mask_cpu, keep)
+        ]
 
 
 def _split_extend_seqs(arr: Sequence[int]) -> int:
@@ -506,6 +553,8 @@ class TboDPAttentionPreparer:
 class TboForwardBatchPreparer:
     @classmethod
     def prepare(cls, batch: ForwardBatch, is_draft_worker: bool = False):
+        if batch.tbo_split_seq_index is None and not is_draft_worker:
+            batch.tbo_split_seq_index = _tp_allreduce_split_seq_index(batch)
         if batch.tbo_split_seq_index is None or is_draft_worker:
             return
 
@@ -594,6 +643,9 @@ class TboForwardBatchPreparer:
                 child_b=child_b,
                 tbo_split_seq_index=batch.tbo_split_seq_index,
             )
+
+        for child in (child_a, child_b):
+            _restrict_mamba_track(child)
 
         assert batch.tbo_children is None
         batch.tbo_children = [child_a, child_b]
@@ -786,6 +838,29 @@ class TboForwardBatchPreparer:
             "reuse_dsa_topk_indices",  # forward-level flag, inherited by both child batches
         ]:
             output_dict[key] = getattr(batch, key)
+
+        # Hybrid-SSM radix tracking: sliced per sequence like seq_lens, and each
+        # child keeps a row's mask only where the tracked length falls inside its
+        # own token range (_restrict_mamba_track, after the two-chunk lengths are
+        # final). The deferred COW / clear ops run once on the PARENT in
+        # model_runner, so neither child carries them.
+        for key in [
+            "mamba_track_indices",
+            "mamba_track_mask",
+            "mamba_track_seqlens",
+            "mamba_prefill_track_mask_cpu",
+            "mamba_track_seqlens_cpu",
+        ]:
+            old_value = getattr(batch, key)
+            output_dict[key] = (
+                None if old_value is None else old_value[start_seq_index:end_seq_index]
+            )
+        for key in [
+            "mamba_cow_src_indices",
+            "mamba_cow_dst_indices",
+            "mamba_clear_indices",
+        ]:
+            output_dict[key] = None
 
         mrope_positions = getattr(batch, "mrope_positions")
         if mrope_positions is not None:
