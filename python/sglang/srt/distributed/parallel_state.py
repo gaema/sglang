@@ -3614,12 +3614,17 @@ def _q38fn_tparfp8(group, inp):  # _q38fn_tparfp8
     if _os_ce.environ.get("SGLANG_TP_AR_FP8_CE", "0") == "1":  # _q38fn_tparce
         # The same payload, quantized straight into an IPC buffer the peer pulls on its copy engine
         # (q38fn_ce_exchange.py): no SM-driven NCCL kernel, so compute beside it is not slowed.
+        from sglang.srt.batch_overlap import q38fn_wave as _wave
         from sglang.srt.distributed import q38fn_ce_exchange as _ce
 
-        st = _ce.get_state(group, hidden, rows)
+        # Inside the prefill wavefront (SGLANG_TBO_TP_WAVE=1) each micro-batch has its own slot, and the other one runs
+        # between start() and finish(), under this exchange's peer copy.
+        st = _ce.get_state(group, hidden, rows, _wave.slot())
         q, s = st.views(rows)
         sglang_per_token_group_quant_fp8(x, G, output_q=q, output_s=s)
-        rq, rs = st.exchange(rows)
+        st.start(rows)
+        _wave.yield_point()
+        rq, rs = st.finish(rows)
         q, rq = q.view(torch.uint8), rq.view(torch.uint8)
     else:
         q, s = sglang_per_token_group_quant_fp8(x, G)

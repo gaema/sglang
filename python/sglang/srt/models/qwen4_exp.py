@@ -2,6 +2,8 @@
 
 import math
 import os
+
+from sglang.srt.batch_overlap import q38fn_wave as _q38fn_wave
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
@@ -2589,6 +2591,18 @@ class Qwen4ExpAttentionDecoderLayer(
         return self._run_ffn_stage(hidden_states, forward_batch)
 
 
+# The prefill wavefront (SGLANG_TBO_TP_WAVE=1) runs two micro-batches through the same layers at once; the state a
+# layer stashes on itself across an all-reduce must be per micro-batch (q38fn_wave.thread_local_attrs).
+_q38fn_wave.thread_local_attrs(
+    Qwen4ExpLayerExtensionMixin, ("_hc_norms", "_ple_forward_batch", "_ple_batch")
+)
+_q38fn_wave.thread_local_attrs(
+    Qwen4ExpPLELayer, ("_prefetch_state", "_eager_prefetch_buffer")
+)
+# A stage's read stashes its mix coefficients for that stage's write-back, across the all-reduce between them.
+_q38fn_wave.thread_local_attrs(GatedResidualState, ("normed", "gate_partials"))
+_q38fn_wave.thread_local_attrs(GatedResidual, ("_q38fn_partials",))
+
 ALL_DECODER_LAYER_TYPES = {
     "attention": Qwen4ExpAttentionDecoderLayer,
     "full_attention": Qwen4ExpAttentionDecoderLayer,
@@ -2743,6 +2757,13 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 ngram_size=self.ple_ngram_size,
                 ngram_eos_token_id=self.ple_ngram_eos_token_id,
             )
+        # In the prefill wavefront, child B prepares its PLE batch (reading the N-gram history) while child A is still
+        # in its first layer, so A commits its history now: the commit reads only the batch, and A's own layers read
+        # the history from that batch, not from the pool.
+        ple_committed = False
+        if _q38fn_wave.role() == 0 and not ple_split and not breakable_ple:
+            _commit_ple_batch(batch=ple_batch, forward_batch=forward_batch)
+            ple_committed = True
         aux_hidden_states = AuxHiddenStateList()
         normalized_input = None
         try:
@@ -2792,7 +2813,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             _q38fn_bcg_pick(qwen4_ple_commit_split)(hidden_states)  # _q38fn_bcg
         elif breakable_ple:
             _breakable_commit_ple_batch(batch=ple_batch)
-        else:
+        elif not ple_committed:
             _commit_ple_batch(batch=ple_batch, forward_batch=forward_batch)
 
         if not self.pp_group.is_last_rank:
@@ -2842,19 +2863,36 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         contexts = _resolve_tbo_child_contexts()
         if contexts[0] is None:
             raise RuntimeError("TBO children without a TboAttnBackend")
-        outputs = []
-        for child, ctx in zip(forward_batch.tbo_children, contexts, strict=True):
+
+        def child_forward(child):
             lo, hi = child.tbo_parent_token_range
-            with forward_context(ctx):
-                # The text model's own forward, not a subclass's (Qwen4ExpVLModel
-                # takes input_embeds and records per-forward state of its own).
-                out = Qwen4ExpModel.forward(
-                    self,
-                    input_ids=input_ids[lo:hi],
-                    positions=positions[lo:hi],
-                    forward_batch=child,
-                    inputs_embeds=None if inputs_embeds is None else inputs_embeds[lo:hi],
-                )
+            # The text model's own forward, not a subclass's (Qwen4ExpVLModel
+            # takes input_embeds and records per-forward state of its own).
+            return Qwen4ExpModel.forward(
+                self,
+                input_ids=input_ids[lo:hi],
+                positions=positions[lo:hi],
+                forward_batch=child,
+                inputs_embeds=None if inputs_embeds is None else inputs_embeds[lo:hi],
+            )
+
+        if _q38fn_wave.ENABLED:
+            # M3c: the children as a wavefront, each yielding inside its TP all-reduce (q38fn_wave).
+            from sglang.srt.model_executor.forward_context import set_forward_context
+
+            children = forward_batch.tbo_children
+            outs = _q38fn_wave.run(
+                [lambda: child_forward(children[0]), lambda: child_forward(children[1])],
+                contexts,
+                set_forward_context,
+            )
+        else:
+            outs = []
+            for child, ctx in zip(forward_batch.tbo_children, contexts, strict=True):
+                with forward_context(ctx):
+                    outs.append(child_forward(child))
+        outputs = []
+        for out in outs:
             if not isinstance(out, tuple) or len(out) != 2:
                 raise RuntimeError(f"TBO children in order: unexpected output {type(out)}")
             outputs.append(out)
