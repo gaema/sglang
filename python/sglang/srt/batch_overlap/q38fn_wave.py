@@ -17,8 +17,10 @@ What the threads must not share, and how this module keeps them apart:
   thread-local by `thread_local_attrs` on those classes, installed only when this mode is on.
 """
 
+import contextvars
 import os
 import threading
+from contextlib import contextmanager
 from typing import Callable, List, Optional, Sequence
 
 import torch
@@ -107,6 +109,37 @@ def yield_point() -> None:
         baton.give(_tls.role)
 
 
+def snapshot():
+    """The calling child's identity, for a breakable-graph break function recorded now and replayed later on one
+    thread: (role, slot, its thread-local attribute dict, its forward context), or None outside a wave."""
+    baton = getattr(_tls, "baton", None)
+    if baton is None:
+        return None
+    if getattr(_tls, "attrs", None) is None:
+        _tls.attrs = {}
+    return (_tls.role, _tls.slot, _tls.attrs, baton.ctxs[_tls.role])
+
+
+@contextmanager
+def restored(snap):
+    """Run a replayed break function as the child that recorded it (snapshot()): its thread-local attributes (the same
+    dict object, so state it leaves for that child's next break is kept), exchange slot and forward context."""
+    if snap is None:
+        yield
+        return
+    from sglang.srt.model_executor.forward_context import set_forward_context
+
+    role, slot_, attrs, ctx = snap
+    saved = (getattr(_tls, "role", None), getattr(_tls, "slot", 0), getattr(_tls, "attrs", None))
+    _tls.role, _tls.slot, _tls.attrs = role, slot_, attrs
+    prev = set_forward_context(ctx)
+    try:
+        yield
+    finally:
+        set_forward_context(prev)
+        _tls.role, _tls.slot, _tls.attrs = saved
+
+
 def run(fns: Sequence[Callable[[], object]], ctxs: Sequence, set_ctx: Callable) -> list:
     """Run fns[0] (child A) and fns[1] (child B) as the wavefront; returns their results in order."""
     assert len(fns) == 2 and len(ctxs) == 2
@@ -132,7 +165,12 @@ def run(fns: Sequence[Callable[[], object]], ctxs: Sequence, set_ctx: Callable) 
             _tls.baton = None
             baton.finish(me, err)
 
-    threads = [threading.Thread(target=body, args=(i,), name=f"q38fn-wave-{'AB'[i]}") for i in range(2)]
+    # Each thread runs in a copy of the caller's contextvars context: a breakable CUDA-graph capture keeps its state
+    # in ContextVars, which a new thread would otherwise not see (its eager breaks would run eagerly mid-capture).
+    contexts = [contextvars.copy_context() for _ in range(2)]
+    threads = [
+        threading.Thread(target=contexts[i].run, args=(body, i), name=f"q38fn-wave-{'AB'[i]}") for i in range(2)
+    ]
     for t in threads:
         t.start()
     for t in threads:

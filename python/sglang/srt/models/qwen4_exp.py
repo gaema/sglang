@@ -2761,8 +2761,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         # in its first layer, so A commits its history now: the commit reads only the batch, and A's own layers read
         # the history from that batch, not from the pool.
         ple_committed = False
-        if _q38fn_wave.role() == 0 and not ple_split and not breakable_ple:
-            _commit_ple_batch(batch=ple_batch, forward_batch=forward_batch)
+        if _q38fn_wave.role() == 0 and not ple_split:
+            if breakable_ple:  # both are graph breaks: replay keeps this order
+                _breakable_commit_ple_batch(batch=ple_batch)
+            else:
+                _commit_ple_batch(batch=ple_batch, forward_batch=forward_batch)
             ple_committed = True
         aux_hidden_states = AuxHiddenStateList()
         normalized_input = None
@@ -2811,9 +2814,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
 
         if ple_split:
             _q38fn_bcg_pick(qwen4_ple_commit_split)(hidden_states)  # _q38fn_bcg
+        elif ple_committed:
+            pass
         elif breakable_ple:
             _breakable_commit_ple_batch(batch=ple_batch)
-        elif not ple_committed:
+        else:
             _commit_ple_batch(batch=ple_batch, forward_batch=forward_batch)
 
         if not self.pp_group.is_last_rank:

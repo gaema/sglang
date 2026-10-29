@@ -310,9 +310,15 @@ def eager_on_graph(
             # captured segment. Keep a strong reference so replay can safely
             # copy fresh eager output into that bridge buffer.
             captured_output = output
+            # Recorded inside the qwen38fn prefill wavefront, the break replays as the micro-batch that recorded it
+            # (its attention backend, exchange slot and per-thread layer state); None everywhere else.
+            from sglang.srt.batch_overlap import q38fn_wave as _q38fn_wave
+
+            wave_snap = _q38fn_wave.snapshot()
 
             def replay_fn():
-                new_out = captured_inner(*captured_args, **captured_kwargs)
+                with _q38fn_wave.restored(wave_snap):
+                    new_out = captured_inner(*captured_args, **captured_kwargs)
                 return _copy_output(captured_output, new_out)
 
             capture.cuda_graph._break_fns.append(replay_fn)

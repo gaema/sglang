@@ -1198,6 +1198,8 @@ class ModelRunner:
                 get_parallel().tp_group,
                 self.model_config.hidden_size,
                 int(__import__("os").environ.get("SGLANG_TP_AR_FP8_CE_ROWS", "16384")),
+                # The prefill wavefront's second micro-batch exchanges on slot 1.
+                slots=2 if __import__("os").environ.get("SGLANG_TBO_TP_WAVE") == "1" else 1,
             )
         capture = capture_cuda_graphs(
             model_runner=self,
