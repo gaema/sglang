@@ -66,6 +66,7 @@ class _Baton:
         self.error: List[Optional[BaseException]] = [None, None]
         self.set_ctx = set_ctx
         self.ctxs = ctxs
+        self.meet = {}  # merge(): key -> the rows left by the first child to arrive, then the result
 
     def _wait_turn(self, me: int) -> None:
         with self.cv:
@@ -107,6 +108,38 @@ def yield_point() -> None:
     baton = getattr(_tls, "baton", None)
     if baton is not None:
         baton.give(_tls.role)
+
+
+MOE_MERGE = ENABLED and os.environ.get("SGLANG_TBO_TP_WAVE_MOE_MERGE") == "1"
+
+
+def merge(key, x: torch.Tensor, compute: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
+    """Run `compute` ONCE over both children's rows (A's first, B's second) and hand each child its own rows back.
+
+    Both children must call merge with the same key at the same program point. Whichever arrives first leaves its rows
+    and passes the baton until the result is there; the second computes on the concatenation and splits it. Outside a
+    wave it is compute(x). Used for the MoE block, whose 2048-row calls run worse grouped-GEMM tiles than one 4096-row
+    call (audit finding 11)."""
+    baton = getattr(_tls, "baton", None)
+    if baton is None:
+        return compute(x)
+    me = _tls.role
+    meet = baton.meet
+    entry = meet.get(key)
+    if entry is None:
+        entry = meet[key] = {"x": {me: x}, "y": None}
+        while entry["y"] is None:
+            if baton.done[1 - me]:
+                raise RuntimeError(f"q38fn wave merge {key!r}: the other micro-batch finished without arriving")
+            baton.give(me)
+        del meet[key]
+        return entry["y"][me]
+    entry["x"][me] = x
+    rows = [entry["x"][0].shape[0], entry["x"][1].shape[0]]
+    y = compute(torch.cat([entry["x"][0], entry["x"][1]], dim=0))
+    ya, yb = y.split(rows, dim=0)
+    entry["y"] = {0: ya, 1: yb}
+    return entry["y"][me]
 
 
 def snapshot():

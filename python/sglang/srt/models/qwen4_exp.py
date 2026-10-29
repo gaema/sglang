@@ -2313,7 +2313,24 @@ class Qwen4ExpLayerExtensionMixin:
                 hidden_states, forward_batch, already_reduced=True
             )
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock) and (
+                _q38fn_wave.MOE_MERGE and _q38fn_wave.role() is not None
+            ):
+                # The prefill wavefront's two micro-batches share one MoE call per
+                # layer (q38fn_wave.merge): a 2048-row call runs smaller grouped-GEMM
+                # tiles than the 4096-row one. A deferred finalize returns expanded,
+                # routed rows that cannot be split back per micro-batch.
+                if ffn_exit.defer_moe_finalize:
+                    raise RuntimeError(
+                        "q38fn wave MoE merge: the FFN exit defers the MoE finalize"
+                    )
+                mlp = self.mlp
+                hidden_states = _q38fn_wave.merge(
+                    ("moe", self.layer_id),
+                    hidden_states,
+                    lambda x: mlp(x, forward_batch, defer_finalize=False),
+                )
+            elif isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
                 hidden_states = self.mlp(
                     hidden_states,
                     forward_batch,

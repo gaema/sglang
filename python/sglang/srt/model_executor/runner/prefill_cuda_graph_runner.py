@@ -178,6 +178,7 @@ def get_prefill_num_tokens_to_capture(capture_tokens: Sequence[int]) -> list[int
 # filling that shape exactly, which the eager split (two_batch_overlap._tp_allreduce_split_seq_index) has already cut.
 _Q38FN_TBO2 = "q38fn_tbo2"
 _Q38FN_TBO2_TOKENS = 4096
+_Q38FN_TBO2_REPLAYS = [0]
 
 
 def _q38fn_tbo2_replayable(runner, num_tokens: int, forward_batch: ForwardBatch) -> bool:
@@ -1126,6 +1127,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _shape_key(self, num_tokens: int, forward_batch: ForwardBatch) -> ShapeKey:
         if _q38fn_tbo2_replayable(self, num_tokens, forward_batch):
+            n = _Q38FN_TBO2_REPLAYS[0] = _Q38FN_TBO2_REPLAYS[0] + 1
+            if n & (n - 1) == 0:  # 1, 2, 4, 8, ...: the log carries the count
+                logger.info("q38fn wavefront: split prefill graph replay #%d", n)
             return ShapeKey(size=num_tokens, variant_label=_Q38FN_TBO2)
         variant = None
         if self._capture_chunked_prefix:
