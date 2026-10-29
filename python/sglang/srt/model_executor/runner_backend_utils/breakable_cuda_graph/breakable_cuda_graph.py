@@ -386,6 +386,13 @@ class BreakableCUDAGraphCapture:
         self.cuda_graph = cuda_graph
         self._pool = pool if pool is not None else (0, 0)
         self._stream = stream
+        # The qwen38fn prefill wavefront records one graph from two threads that pass a baton: a segment begun in one
+        # micro-batch's thread is ended at a break in the other's, which CUDA allows only for a capture begun in
+        # RELAXED mode (cudaErrorStreamCaptureWrongThread otherwise).
+        from sglang.srt.batch_overlap import q38fn_wave as _q38fn_wave
+
+        if _q38fn_wave.ENABLED and capture_error_mode == "global":
+            capture_error_mode = "relaxed"
         self._capture_error_mode = capture_error_mode
         self._barrier_fn = barrier_fn
         self._stream_ctx = None

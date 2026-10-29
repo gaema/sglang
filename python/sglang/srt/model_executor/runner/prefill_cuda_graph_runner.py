@@ -173,6 +173,27 @@ def get_prefill_num_tokens_to_capture(capture_tokens: Sequence[int]) -> list[int
     return sorted({get_cuda_graph_max_batch_size(n) for n in capture_tokens})
 
 
+# The qwen38fn prefill wavefront (SGLANG_TBO_TP_WAVE=1, batch_overlap/q38fn_wave.py): one extra capture of the
+# 4096-token shape with the batch split into two TBO children run as the wavefront; replayed only for a lone request
+# filling that shape exactly, which the eager split (two_batch_overlap._tp_allreduce_split_seq_index) has already cut.
+_Q38FN_TBO2 = "q38fn_tbo2"
+_Q38FN_TBO2_TOKENS = 4096
+
+
+def _q38fn_tbo2_replayable(runner, num_tokens: int, forward_batch: ForwardBatch) -> bool:
+    from sglang.srt.batch_overlap import q38fn_wave
+
+    return (
+        q38fn_wave.ENABLED
+        and num_tokens == _Q38FN_TBO2_TOKENS
+        and len(forward_batch.input_ids) == _Q38FN_TBO2_TOKENS
+        and forward_batch.batch_size == 1
+        and forward_batch.tbo_children is not None
+        and forward_batch.forward_mode == ForwardMode.EXTEND
+        and not runner._capture_chunked_prefix
+    )
+
+
 def _chunked_prefix_variant(num_chunks: int) -> str:
     return f"chunked_prefix:{num_chunks}"
 
@@ -1104,6 +1125,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def _shape_key(self, num_tokens: int, forward_batch: ForwardBatch) -> ShapeKey:
+        if _q38fn_tbo2_replayable(self, num_tokens, forward_batch):
+            return ShapeKey(size=num_tokens, variant_label=_Q38FN_TBO2)
         variant = None
         if self._capture_chunked_prefix:
             prefix_lens = forward_batch.extend_prefix_lens_cpu
@@ -1752,6 +1775,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     f"Capturing prefill shape ({num_tokens=} {avail_mem=:.2f} GB)"
                 )
             self.capture_one_shape(num_tokens)
+            from sglang.srt.batch_overlap import q38fn_wave as _q38fn_wave
+
+            if _q38fn_wave.ENABLED and num_tokens == _Q38FN_TBO2_TOKENS:
+                self.capture_one_shape(num_tokens, q38fn_tbo2=True)
             if self._capture_chunked_prefix:
                 for captured_n in self._prefix_capture_variants:
                     self.capture_one_shape(
@@ -1759,12 +1786,30 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         prefix_num_chunks=captured_n,
                     )
 
-    def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
+    def capture_one_shape(
+        self, size: int, *, prefix_num_chunks: int = 0, q38fn_tbo2: bool = False
+    ) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
+        q38fn_tbo2: capture the prefill wavefront's split of one size-token
+        request instead (variant _Q38FN_TBO2, SGLANG_TBO_TP_WAVE=1).
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        if q38fn_tbo2:
+            from sglang.srt.batch_overlap.two_batch_overlap import (
+                TboForwardBatchPreparer,
+            )
+
+            # prepare_raw reads the attention backend from the forward context.
+            with forward_context(
+                ForwardContext(attn_backend=attn_backend), forward_batch=forward_batch
+            ):
+                TboForwardBatchPreparer.prepare(forward_batch)
+            assert forward_batch.tbo_children is not None, (
+                f"q38fn wavefront: the {num_tokens}-token capture batch did not split "
+                f"(extend_seq_lens_cpu={forward_batch.extend_seq_lens_cpu})"
+            )
         # Recapture can follow decode replay, which may change model-owned storage.
         prepare = getattr(self.model_runner.model, "prepare_for_forward", None)
         if prepare is not None:
@@ -1790,7 +1835,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         shape_key = ShapeKey(
             size=num_tokens,
             variant_label=(
-                _chunked_prefix_variant(prefix_num_chunks)
+                _Q38FN_TBO2
+                if q38fn_tbo2
+                else _chunked_prefix_variant(prefix_num_chunks)
                 if prefix_num_chunks
                 else None
             ),
@@ -2063,6 +2110,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.kv_index_translator,
             slots=out_cache_loc,
         )
+        # The prefill wavefront's children (the eager split of this batch): the
+        # split graph's breaks resolve their child's batch from the replay batch.
+        static_forward_batch.tbo_children = forward_batch.tbo_children
         # The n-gram hasher runs outside the graph and reads this at replay.
         static_forward_batch.ngram_embedding_info = forward_batch.ngram_embedding_info
         static_forward_batch.engram_history = forward_batch.engram_history
@@ -2364,8 +2414,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
             shape_key = self._shape_key(static_num_tokens, forward_batch)
-            # The only variants this runner records are chunked-prefix ones.
-            if shape_key.variant_label is not None:
+            # Besides the prefill-wavefront split, the only variants this runner records are chunked-prefix ones.
+            if shape_key.variant_label not in (None, _Q38FN_TBO2):
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
             # Publish after replay prep, including the chunked-prefix gather
             # above, which also reads the shared tables.

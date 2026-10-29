@@ -395,7 +395,7 @@ if _QSA_SPLIT_OP_GATE:
 # `with_output`): the call site allocates `out` inside the traced body so
 # the next piece reads it at a fixed graph-pool address; the op mutates it.
 _PLE_SPLIT_LAYERS: list = []
-_PLE_SPLIT_STATE: dict = {"ctx": None, "batch": None, "model": None}
+_PLE_SPLIT_STATE: dict = {"by_ctx": {}, "model": None}
 # Replay readback: forwards that ran the split-op PLE path OUTSIDE the
 # compile pass and OUTSIDE a capture session -- i.e. served forwards on the
 # captured surface. Logged at 1, 2, 4, 8, ... so the log carries the count.
@@ -438,19 +438,31 @@ if _QSA_SPLIT_OP_GATE:
         """The PLE batch for THIS forward, prepared once per forward context
         from the live (static) forward batch and cached until the commit op
         clears it."""
-        if _PLE_SPLIT_STATE["ctx"] is not ctx:
+        # Keyed by context: inside the prefill wavefront the two micro-batches
+        # interleave, each with its own context (q38fn_wave), and must not evict
+        # each other's batch. Entry: (ctx, batch, committed early).
+        by_ctx = _PLE_SPLIT_STATE["by_ctx"]
+        entry = by_ctx.get(id(ctx))
+        if entry is None or entry[0] is not ctx:
             model = _PLE_SPLIT_STATE["model"]
             if model is None:
                 raise RuntimeError("qwen4 PLE split op: no model registered")
             fb = ctx.forward_batch
-            _PLE_SPLIT_STATE["batch"] = _prepare_ple_batch(
+            batch = _prepare_ple_batch(
                 fb.input_ids,
                 fb,
                 ngram_size=model.ple_ngram_size,
                 ngram_eos_token_id=model.ple_ngram_eos_token_id,
             )
-            _PLE_SPLIT_STATE["ctx"] = ctx
-        return _PLE_SPLIT_STATE["batch"]
+            # Wavefront child A commits its N-gram history now: child B prepares
+            # before A's commit op runs (the commit reads only the batch).
+            committed = _q38fn_wave.role() == 0
+            if committed:
+                _commit_ple_batch(batch, fb)
+            if len(by_ctx) >= 4:  # entries of forwards that died before their commit op
+                by_ctx.clear()
+            entry = by_ctx[id(ctx)] = (ctx, batch, committed)
+        return entry[1]
 
     def _ple_layer_split_fake(handle: int, ple_query: torch.Tensor, out: torch.Tensor) -> None:
         if out.shape != ple_query.shape or out.dtype != ple_query.dtype:
@@ -478,10 +490,9 @@ if _QSA_SPLIT_OP_GATE:
         # Declared as mutating `hidden_states` so the trace keeps and orders
         # it after the last layer; it writes nothing into it.
         ctx = _ple_split_context()
-        if _PLE_SPLIT_STATE["ctx"] is ctx:
-            _commit_ple_batch(_PLE_SPLIT_STATE["batch"], ctx.forward_batch)
-        _PLE_SPLIT_STATE["ctx"] = None
-        _PLE_SPLIT_STATE["batch"] = None
+        entry = _PLE_SPLIT_STATE["by_ctx"].pop(id(ctx), None)
+        if entry is not None and entry[0] is ctx and not entry[2]:
+            _commit_ple_batch(entry[1], ctx.forward_batch)
         from sglang.srt.compilation.compile_phase import (
             get_pcg_capture_stream,
             is_in_torch_compile_warmup,
@@ -2591,6 +2602,89 @@ class Qwen4ExpAttentionDecoderLayer(
         return self._run_ffn_stage(hidden_states, forward_batch)
 
 
+class _WaveContexts:
+    """The prefill wavefront's per-child process-global contexts, resolved by ROLE against whatever parent contexts
+    are installed: the attention forward context (the parent's TboAttnBackend -> that child's backend) and, inside a
+    prefill graph, the tc_piecewise forward context (the parent's batch -> that child's batch), which the graphed PLE /
+    QSA split ops and breaks read. Resolving by role, not by object, is what lets a break recorded at capture replay
+    against the batch of the CURRENT replay. A child's contexts stay the same objects for the life of one parent
+    (the PLE split cache keys on them)."""
+
+    def __init__(self):
+        self.parent = None
+        self.parent_batch = None
+        self.kids = {}
+
+    @staticmethod
+    def _current():
+        from sglang.srt.model_executor import forward_context as _fc
+        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+            context_manager as _tcm,
+        )
+        from sglang.srt.model_executor.runner_utils import forward_batch as _rfb
+
+        return (_fc._current, _tcm._tc_piecewise_forward_context, _rfb._current_batch.get())
+
+    @staticmethod
+    def _install(triple) -> None:
+        from sglang.srt.model_executor import forward_context as _fc
+        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+            context_manager as _tcm,
+        )
+        from sglang.srt.model_executor.runner_utils import forward_batch as _rfb
+
+        fwd, tc, fb = triple
+        _fc.set_forward_context(fwd)
+        _tcm._tc_piecewise_forward_context = tc
+        _rfb._current_batch.set(fb)
+
+    def _triple(self, role: int):
+        from dataclasses import replace as _dc_replace
+
+        from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+
+        cur = self._current()
+        # A parent is whatever installs the TboAttnBackend; a child's contexts (or ones code inside a child re-derives
+        # from them, e.g. forward_context(ctx, forward_batch=...)) carry a child backend and keep the cached parent.
+        is_parent = cur[0] is not None and isinstance(cur[0].attn_backend, TboAttnBackend)
+        if is_parent:
+            # Same parent batch -> same forward: keep the children's context objects (the PLE split cache keys on
+            # them) even if a context member was re-installed meanwhile.
+            batch = cur[2] if cur[2] is not None else (cur[1].forward_batch if cur[1] is not None else None)
+            if (
+                self.parent is None
+                or batch is not self.parent_batch
+                or (batch is None and cur[0] is not self.parent[0])  # eager: no batch context, key on the forward's
+            ):
+                self.kids = {}
+            self.parent, self.parent_batch = cur, batch
+        if self.parent is None:
+            raise RuntimeError("q38fn wave: no parent context (no TboAttnBackend installed)")
+        if role not in self.kids:
+            pf, pt, pb = self.parent
+            fwd = _dc_replace(pf, attn_backend=pf.attn_backend.children[role])
+            # The child's batch: from the runner's current batch (graph capture / replay) or the tc context.
+            parent_batch = pb if pb is not None else (pt.forward_batch if pt is not None else None)
+            child = parent_batch.tbo_children[role] if parent_batch is not None else None
+            tc = None
+            if pt is not None:
+                n = child.input_ids.shape[0]
+                tc = _dc_replace(pt, forward_batch=child, num_tokens=n, raw_num_tokens=n)
+            self.kids[role] = (fwd, tc, child if pb is not None else None)
+        return self.kids[role]
+
+    def set(self, x):
+        """Install child x's contexts (x = 0 / 1) or a raw (forward, tc, batch) triple; returns the previous one.
+        The three are the attention forward context, the tc_piecewise forward context and the prefill runner's
+        current batch (runner_utils.forward_batch), which graph-time eager callbacks such as RadixAttention's
+        _eager_attention read."""
+        prev = self._current()
+        self._install(self._triple(x) if isinstance(x, int) else (x if x is not None else (None, None, None)))
+        return prev
+
+
+_WAVE_CTX = _WaveContexts()
+
 # The prefill wavefront (SGLANG_TBO_TP_WAVE=1) runs two micro-batches through the same layers at once; the state a
 # layer stashes on itself across an all-reduce must be per micro-batch (q38fn_wave.thread_local_attrs).
 _q38fn_wave.thread_local_attrs(
@@ -2882,14 +2976,15 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             )
 
         if _q38fn_wave.ENABLED:
-            # M3c: the children as a wavefront, each yielding inside its TP all-reduce (q38fn_wave).
-            from sglang.srt.model_executor.forward_context import set_forward_context
-
+            # M3c: the children as a wavefront, each yielding inside its TP all-reduce (q38fn_wave). Each child gets
+            # its own pair of process-global contexts: the attention forward context (its own backend) and, inside a
+            # prefill graph, the tc_piecewise forward context, from which the graphed PLE / QSA split ops and breaks
+            # read the batch they serve.
             children = forward_batch.tbo_children
             outs = _q38fn_wave.run(
                 [lambda: child_forward(children[0]), lambda: child_forward(children[1])],
-                contexts,
-                set_forward_context,
+                [0, 1],
+                _WAVE_CTX.set,
             )
         else:
             outs = []

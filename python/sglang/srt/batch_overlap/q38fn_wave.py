@@ -117,7 +117,7 @@ def snapshot():
         return None
     if getattr(_tls, "attrs", None) is None:
         _tls.attrs = {}
-    return (_tls.role, _tls.slot, _tls.attrs, baton.ctxs[_tls.role])
+    return (_tls.role, _tls.slot, _tls.attrs, baton.ctxs[_tls.role], baton.set_ctx)
 
 
 @contextmanager
@@ -127,21 +127,22 @@ def restored(snap):
     if snap is None:
         yield
         return
-    from sglang.srt.model_executor.forward_context import set_forward_context
-
-    role, slot_, attrs, ctx = snap
+    role, slot_, attrs, ctx, set_ctx = snap
     saved = (getattr(_tls, "role", None), getattr(_tls, "slot", 0), getattr(_tls, "attrs", None))
     _tls.role, _tls.slot, _tls.attrs = role, slot_, attrs
-    prev = set_forward_context(ctx)
+    prev = set_ctx(ctx)
     try:
         yield
     finally:
-        set_forward_context(prev)
+        set_ctx(prev)
         _tls.role, _tls.slot, _tls.attrs = saved
 
 
 def run(fns: Sequence[Callable[[], object]], ctxs: Sequence, set_ctx: Callable) -> list:
-    """Run fns[0] (child A) and fns[1] (child B) as the wavefront; returns their results in order."""
+    """Run fns[0] (child A) and fns[1] (child B) as the wavefront; returns their results in order.
+
+    ctxs[i] is child i's process-global context, opaque here; set_ctx(c) installs one and returns the previous one.
+    The baton holder's is installed on every resume, and a break recorded by child i replays under ctxs[i]."""
     assert len(fns) == 2 and len(ctxs) == 2
     baton = _Baton(set_ctx, ctxs)
     stream = torch.cuda.current_stream()
