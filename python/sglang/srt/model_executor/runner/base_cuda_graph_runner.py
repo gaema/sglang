@@ -177,7 +177,9 @@ def get_batch_sizes_to_capture(
     # TBO splits each request's rows across two micro-batches, so the
     # alignment constraint applies per request rather than per token row.
     alignment_width = captured_req_width
-    if get_exec().overlap.enable_two_batch_overlap:
+    from sglang.srt.utils.common import tbo_splits_decode_graphs
+
+    if tbo_splits_decode_graphs():
         alignment_width = 1
 
     # pad `num_max_requests` to avoid being filtered out

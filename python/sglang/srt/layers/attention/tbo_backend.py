@@ -83,6 +83,12 @@ class TboAttnBackend(AttentionBackend):
             return
         if in_capture:
             return
+        from sglang.srt.utils.common import tbo_splits_decode_graphs
+
+        if not tbo_splits_decode_graphs():
+            # Plain-TP prefill overlap: decode graphs are captured and replayed
+            # unsplit, so the children hold no metadata for them.
+            return
         # Replay path: build_replay_fb_view returns a SimpleNamespace and
         # tbo_plugin.replay_prepare does not call prepare_raw, so split the
         # padded buffers here using the same indices the eager path would.

@@ -4153,13 +4153,23 @@ def require_mlp_sync():
     return get_parallel().attn_dp_enabled or require_gathered_buffer()
 
 
+def tbo_splits_decode_graphs() -> bool:
+    """Whether two-batch overlap splits the decode CUDA graphs. Plain-TP prefill
+    overlap (SGLANG_TBO_TP_ALLREDUCE=1) splits only the extend batches it picks and
+    captures and replays every decode graph unsplit, so decode sees TBO as off."""
+    return bool(
+        get_exec().overlap.enable_two_batch_overlap
+        and os.environ.get("SGLANG_TBO_TP_ALLREDUCE") != "1"
+    )
+
+
 def get_cuda_graph_batch_size_alignment(
     *, gathered_buffer_required: Optional[bool] = None
 ) -> int:
     if gathered_buffer_required is None:
         gathered_buffer_required = require_gathered_buffer()
     alignment = 1
-    if get_exec().overlap.enable_two_batch_overlap:
+    if tbo_splits_decode_graphs():
         alignment *= 2
     if gathered_buffer_required:
         alignment *= get_parallel().attn_tp_size

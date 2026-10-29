@@ -148,6 +148,16 @@ def _tp_allreduce_split_seq_index(batch) -> Optional[int]:
         return None
     if sum(lens) % (2 * _TBO_TP_SPLIT_ALIGN) != 0:
         return None
+    # The two-chunk cut is sum // 2 tokens into the batch. Inside the request it lands in, child B's row starts at that
+    # request's cached prefix plus the cut's offset, and the QSA write asserts that start is a multiple of its compress
+    # ratio: keep the split only where the start is page-aligned (or the cut falls between requests).
+    cut = sum(lens) // 2
+    i = _split_array_by_cum_less_than_half(lens)
+    offset = cut - sum(lens[:i])
+    if offset != 0:
+        prefixes = getattr(batch, "extend_prefix_lens_cpu", None)
+        if prefixes is None or (int(prefixes[i]) + offset) % _TBO_TP_SPLIT_ALIGN != 0:
+            return None
     return compute_split_seq_index(batch.forward_mode, sum(lens), lens, None)
 
 
