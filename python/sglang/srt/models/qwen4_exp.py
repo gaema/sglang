@@ -1,6 +1,7 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
 import math
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
@@ -287,6 +288,8 @@ class _PLEBatchTraceable(NamedTuple):
 # constructor's read further down is): OFF keeps the shipped msgspec struct
 # and the shipped pinned-table gather.
 _QSA_SPLIT_OP_GATE = bool(envs.SGLANG_QWEN4_QSA_SPLIT_OP.get())
+# qwen38fn prefill overlap on plain TP (two_batch_overlap._tp_allreduce_split_seq_index).
+_TBO_TP_ALLREDUCE = os.environ.get("SGLANG_TBO_TP_ALLREDUCE") == "1"
 _PLE_BATCH_CLS = _PLEBatchTraceable if _QSA_SPLIT_OP_GATE else _PLEBatch
 if _QSA_SPLIT_OP_GATE:
     # R2d (fn:N286): every JIT kernel this model's traced extend body reaches
@@ -517,7 +520,9 @@ def _prepare_ple_batch(
 ) -> Optional[_PLEBatch]:
     """Prepare the token layout and the shared N-gram history once per forward."""
 
-    if forward_batch.tbo_parent_token_range is not None:
+    if forward_batch.tbo_parent_token_range is not None and not _TBO_TP_ALLREDUCE:
+        # Under SGLANG_TBO_TP_ALLREDUCE the children run in order (A, then B), so
+        # B's N-gram history and PLE conv state are the ones A committed.
         raise NotImplementedError("Qwen4 PLE is not compatible with two-batch overlap")
     spec_algorithm = forward_batch.spec_algorithm
     if spec_algorithm is not None and spec_algorithm.is_ngram():
@@ -2683,6 +2688,10 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         inputs_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], PPProxyTensors]:
+        if _TBO_TP_ALLREDUCE and forward_batch.tbo_children is not None:
+            return self._forward_tbo_children_in_order(
+                input_ids, positions, forward_batch, inputs_embeds, pp_proxy_tensors
+            )
         if self.pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -2815,6 +2824,44 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
+
+    def _forward_tbo_children_in_order(
+        self, input_ids, positions, forward_batch, inputs_embeds, pp_proxy_tensors
+    ):
+        """Overlap plan M3b: the two TBO children of one extend batch, each a whole
+        forward under its own attention backend, A before B, outputs joined in
+        token order. No overlap yet; this is the split's correctness reference.
+        B reads every state A leaves (KV, GDN, PLE conv, N-gram history)."""
+        from sglang.srt.batch_overlap.operations import _resolve_tbo_child_contexts
+        from sglang.srt.model_executor.forward_context import forward_context
+
+        if pp_proxy_tensors is not None or not self.pp_group.is_last_rank:
+            raise NotImplementedError("TBO children in order: single PP stage only")
+        if _shards_rows_over_cp(forward_batch):
+            raise NotImplementedError("TBO children in order: no context parallel")
+        contexts = _resolve_tbo_child_contexts()
+        if contexts[0] is None:
+            raise RuntimeError("TBO children without a TboAttnBackend")
+        outputs = []
+        for child, ctx in zip(forward_batch.tbo_children, contexts, strict=True):
+            lo, hi = child.tbo_parent_token_range
+            with forward_context(ctx):
+                # The text model's own forward, not a subclass's (Qwen4ExpVLModel
+                # takes input_embeds and records per-forward state of its own).
+                out = Qwen4ExpModel.forward(
+                    self,
+                    input_ids=input_ids[lo:hi],
+                    positions=positions[lo:hi],
+                    forward_batch=child,
+                    inputs_embeds=None if inputs_embeds is None else inputs_embeds[lo:hi],
+                )
+            if not isinstance(out, tuple) or len(out) != 2:
+                raise RuntimeError(f"TBO children in order: unexpected output {type(out)}")
+            outputs.append(out)
+        hidden_states = torch.cat([o[0] for o in outputs], dim=0)
+        hc = [o[1] for o in outputs]
+        hc_hidden_states = None if any(h is None for h in hc) else torch.cat(hc, dim=0)
+        return hidden_states, hc_hidden_states
 
 
 class Qwen4ExpVLModel(Qwen4ExpModel):
