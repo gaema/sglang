@@ -139,7 +139,7 @@ def _tp_allreduce_split_seq_index(batch) -> Optional[int]:
     so the ranks agree without a collective. Only an EXTEND batch whose two-chunk
     cut leaves both halves page-aligned (child B's prefix is the cut, and the QSA
     compressed-KV write asserts page-granular prefixes) is split."""
-    if os.environ.get("SGLANG_TBO_TP_ALLREDUCE") != "1":
+    if not _TBO_TP_ALLREDUCE:
         return None
     if batch.forward_mode != ForwardMode.EXTEND:
         return None
@@ -152,6 +152,7 @@ def _tp_allreduce_split_seq_index(batch) -> Optional[int]:
 
 
 _TBO_TP_SPLIT_ALIGN = 64  # the served --page-size
+_TBO_TP_ALLREDUCE = os.environ.get("SGLANG_TBO_TP_ALLREDUCE") == "1"
 
 
 def _restrict_mamba_track(child) -> None:
@@ -392,7 +393,10 @@ class TboCudaGraphRunnerPlugin:
         )
 
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
-        if not is_tbo_enabled():
+        # Plain-TP prefill overlap (SGLANG_TBO_TP_ALLREDUCE=1) splits only the
+        # extend batches it chooses (_tp_allreduce_split_seq_index); every CUDA
+        # graph, decode and prefill, is captured and replayed unsplit.
+        if not is_tbo_enabled() or _TBO_TP_ALLREDUCE:
             return
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=batch.forward_mode, spec_info=batch.spec_info
@@ -423,6 +427,8 @@ class TboCudaGraphRunnerPlugin:
         num_token_non_padded: int,
         spec_info: Optional[SpecInput],
     ):
+        if _TBO_TP_ALLREDUCE:  # graphs replay unsplit (capture_one_batch_size)
+            return
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=forward_mode, spec_info=spec_info
         )
