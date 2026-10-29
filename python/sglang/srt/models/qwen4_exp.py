@@ -2296,6 +2296,12 @@ class Qwen4ExpLayerExtensionMixin:
     def _run_ffn_stage(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
+        if _q38fn_wave.MOE_PREP_YIELD and _q38fn_wave.role() is not None:
+            # Merged-MoE wavefront: hand the baton over before this micro-batch's FFN
+            # prepare, so the other gets its attention all-reduce copy started and this
+            # prepare (HC mix, norm) runs under it instead of before it -- the copy
+            # would otherwise sit exposed right before the merged MoE.
+            _q38fn_wave.yield_point()
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         if (
             self._decode_moe_comm is not None
@@ -2631,34 +2637,37 @@ class _WaveContexts:
         self.parent = None
         self.parent_batch = None
         self.kids = {}
+        self._mods = None  # (forward_context, tc_piecewise context_manager, runner forward_batch, TboAttnBackend)
 
-    @staticmethod
-    def _current():
-        from sglang.srt.model_executor import forward_context as _fc
-        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-            context_manager as _tcm,
-        )
-        from sglang.srt.model_executor.runner_utils import forward_batch as _rfb
+    def _m(self):
+        # Resolved once: every recorded break of the split graph switches contexts twice
+        # per replay, so per-call imports are host time the GPU waits on.
+        if self._mods is None:
+            from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+            from sglang.srt.model_executor import forward_context as _fc
+            from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+                context_manager as _tcm,
+            )
+            from sglang.srt.model_executor.runner_utils import forward_batch as _rfb
 
+            self._mods = (_fc, _tcm, _rfb, TboAttnBackend)
+        return self._mods
+
+    def _current(self):
+        _fc, _tcm, _rfb, _ = self._m()
         return (_fc._current, _tcm._tc_piecewise_forward_context, _rfb._current_batch.get())
 
-    @staticmethod
-    def _install(triple) -> None:
-        from sglang.srt.model_executor import forward_context as _fc
-        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-            context_manager as _tcm,
-        )
-        from sglang.srt.model_executor.runner_utils import forward_batch as _rfb
-
+    def _install(self, triple) -> None:
+        _fc, _tcm, _rfb, _ = self._m()
         fwd, tc, fb = triple
-        _fc.set_forward_context(fwd)
+        _fc._current = fwd
         _tcm._tc_piecewise_forward_context = tc
         _rfb._current_batch.set(fb)
 
     def _triple(self, role: int):
         from dataclasses import replace as _dc_replace
 
-        from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+        TboAttnBackend = self._m()[3]
 
         cur = self._current()
         # A parent is whatever installs the TboAttnBackend; a child's contexts (or ones code inside a child re-derives

@@ -719,6 +719,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output
         ):
             topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
+        from sglang.srt.batch_overlap import q38fn_wave as _q38fn_wave
+
+        if _q38fn_wave.ROUTED_MERGE and _q38fn_wave.role() is not None:
+            # qwen38fn prefill wavefront: the two micro-batches share one routed-expert
+            # call (a 2048-row call runs smaller grouped-GEMM tiles); each ran its own
+            # router and shared expert first. Every top-k field is row-major.
+            fields = tuple(topk_output)
+            rows = hidden_states.shape[0]
+            if any(f.shape[0] != rows for f in fields):
+                raise RuntimeError("q38fn wave routed merge: a top-k field is not row-major")
+            kind, experts = type(topk_output), self.experts
+            return _q38fn_wave.merge(
+                ("routed", id(self)),
+                (hidden_states, *fields),
+                lambda h, *fs: experts(h, kind(*fs)),
+            )
         return self.experts(hidden_states, topk_output)
 
     def _gate_shared_output_out_of_place(

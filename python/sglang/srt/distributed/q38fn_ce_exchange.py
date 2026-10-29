@@ -33,6 +33,7 @@ _G = 128
 _PAGE = 4096
 _FULL = (0, 8)  # uint64 slot index per rank, 64 bytes apart
 _states: dict = {}
+_shared_copy_streams: dict = {}
 
 
 def _chk(r, what, runtime=False):
@@ -63,7 +64,17 @@ class _State:
         self.s = torch.empty(rows_cap * self.groups, dtype=torch.float32, device=dev)
         self.rq = torch.empty_like(self.q)
         self.rs = torch.empty_like(self.s)
-        self.copy_stream = torch.cuda.Stream(device=dev)
+        # SGLANG_TP_AR_FP8_CE_ONE_STREAM=1: every slot pulls on ONE copy stream, so two exchanges in flight run one
+        # after the other at full link bandwidth (in issue order, the same on both ranks) instead of sharing it -- the
+        # first one needed finishes in half the time.
+        if os.environ.get("SGLANG_TP_AR_FP8_CE_ONE_STREAM") == "1":
+            if (dev.index, group.unique_name) not in _shared_copy_streams:
+                _shared_copy_streams[(dev.index, group.unique_name)] = torch.cuda.Stream(device=dev)
+            self.copy_stream = _shared_copy_streams[(dev.index, group.unique_name)]
+            self.done_event = torch.cuda.Event()
+        else:
+            self.copy_stream = torch.cuda.Stream(device=dev)
+            self.done_event = None
         torch.cuda.synchronize()
 
         # The flag page: a /dev/shm file opened directly (not multiprocessing.SharedMemory, whose resource tracker is
@@ -159,10 +170,18 @@ class _State:
         _chk(rt.cudaMemcpyAsync(self.rs.data_ptr(), self.peer_s_ptr, 4 * ns, kind, C.cuda_stream), "copy s",
              runtime=True)
         _chk(cu.cuStreamWriteValue64(c, self._ptr(_FULL[self.peer]), 0, 0), "write FULL[peer] = 0")
+        if self.done_event is not None:
+            # A fresh event per pull: one event re-recorded across captured segments is refused inside capture.
+            self.done_event = torch.cuda.Event()
+            self.done_event.record(C)
 
     def finish(self, rows):
         """Make the caller's stream wait for start()'s pull; returns the received (rq, rs) views."""
-        torch.cuda.current_stream().wait_stream(self.copy_stream)
+        if self.done_event is not None:
+            # A shared copy stream also carries the other slot's later pull; wait for this one only.
+            torch.cuda.current_stream().wait_event(self.done_event)
+        else:
+            torch.cuda.current_stream().wait_stream(self.copy_stream)
         nq, ns = rows * self.hidden, rows * self.groups
         rq = self.rq[:nq].view(torch.float8_e4m3fn).view(rows, self.hidden)
         rs = self.rs[:ns].view(rows, self.groups)

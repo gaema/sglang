@@ -1910,6 +1910,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
             post_warmup_hook=post_warmup_hook,
         )
+        if num_tokens == _Q38FN_TBO2_TOKENS:
+            graph = getattr(self.backend, "_graphs", {}).get(shape_key)
+            if graph is not None and hasattr(graph, "_break_fns"):
+                logger.info(
+                    "q38fn prefill graph %s: %d segments, %d eager breaks",
+                    shape_key.variant_label or "unsplit",
+                    len(graph._segments),
+                    len(graph._break_fns),
+                )
 
     def load_batch(
         self, forward_batch: ForwardBatch, **kwargs

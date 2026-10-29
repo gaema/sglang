@@ -111,6 +111,11 @@ def yield_point() -> None:
 
 
 MOE_MERGE = ENABLED and os.environ.get("SGLANG_TBO_TP_WAVE_MOE_MERGE") == "1"
+# Round 3: with the MoE merged, yield once at the start of each FFN stage (qwen4_exp._run_ffn_stage).
+MOE_PREP_YIELD = MOE_MERGE and os.environ.get("SGLANG_TBO_TP_WAVE_PREP_YIELD") == "1"
+# Round 4: merge only the routed-expert call (qwen2_moe._forward_router_experts); router, shared expert and the FFN
+# prepare stay per micro-batch, ahead of the meeting point.
+ROUTED_MERGE = ENABLED and not MOE_MERGE and os.environ.get("SGLANG_TBO_TP_WAVE_ROUTED_MERGE") == "1"
 
 
 def merge(key, x: torch.Tensor, compute: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
@@ -135,8 +140,13 @@ def merge(key, x: torch.Tensor, compute: Callable[[torch.Tensor], torch.Tensor])
         del meet[key]
         return entry["y"][me]
     entry["x"][me] = x
-    rows = [entry["x"][0].shape[0], entry["x"][1].shape[0]]
-    y = compute(torch.cat([entry["x"][0], entry["x"][1]], dim=0))
+    xa, xb = entry["x"][0], entry["x"][1]
+    if isinstance(x, (tuple, list)):  # several row-major tensors, concatenated pairwise
+        rows = [xa[0].shape[0], xb[0].shape[0]]
+        y = compute(*[torch.cat([a, b], dim=0) for a, b in zip(xa, xb, strict=True)])
+    else:
+        rows = [xa.shape[0], xb.shape[0]]
+        y = compute(torch.cat([xa, xb], dim=0))
     ya, yb = y.split(rows, dim=0)
     entry["y"] = {0: ya, 1: yb}
     return entry["y"][me]
