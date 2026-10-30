@@ -36,8 +36,12 @@ def decide_needs_cpu_seq_lens(
     # importable everywhere; spec_info pulls in the spec/schedule_batch graph.
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-    if get_exec().overlap.enable_two_batch_overlap:
-        # FIXME: support TBO without seq lens cpu value
+    from sglang.srt.utils.common import tbo_splits_decode_graphs
+
+    if tbo_splits_decode_graphs():
+        # FIXME: support TBO without seq lens cpu value. Plain-TP prefill overlap
+        # (SGLANG_TBO_TP_ALLREDUCE=1) splits only extend batches, which carry the
+        # scheduler's CPU lengths, so decode keeps the backends' sync-free choice.
         return True
     algo = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
     if algo.is_ngram():
