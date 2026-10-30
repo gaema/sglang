@@ -201,6 +201,7 @@ from sglang.srt.managers.overlap_utils import (
     RelayPayload,
     decide_needs_confidence_relay,
     decide_needs_cpu_seq_lens,
+    decide_skip_cpu_seq_lens_bs1,
     resolve_forward_inputs,
 )
 from sglang.srt.managers.prefill_delayer import (
@@ -1670,6 +1671,9 @@ class Scheduler(
             self.req_to_token_pool,
             needs_cpu_seq_lens=needs_cpu_seq_lens,
             needs_confidence_relay=needs_confidence_relay,
+        )
+        self.future_map.skip_cpu_seq_lens_bs1 = decide_skip_cpu_seq_lens_bs1(
+            attn_backends
         )
 
         self._confidence_budget_prepare = None

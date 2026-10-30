@@ -55,6 +55,33 @@ def decide_needs_cpu_seq_lens(
     )
 
 
+def decide_skip_cpu_seq_lens_bs1(
+    attn_backends: Sequence[AttentionBackend],
+) -> bool:
+    """SGLANG_Q38_SEQLENS_BS1_SKIP=1: skip the host seq_lens copy for one-request
+    batches when the copy is forced only by the TboAttnBackend wrapper (TBO does
+    not split decode, ngram off, every wrapped primary opts out)."""
+    import os
+
+    if os.environ.get("SGLANG_Q38_SEQLENS_BS1_SKIP", "0") != "1":
+        return False
+    from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.utils.common import tbo_splits_decode_graphs
+
+    if tbo_splits_decode_graphs():
+        return False
+    if SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm).is_ngram():
+        return False
+    bs = [b for b in attn_backends if b is not None]
+    if not any(isinstance(b, TboAttnBackend) for b in bs):
+        return False
+    return not any(
+        getattr(b.primary if isinstance(b, TboAttnBackend) else b, "needs_cpu_seq_lens", True)
+        for b in bs
+    )
+
+
 def decide_needs_confidence_relay() -> bool:
     from sglang.srt.speculative.ragged_verify import (
         RaggedVerifyMode,
@@ -304,6 +331,8 @@ class FutureMap:
         # Computed by decide_needs_cpu_seq_lens(); see that helper for the
         # full decision (per-backend flag + TBO / piecewise CG overrides).
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
+        # Set by the scheduler from decide_skip_cpu_seq_lens_bs1().
+        self.skip_cpu_seq_lens_bs1 = False
         self.needs_confidence_relay = needs_confidence_relay
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
         # Kept for the mixed-tail late binding (reserved-slot gather).
@@ -616,7 +645,9 @@ class FutureMap:
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
-        if not self.needs_cpu_seq_lens:
+        if not self.needs_cpu_seq_lens or (
+            self.skip_cpu_seq_lens_bs1 and fi.shape[0] == 1
+        ):
             # GPU gather above is kept (SB.seq_lens must advance each verify);
             # skip the .cpu() D2H. Downstream takes the GPU-only path.
             batch.seq_lens_cpu = None
